@@ -39,7 +39,8 @@ Shell 版没有 GUI，所以等价替代是：用本地 CLI wizard 收集信息�
   `~/.remote-harness/.sessions/...`，并关闭 OpenSSH multiplexing；退出清理时会尽量删除这些会话级目录。
   它不写 `~/.ssh/config`、`known_hosts` 或 SSH key；唯一的 `~/.ssh` 修改是笔记本侧用于临时反向认证的
   `authorized_keys` 托管块。
-- 启动 Agent 时会在本次会话的 `PATH` 中加入临时 `ssh` 包装器，所以注入规则里只需要写 `ssh rlocal ...`。
+- Claude/Codex 启动时加入会话级 `PreToolUse` hook 和 runner，自动把 Bash 路由到 `rlocal`；
+  opencode 继续使用临时 `ssh` wrapper 和提示词规则。
 - 服务器只在实际部署时收到必要配置，例如 `rlocal` 临时别名、反向端口和挂载请求。
 - 本地路径不会进入 Agent 聊天上下文；如果用户不主动粘贴，Agent 看不到这些值。
 
@@ -100,7 +101,7 @@ ssh -n -o ClearAllForwardings=yes \
 9. `laptop-setup.sh` 会为笔记本到远端的 RemoteForward alias 创建本地会话级 ssh config，并通过内部
    `ssh` wrapper 保持脚本调用仍是短命令（`ssh <target>`）。
 10. `laptop-setup.sh` 后续所有远端回连笔记本的操作都显式使用远端这份 config：`check-tunnel.sh`、
-   `mount-project.sh`、端口切换后的别名重写，以及本次 Agent 会话里的临时 `ssh` 包装器。Agent 看到的规则只写 `ssh rlocal ...`。
+   `mount-project.sh`、端口切换后的别名重写、Claude/Codex runner，以及 opencode 会话 `ssh` wrapper。
 11. Agent 退出后，脚本自动卸载、清理会话级规则、删除两端的临时 ssh config，并清理
     `~/.remote-harness/mounts` 下的默认空挂载目录。
 

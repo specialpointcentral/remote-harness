@@ -12,7 +12,8 @@ remote-harness 连接两台机器：
 - **A**：编程 Agent 运行所在机器。
 - **P**：项目和开发环境所在机器。
 
-它用 sshfs 把 P 的项目挂载到 A，在会话中注入“项目命令必须在 P 上运行”的规则，然后在挂载目录启动选定 Agent。
+它用 sshfs 把 P 的项目挂载到 A，然后在挂载目录启动选定 Agent。Claude 和 Codex 获得会话级 hook，
+将每个 Bash 调用改写到 P；opencode 保留提示词 SSH 路由。
 
 ## 2. 两个方向
 
@@ -58,9 +59,8 @@ remote-harness 公钥时，`laptop-setup.sh` 会先检测本机是否已有匹�
 `~/.remote-harness/.sessions/authorized-keys/...` 下的引用 token 用来避免一个会话退出时删除仍被
 其他会话使用的授权。除此之外，`~/.ssh` 中已有历史文件都属于用户，除非用户明确要求，否则不修改。
 
-启动后的 Agent 只看到短命令（`ssh rlocal ...` 或 `ssh <server-alias> ...`）。需要临时 config 时，
-`inject-rule.sh` 会创建会话级 `bin/ssh` wrapper 并 prepend 到 `PATH`，因此注入规则不会暴露
-`ssh -F <临时config>`。
+Claude/Codex 获得会话级 `PreToolUse` hook 和 `bin/rh-run`。opencode 继续通过会话级 `bin/ssh`
+wrapper 使用 `ssh rlocal ...` / `ssh <server-alias> ...` 短命令。
 
 ## 5. 隐私边界
 
@@ -78,21 +78,26 @@ remote-harness 的 simple 流程会在客户端侧使用会话级 SSH config、�
 
 该优化不是单个小会话的硬性前置条件；它是共享服务器长期稳定性的运行环境要求。
 
-## 7. 规则注入
+## 7. 规则与 hook 注入
 
-`inject-rule.sh` 是会话级且方向无关。它写入 `$RH_HOME/.sessions/<key>`，永不写入被挂载仓库。规则告诉 Agent：
+`inject-rule.sh` 是会话级且方向无关。它写入 `$RH_HOME/.sessions/<key>`，永不写入被挂载仓库。
+Claude/Codex 会创建 `PreToolUse` hook 和 `bin/rh-run`。hook 保留工具输入，把 cwd 映射为挂载点
+相对目录，并只替换 Bash 命令。runner 通过 SSH 传输编码命令，在 P 的登录 shell 中执行，并设置
+`GIT_OPTIONAL_LOCKS=0`。
 
-- 在挂载目录中进行本地文件读取、写入、编辑和搜索是允许的；
-- 项目命令必须通过 SSH 在 P 上运行；
-- 会修改状态的 git 命令及其 hooks 也属于项目命令。
+规则、hook、runner、Python 或会话 SSH config 不可用时，启动立即中止。hook 拒绝或 SSH 失败时，
+hook 成功加载后，handler 错误返回拒绝，SSH 失败不会回退到 A 执行。客户端 hook 框架仍是防护机制，
+不是完整隔离边界。
 
 各 Agent 通道：
 
-- Claude：`--append-system-prompt-file <rule>`。
-- opencode：`OPENCODE_CONFIG=<session config>`。
-- Codex：`-c developer_instructions=<rule>`；非 yolo 时还启用 workspace-write 网络访问，并只把相关
-  `~/.remote-harness/.sessions/...` 目录加入 writable roots，让 SSH 把临时 `known_hosts` 和
-  运行时文件写在那里，而不触碰 `~/.ssh`。
+- Claude：`--append-system-prompt-file <rule> --settings <会话 settings>`。
+- Codex：会话 `developer_instructions`、内联 `hooks.PreToolUse`，并显式信任生成的 hook；非 yolo
+  仍启用 workspace-write 网络和会话 writable roots。
+- opencode：`OPENCODE_CONFIG=<session config>`，继续使用提示词 SSH 路由。
+
+hook 是命令路由防护，不是文件系统隔离。SSHFS 和反向 SSH key 仍要求 A 是可信主机，并可访问所选
+项目主机账号。
 
 ## 8. 不变量
 

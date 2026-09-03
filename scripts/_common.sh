@@ -76,7 +76,10 @@ ssh_config_value() {
 # effective path limit is short enough that otherwise-valid session dirs can fail before sshfs starts.
 write_session_ssh_defaults() {
   _wssd_dir="$1"
-  _wssd_kh="${2:-$_wssd_dir/known_hosts}"
+  _wssd_runtime="$_wssd_dir/runtime"
+  mkdir -p "$_wssd_runtime" 2>/dev/null || return 1
+  chmod 700 "$_wssd_runtime" 2>/dev/null || true
+  _wssd_kh="${2:-$_wssd_runtime/known_hosts}"
   {
     printf 'Host *\n'
     printf '    UserKnownHostsFile %s\n' "$(ssh_config_value "$_wssd_kh")"

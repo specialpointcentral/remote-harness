@@ -28,6 +28,7 @@
 set -uo pipefail
 
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
 
 safe_ssh_token() {
   case "${1:-}" in
@@ -97,15 +98,12 @@ toml_escape_value() {
 }
 
 codex_writable_roots_cfg() {
-  _cwr_sd="$1"
-  _cwr_ssh_config="${2:-}"
-  _cwr_cfg_dir=""
-  [ -n "$_cwr_ssh_config" ] && _cwr_cfg_dir="$(dirname "$_cwr_ssh_config" 2>/dev/null || true)"
-  printf 'sandbox_workspace_write.writable_roots=["%s"' "$(toml_escape_value "$_cwr_sd")"
-  if [ -n "$_cwr_cfg_dir" ] && [ "$_cwr_cfg_dir" != "$_cwr_sd" ]; then
-    printf ',"%s"' "$(toml_escape_value "$_cwr_cfg_dir")"
-  fi
-  printf ']'
+  _cwr_ssh_config="${1:-}"
+  [ -n "$_cwr_ssh_config" ] || return 1
+  _cwr_runtime_dir="$(dirname "$_cwr_ssh_config" 2>/dev/null)/runtime"
+  mkdir -p "$_cwr_runtime_dir" 2>/dev/null || return 1
+  chmod 700 "$_cwr_runtime_dir" 2>/dev/null || true
+  printf 'sandbox_workspace_write.writable_roots=["%s"]' "$(toml_escape_value "$_cwr_runtime_dir")"
 }
 
 write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
@@ -144,37 +142,69 @@ write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
   return 0
 }
 
-write_rule() {  # $1=outfile  $2=code_path (on $3)  $3=host_alias (where code lives)  $4=mountpoint
+write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config
+  _wsr_runner="$1/bin/rh-run"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'exec %s --ssh-config %s --alias %s --project-root %s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")"
+  } > "$_wsr_runner" || return 1
+  chmod +x "$_wsr_runner" 2>/dev/null || return 1
+  printf '%s' "$_wsr_runner"
+}
+
+write_claude_settings() {  # $1=outfile $2=hook command
+  _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
+  cat > "$1" <<EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_command,
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
   cmds="$(detect_cmds "$4")"
   lpq="$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"   # path with single quotes escaped, for the 'cd ...' examples
+  if [ "${5:-}" = opencode ]; then
+    {
+      printf '# IMPORTANT - Remote dev harness rule\n\n'
+      printf 'This working directory is an SSHFS mount of `%s` on `%s`.\n' "$2" "$3"
+      printf 'File reads and edits may use the mount, but project commands must run on `%s`:\n\n' "$3"
+      printf '    ssh %s '\''cd %s && <command>'\''\n\n' "$3" "$lpq"
+      printf 'Do not install dependencies, build, test, format, lint, or mutate Git on this machine.\n'
+    } > "$1"
+    return
+  fi
   {
-    printf '# IMPORTANT — Remote dev harness rule (READ BEFORE RUNNING ANY COMMAND)\n\n'
-    printf '**Your working directory is an sshfs mount of `%s` on `%s` — this machine is NOT where\n' "$2" "$3"
-    printf 'the project runs.** It may lack the toolchain/runtime, and ANYTHING you write here\n'
-    printf '(node_modules, .venv, target/, build output) is written back over the mount to `%s` and\n' "$3"
-    printf 'may be built for the WRONG OS/arch — silently corrupting that environment.\n\n'
-    printf '**MANDATORY RULE — no exceptions:** run EVERY build, run/start, test, linter, formatter,\n'
-    printf 'type-check, language server, debugger, dependency install, code generator, DB migration,\n'
-    printf 'and `git commit`/`git push` (their hooks run the toolchain) — and ANY other project tool —\n'
-    printf '**on `%s`**, never on this machine. One-shot commands:\n\n' "$3"
-    printf '    ssh %s '\''cd %s && <command>'\''\n\n' "$3" "$lpq"
-    printf 'For this project, that means (for example):\n\n'
+    printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
+    printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools operate on the\n' "$2" "$3"
+    printf 'mount, while a session `PreToolUse` hook routes every Bash command to `%s`.\n\n' "$3"
+    printf 'Run ordinary relative commands. Do not wrap them in `ssh`, and do not replace the routing\n'
+    printf 'runner. The hook maps the current mount-relative directory to the project host. Examples:\n\n'
     printf '%s\n' "$cmds" | while IFS= read -r c; do
-      [ -n "$c" ] && printf '    ssh %s '\''cd %s && %s'\''\n' "$3" "$lpq" "$c"
+      [ -n "$c" ] && printf '    %s\n' "$c"
     done
     printf '\n'
-    printf 'For a long-running process (dev server, file watcher) allocate a TTY, and forward any port\n'
-    printf 'you need to reach locally:\n\n'
-    printf '    ssh -t -L 3000:127.0.0.1:3000 %s '\''cd %s && <dev server>'\''\n\n' "$3" "$lpq"
-    printf '**NEVER run installs/builds/tools on this machine** (`npm install`, `pip install`,\n'
-    printf '`cargo build`, `make`, a linter/formatter, a language server, etc.) — it pollutes the mount\n'
-    printf 'and corrupts `%s`'\''s deps with wrong-OS/arch binaries. Safe local work is file-oriented:\n' "$3"
-    printf 'read files, write/edit files, search with `rg`/`grep`, and use read-only git\n'
-    printf '(`git status`/`git diff`/`git log`). Mutating git commands or any command that needs the\n'
-    printf 'project toolchain/runtime belong on `%s` via SSH.\n' "$3"
-    printf 'If a command needs the toolchain, or a remote run fails right after you edited a file (the\n'
-    printf 'mount may not have flushed yet — just re-run it once), do NOT work around it locally — run\n'
-    printf 'it on `%s` via the `ssh %s ...` forms above.\n' "$3" "$3"
+    printf 'All Git commands are routed too, with `GIT_OPTIONAL_LOCKS=0` to avoid SSHFS index refreshes.\n'
+    printf 'Use relative project paths in Bash commands; absolute mount paths name the agent host and\n'
+    printf 'are not portable to `%s`. Interactive PTY commands are not supported by strict routing.\n\n' "$3"
+    printf 'Safe local work is file-oriented: use the agent read/edit/write/patch tools on the mount.\n'
+    printf 'If routing is unavailable or the cwd is outside the mount, the Bash call is denied. Never\n'
+    printf 'work around that failure by executing the project command on this machine.\n'
   } > "$1"
 }
 
@@ -187,7 +217,7 @@ case "${1:-}" in
     rm -rf "$SD" 2>/dev/null || true
     mkdir -p "$SD" 2>/dev/null || { echo "RH_STATUS=ERROR"; exit 1; }
     RULE="$SD/rule.md"
-    write_rule "$RULE" "$lp" "$ba" "$mp" || { echo "RH_STATUS=ERROR"; exit 1; }
+    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || { echo "RH_STATUS=ERROR"; exit 1; }
 
     env_out=""; flags_out=""
     if [ -n "$ssh_config" ]; then
@@ -195,9 +225,24 @@ case "${1:-}" in
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
       fi
     fi
+    if [ "$agent" = claude ] || [ "$agent" = codex ]; then
+      [ -n "$ssh_config" ] && [ -f "$ssh_config" ] \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      PYTHON3=$(command -v python3 2>/dev/null || true)
+      [ -n "$PYTHON3" ] && [ -x "$PYTHON3" ] \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      [ -x "$SCRIPT_DIR/route-command.py" ] && [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config") \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      hook_command="$(sq "$PYTHON3") $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
+    fi
     case "$agent" in
       claude)
-        flags_out="--append-system-prompt-file $(sq "$RULE")"
+        CLAUDE_SETTINGS="$SD/claude-settings.json"
+        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" \
+          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
         ;;
       opencode)
         # OPENCODE_CONFIG is merged ADDITIVELY on top of the user's global + project configs, so we
@@ -213,7 +258,8 @@ case "${1:-}" in
         ;;
       codex)
         dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
-        flags_out="-c $(sq "$dev_cfg")"
+        hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=5,statusMessage=\"Routing command to project host\"}]}]"
+        flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") --dangerously-bypass-hook-trust"
         # codex's default sandbox gates network, which blocks the rule's `ssh <host> ...`. The
         # `[sandbox_workspace_write]` sub-table only merges when workspace-write is EXPLICITLY
         # selected, so `-s workspace-write` is required — `network_access` alone at the implicit
@@ -223,7 +269,8 @@ case "${1:-}" in
         # access to the session-owned directories where the wrapper/config put temporary known_hosts.
         # Do not add ~/.ssh; user SSH files remain read-only/user-managed.
         if [ "$yolo" != 1 ]; then
-          roots_cfg="$(codex_writable_roots_cfg "$SD" "$ssh_config")"
+          roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
+            || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
           flags_out="$flags_out -s workspace-write -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
         fi
         ;;

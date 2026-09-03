@@ -68,7 +68,9 @@ place_scripts() {  # destdir
   if [ "$MODE" = dev ]; then
     mkdir -p "$(dirname "$1")"; ln -s "$SRC/scripts" "$1"
   else
-    mkdir -p "$1"; cp "$SRC"/scripts/*.sh "$1"/; chmod +x "$1"/*.sh
+    mkdir -p "$1"
+    cp "$SRC"/scripts/*.sh "$SRC"/scripts/*.py "$1"/
+    chmod +x "$1"/*.sh "$1"/*.py
   fi
 }
 place_docs() {  # destdir
@@ -76,7 +78,8 @@ place_docs() {  # destdir
   if [ "$MODE" = dev ]; then
     mkdir -p "$(dirname "$1")"; ln -s "$SRC/docs" "$1"
   else
-    mkdir -p "$1"; cp "$SRC"/docs/* "$1"/
+    mkdir -p "$1"
+    find "$SRC/docs" -maxdepth 1 -type f -exec cp {} "$1"/ \;
   fi
 }
 rm_path() {  # remove a file/dir/symlink if present (symlinks unlinked, never followed)
@@ -129,7 +132,7 @@ if want codex; then
     mkdir -p "$CODEX_DIR"
     cp "$SRC/SKILL.md" "$CODEX_DIR/SKILL.md"
     cp "$SRC/SKILL.cn.md" "$CODEX_DIR/SKILL.cn.md"
-    mkdir -p "$CODEX_DIR/docs"; cp "$SRC"/docs/* "$CODEX_DIR/docs"/
+    place_docs "$CODEX_DIR/docs"
     echo "  ✓ Codex skill (copy)       → $CODEX_DIR/SKILL.md  (invoke: '\$remote-harness')"
   fi
 fi

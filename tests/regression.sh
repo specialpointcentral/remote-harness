@@ -16,6 +16,103 @@ assert_grep() {
 
 . "$ROOT/scripts/_common.sh"
 
+# --- strict command routing: hook rewrite + project-host dispatch -----------------------------
+router_tmp="$tmp/router"
+mkdir -p "$router_tmp/mount/packages/api" "$router_tmp/outside" "$router_tmp/project/packages/api"
+printf '#!/bin/sh\nexit 0\n' > "$router_tmp/rh-run"
+chmod +x "$router_tmp/rh-run"
+router_input="$router_tmp/input.json"
+cat > "$router_input" <<EOF
+{
+  "hook_event_name": "PreToolUse",
+  "cwd": "$router_tmp/mount",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf routed",
+    "workdir": "$router_tmp/mount/packages/api",
+    "timeout_ms": 12345
+  }
+}
+EOF
+router_output="$router_tmp/output.json"
+python3 "$ROOT/scripts/route-command.py" \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+  < "$router_input" > "$router_output"
+python3 - "$router_output" "$router_tmp/rh-run" <<'PY'
+import base64
+import json
+import shlex
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+specific = payload["hookSpecificOutput"]
+assert specific["hookEventName"] == "PreToolUse"
+assert specific["permissionDecision"] == "allow"
+updated = specific["updatedInput"]
+assert updated["timeout_ms"] == 12345
+argv = shlex.split(updated["command"])
+assert argv[0] == sys.argv[2]
+assert base64.b64decode(argv[1]).decode() == "packages/api"
+assert base64.b64decode(argv[2]).decode() == "printf routed"
+PY
+
+python3 - "$router_tmp/outside.json" "$router_tmp/outside" <<'PY'
+import json
+import sys
+
+json.dump({
+    "hook_event_name": "PreToolUse",
+    "cwd": sys.argv[2],
+    "tool_name": "Bash",
+    "tool_input": {"command": "uname -a"},
+}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+python3 "$ROOT/scripts/route-command.py" \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+  < "$router_tmp/outside.json" > "$router_tmp/outside-output.json"
+python3 - "$router_tmp/outside-output.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+specific = payload["hookSpecificOutput"]
+assert specific["permissionDecision"] == "deny"
+assert "outside" in specific["permissionDecisionReason"].lower()
+PY
+
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+dispatch_out=$(SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+  "$(b64 "$router_tmp/project")" "$(b64 packages/api)" \
+  "$(b64 'printf "%s|%s" "$PWD" "$GIT_OPTIONAL_LOCKS"')")
+assert_eq "project-host cwd and git lock policy" "$dispatch_out" "$router_tmp/project/packages/api|0"
+if sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+    "$(b64 "$router_tmp/project")" "$(b64 ../outside)" "$(b64 true)" \
+    >/dev/null 2>"$router_tmp/traversal.err"; then
+  fail "project-host dispatcher accepted a parent-directory traversal"
+fi
+assert_grep "$router_tmp/traversal.err" "invalid relative working directory" "dispatch traversal denial"
+
+mkdir -p "$router_tmp/bin"
+cat > "$router_tmp/bin/ssh" <<'EOS'
+#!/usr/bin/env sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -F|-o) shift 2 ;;
+    -T) shift ;;
+    *) shift; remote_command=${1:-}; break ;;
+  esac
+done
+exec sh -c "$remote_command"
+EOS
+chmod +x "$router_tmp/bin/ssh"
+printf 'Host project-host\n    HostName 127.0.0.1\n' > "$router_tmp/ssh_config"
+client_out=$(PATH="$router_tmp/bin:$PATH" SHELL=/bin/sh \
+  sh "$ROOT/scripts/run-on-project-host.sh" \
+    --ssh-config "$router_tmp/ssh_config" --alias project-host \
+    --project-root "$router_tmp/project" --cwd-relative-b64 "$(b64 packages/api)" \
+    --command-b64 "$(b64 'printf "%s" "$PWD"')")
+assert_eq "project-host client transport" "$client_out" "$router_tmp/project/packages/api"
+
 parse_via "ssh -J jump -p 2222 -i /tmp/key dev@example.com"
 assert_eq "host" "$V_HOST" "example.com"
 assert_eq "port" "$V_PORT" "2222"
@@ -66,14 +163,24 @@ rh_home="$tmp/rh with 'quote"
 home_dir="$tmp/home with 'quote"
 session_key="$(printf '%s' "$tmp/mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 session_dir="$rh_home/.sessions/$session_key"
+basic_ssh_cfg="$tmp/basic-ssh-config"
+printf 'Host laptop\n    HostName 127.0.0.1\n' > "$basic_ssh_cfg"
 RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount" 0 > "$tmp/inject.out"
+  "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount" 0 "$basic_ssh_cfg" > "$tmp/inject.out"
 assert_grep "$tmp/inject.out" "RH_STATUS=INJECTED" "inject on"
 assert_grep "$tmp/inject.out" "RH_LAUNCH_ENV=" "inject codex leaves CODEX_HOME alone"
 assert_grep "$tmp/inject.out" "RH_LAUNCH_FLAGS=-c 'developer_instructions=\"" "inject codex developer instructions"
-assert_grep "$tmp/inject.out" "'\\''s deps" "inject codex flags escape apostrophe"
+assert_grep "$tmp/inject.out" "hooks.PreToolUse=" "inject codex pre-tool hook"
+assert_grep "$tmp/inject.out" "--dangerously-bypass-hook-trust" "inject codex trusts generated session hook"
+assert_grep "$tmp/inject.out" "$(command -v python3)" "inject codex pins the Python hook runtime"
+assert_grep "$tmp/inject.out" "Remote dev harness strict routing rule" "inject codex strict routing instructions"
 assert_grep "$tmp/inject.out" "sandbox_workspace_write.writable_roots=[" "inject codex writable roots present"
-assert_grep "$tmp/inject.out" ".sessions" "inject codex writable root is under RH_HOME sessions"
+assert_grep "$tmp/inject.out" "sandbox_workspace_write.writable_roots=[\"$(dirname "$basic_ssh_cfg")/runtime\"]" "inject codex only makes mutable SSH runtime writable"
+if grep -F "sandbox_workspace_write.writable_roots=[\"$session_dir" "$tmp/inject.out" >/dev/null; then
+  fail "inject codex made its hook and runner directory writable"
+fi
+[ -x "$session_dir/bin/rh-run" ] || fail "inject codex session runner missing"
+assert_grep "$session_dir/bin/rh-run" "run-on-project-host.sh" "session runner delegates to project host"
 if grep -F 'writable_roots=["~/.ssh"]' "$tmp/inject.out" >/dev/null; then
   fail "inject codex made ~/.ssh writable"
 fi
@@ -93,7 +200,10 @@ assert_grep "$tmp/inject-wrapped.out" "RH_LAUNCH_ENV=PATH='" "inject wrapper exp
 [ -x "$wrapped_dir/bin/ssh" ] || fail "inject wrapper ssh missing"
 assert_grep "$wrapped_dir/bin/ssh" "cfg='$ssh_cfg'" "inject wrapper stores temp ssh config"
 assert_grep "$wrapped_dir/bin/ssh" '-F "$cfg"' "inject wrapper uses temp ssh config"
-assert_grep "$wrapped_dir/rule.md" "ssh rlocal 'cd" "inject rule uses short alias"
+assert_grep "$wrapped_dir/rule.md" 'routes every Bash command to `rlocal`' "inject rule documents automatic routing"
+if grep -F "ssh rlocal 'cd" "$wrapped_dir/rule.md" >/dev/null; then
+  fail "strict inject rule still tells Codex to wrap commands in ssh"
+fi
 assert_grep "$tmp/inject-wrapped.out" "sandbox_workspace_write.writable_roots=[" "inject wrapper writable roots present"
 assert_grep "$tmp/inject-wrapped.out" "$(dirname "$ssh_cfg")" "inject wrapper writable roots include session config dir"
 if grep -q -- "-F " "$wrapped_dir/rule.md"; then
@@ -103,10 +213,25 @@ RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off codex "$tmp/mount-wrapped" >/dev/null
 
 RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 > "$tmp/inject-claude.out"
+  "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
 assert_grep "$tmp/inject-claude.out" "RH_LAUNCH_FLAGS=--append-system-prompt-file '" "inject claude flag quoted"
+assert_grep "$tmp/inject-claude.out" "--settings '" "inject claude session settings"
+claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
+python3 - "$claude_settings" <<'PY'
+import json
+import sys
+
+settings = json.load(open(sys.argv[1], encoding="utf-8"))
+hook = settings["hooks"]["PreToolUse"][0]
+assert hook["matcher"] == "Bash"
+assert "route-command.py" in hook["hooks"][0]["command"]
+PY
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
+missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount-no-config" 0 || true)
+assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex inject requires ssh config"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 1 > "$tmp/inject-opencode.out"
 assert_grep "$tmp/inject-opencode.out" "RH_LAUNCH_ENV=OPENCODE_CONFIG='" "inject opencode env quoted"
@@ -147,6 +272,7 @@ assert_grep "$setup_cfg" "    IdentityFile /tmp/key" "setup-only identity"
 assert_grep "$setup_cfg" "    ProxyJump jumpbox" "setup-only proxyjump"
 assert_grep "$setup_cfg" "    RemoteForward 32022 127.0.0.1:22" "setup-only remote forward"
 assert_grep "$setup_cfg" "UserKnownHostsFile $setup_home/.remote-harness/.sessions/" "setup-only known_hosts under remote-harness"
+assert_grep "$setup_cfg" "/runtime/known_hosts" "setup-only separates mutable SSH runtime from config"
 assert_grep "$setup_cfg" "    ControlMaster no" "setup-only disables multiplexing"
 [ ! -e "$setup_home/.ssh/config" ] || fail "laptop-setup wrote ~/.ssh/config"
 [ ! -e "$setup_home/.ssh/authorized_keys" ] || fail "laptop-setup wrote ~/.ssh/authorized_keys"
@@ -184,6 +310,7 @@ assert_grep "$alias_cfg" "Host mybox-remote-harness" "dedicated harness alias"
 assert_grep "$alias_cfg" "    HostName 203.0.113.7" "dedicated alias resolved hostname"
 assert_grep "$alias_cfg" "    RemoteForward 22022 127.0.0.1:22" "dedicated alias remote forward"
 assert_grep "$alias_cfg" "Include $alias_home/.ssh/config" "dedicated alias reads user config without editing it"
+assert_grep "$alias_cfg" "/runtime/known_hosts" "dedicated alias separates mutable SSH runtime from config"
 if grep -q "mybox-remote-harness" "$alias_home/.ssh/config"; then
   fail "laptop-setup wrote dedicated alias to user ~/.ssh/config"
 fi
@@ -246,13 +373,17 @@ cat > "$local_session_scripts/inject-rule.sh" <<'EOS'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LOCAL_INJECT_ARGS:?}"
 case "${1:-}" in
-  on) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=PATH=%q\nRH_LAUNCH_FLAGS=\n' "/tmp/rh-bin:$PATH";;
+  on)
+    if [ "${LOCAL_INJECT_FAIL:-0}" = 1 ]; then printf 'RH_STATUS=ERROR\n';
+    else printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=PATH=%q\nRH_LAUNCH_FLAGS=\n' "/tmp/rh-bin:$PATH"; fi
+    ;;
   off) printf 'RH_STATUS=RESTORED\n';;
 esac
 EOS
 chmod +x "$local_session_scripts/mount-project.sh" "$local_session_scripts/inject-rule.sh"
 cat > "$tmp/bin/fake-shell" <<'EOS'
 #!/usr/bin/env bash
+[ -n "${FAKE_SHELL_MARKER:-}" ] && printf 'launched\n' > "$FAKE_SHELL_MARKER"
 exit 0
 EOS
 cat > "$tmp/bin/ssh" <<'EOS'
@@ -276,6 +407,22 @@ assert_grep "$tmp/local-inject.args" "$local_session_home/.remote-harness/.sessi
 assert_grep "$tmp/local-ssh.log" "-F $local_session_home/.remote-harness/.sessions/" "local setup probes through temp config"
 [ ! -e "$local_session_home/.ssh/config" ] || fail "local-setup wrote ~/.ssh/config"
 [ -z "$(find "$local_session_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "local-setup created config.rh-bak"
+
+local_fail_home="$tmp/local-fail-home"
+mkdir -p "$local_fail_home" "$tmp/local-fail-mount"
+if HOME="$local_fail_home" PATH="$tmp/bin:$PATH" RH_COMMON="$local_session_scripts/_common.sh" \
+  SHELL="$tmp/bin/fake-shell" LOCAL_MOUNT_ARGS="$tmp/local-fail-mount.args" \
+  LOCAL_INJECT_ARGS="$tmp/local-fail-inject.args" LOCAL_SSH_LOG="$tmp/local-fail-ssh.log" \
+  LOCAL_MOUNTPOINT="$tmp/local-fail-mount" LOCAL_INJECT_FAIL=1 \
+  FAKE_SHELL_MARKER="$tmp/local-fail-launched" \
+  bash "$local_session_scripts/local-setup.sh" \
+    --via "ssh -p 2222 dev@example.com" --remote-path /srv/app \
+    --mountpoint "$tmp/local-fail-mount" --launch codex --yes \
+    >"$tmp/local-fail.out" 2>"$tmp/local-fail.err"; then
+  fail "local-setup continued after strict rule injection failed"
+fi
+[ ! -e "$tmp/local-fail-launched" ] || fail "local-setup launched the agent after injection failure"
+assert_grep "$tmp/local-fail.err" "refusing to launch" "local setup fails closed"
 
 simple_dir="$tmp/simple-scripts"
 simple_project="$tmp/simple project"
@@ -476,9 +623,13 @@ HOME="$install_home" CODEX_HOME="$install_home/.codex" RH_HOME="$install_home/.r
   bash "$ROOT/manage.sh" codex > "$tmp/manage-install.out"
 [ -f "$install_home/.remote-harness/docs/complete-flow.md" ] || fail "manage install did not copy shared docs"
 [ -f "$install_home/.remote-harness/docs/complete-flow.html" ] || fail "manage install did not copy HTML flow doc"
+[ ! -e "$install_home/.remote-harness/docs/superpowers" ] || fail "manage install copied internal implementation plans"
 [ -f "$install_home/.codex/skills/remote-harness/docs/complete-flow.md" ] || fail "codex copy install did not include docs"
+[ ! -e "$install_home/.codex/skills/remote-harness/docs/superpowers" ] || fail "codex copy install copied internal implementation plans"
 [ -f "$install_home/.codex/skills/remote-harness/SKILL.cn.md" ] || fail "codex copy install did not include SKILL.cn.md"
 [ -x "$install_home/.remote-harness/scripts/simple-bootstrap.sh" ] || fail "manage install did not install executable simple-bootstrap.sh"
+[ -x "$install_home/.remote-harness/scripts/route-command.py" ] || fail "manage install did not install executable route-command.py"
+[ -x "$install_home/.remote-harness/scripts/run-on-project-host.sh" ] || fail "manage install did not install project-host runner"
 
 suggest_user="$(id -un)"
 SSH_CONNECTION='198.51.100.10 55555 203.0.113.7 2222' \
@@ -526,14 +677,17 @@ conflict_state="$tmp/tunnel-conflict.state"
 conflict_setup_log="$tmp/tunnel-conflict.setup.log"
 conflict_ssh_log="$tmp/tunnel-conflict.ssh.log"
 mkdir -p "$conflict_home" "$conflict_project"
-HOME="$conflict_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
+if HOME="$conflict_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
   TUNNEL_STATE="$conflict_state" SETUP_TUNNEL_LOG="$conflict_setup_log" SSH_LOG="$conflict_ssh_log" \
   bash "$ROOT/scripts/laptop-setup.sh" \
     --host example.com --port 32026 --via "ssh user@example.com" \
     --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
     --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
     --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$conflict_project" --launch codex --yes >"$tmp/tunnel-conflict.out" 2>"$tmp/tunnel-conflict.err"
+    --project-dir "$conflict_project" --launch codex --yes >"$tmp/tunnel-conflict.out" 2>"$tmp/tunnel-conflict.err"; then
+  fail "laptop-setup continued after strict rule injection failed"
+fi
+assert_grep "$tmp/tunnel-conflict.err" "refusing to launch" "laptop setup fails closed"
 assert_grep "$tmp/tunnel-conflict.out" "Remote port 32026 is already listening" "tunnel conflict detected"
 assert_grep "$tmp/tunnel-conflict.out" "Switching this setup to remote port 32027" "tunnel conflict fallback"
 assert_grep "$tmp/tunnel-conflict.out" "RemoteForward 32027" "local RemoteForward switched"
@@ -553,7 +707,7 @@ for arg in "$@"; do
     *'check-tunnel.sh'*) printf 'SSH=up\n'; exit 0;;
     *'grep -qx'*) exit 0;;
     *'mount-project.sh'*) printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
-    *'inject-rule.sh'*) printf 'RH_STATUS=ERROR\n'; exit 0;;
+    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\n'; exit 0;;
   esac
 done
 exit 0
@@ -677,6 +831,7 @@ case "$st_port" in *2) ;; *) fail "setup-tunnel hashed port should end in 2 (got
 { [ "$st_port" -ge 20002 ] && [ "$st_port" -le 29992 ]; } || fail "setup-tunnel hashed port out of [20002,29992] (got '$st_port')"
 assert_grep "$st_cfg_ns" "Host alice-mac" "namespaced managed alias"
 assert_grep "$st_cfg_ns" "    ControlMaster no" "setup-tunnel disables multiplexing"
+assert_grep "$st_cfg_ns" "/runtime/known_hosts_alice-mac" "setup-tunnel separates mutable SSH runtime"
 [ ! -e "$st_home/.ssh/config" ] || fail "setup-tunnel namespace wrote ~/.ssh/config"
 [ ! -e "$st_home/.ssh/id_ed25519" ] || fail "setup-tunnel namespace generated key under ~/.ssh"
 [ -f "$st_home/.remote-harness/keys/id_ed25519" ] || fail "setup-tunnel namespace did not generate key under ~/.remote-harness/keys"
@@ -712,7 +867,7 @@ assert_grep "$tmp/st-noport.err" "need --port PORT or --namespace RU" "setup-tun
 # --- inject-rule.sh: a pathological mountpoint ('..') must NOT escape $RH_HOME/.sessions/ ----
 ir_rh="$tmp/ir-home/.remote-harness"; ir_home="$tmp/ir-home2"
 mkdir -p "$ir_rh" "$ir_home" "$tmp/ir-code"
-RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop ".." 0 >/dev/null
+RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop ".." 0 "$basic_ssh_cfg" >/dev/null
 [ -f "$ir_rh/.sessions/default/rule.md" ] || fail "inject-rule: '..' mountpoint not neutralized to .sessions/default"
 [ ! -e "$ir_rh/rule.md" ] || fail "inject-rule: '..' mountpoint escaped to RH_HOME"
 RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude ".." >/dev/null

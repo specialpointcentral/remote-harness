@@ -42,8 +42,8 @@ project and dev environment live. Keep `reference/` aligned with the simple flow
 
 Generic roles still matter for internals: **A** = machine the agent runs on; **P** = machine the code
 lives on (an ssh `<alias>`). The lower-level reverse flow uses a reverse SSH tunnel; the forward flow
-uses direct ssh. Both mount P's project onto an empty dir on A, inject "build on `<alias>`" via
-`inject-rule.sh`, and launch the agent in the mount.
+uses direct ssh. Both mount P's project onto an empty dir on A. `inject-rule.sh` installs strict
+Claude/Codex Bash routing or the opencode SSH instruction, then launches the agent in the mount.
 
 ## Simple Reverse Rules
 
@@ -96,9 +96,9 @@ uses direct ssh. Both mount P's project onto an empty dir on A, inject "build on
   tuning. For shared remote boxes or many long-lived SSHFS mounts, docs and user-facing reminders
   should point to `docs/ssh-sshfs-long-lived-connections*.md` so server operators tune sshd,
   `nofile`, and TCP queues.
-- The launched agent should see short commands such as `ssh rlocal 'cd ... && <command>'`. Hide the
-  temp ssh config behind the session-local `bin/ssh` wrapper that is prepended to the launched
-  agent's `PATH`; do not expose `ssh -F <temp-config> ...` in the injected rule.
+- Claude/Codex must receive the session `PreToolUse` hook and `rh-run`; ordinary Bash commands are
+  mapped by cwd and routed automatically. Keep the temp `bin/ssh` wrapper for opencode and internal
+  SSH config resolution.
 - The default remote mountpoint is under remote `~/.remote-harness/mounts/<project>` and should be
   removed on exit when empty. User-entered mountpoints are allowed because they are explicit choices.
 - When `RH_LANG=zh`, local script prompts should be Chinese. The skill command itself selects

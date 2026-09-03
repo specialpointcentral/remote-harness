@@ -10,8 +10,9 @@ remote-harness connects two machines:
 - **A**: where the coding agent runs.
 - **P**: where the project and development environment live.
 
-It mounts P's project onto A with sshfs, injects a session rule that project commands must run on P,
-and launches the selected agent in the mount.
+It mounts P's project onto A with sshfs and launches the selected agent in the mount. Claude and
+Codex receive a session hook that rewrites every Bash call to P; opencode retains instruction-based
+SSH routing.
 
 ## 2. Directions
 
@@ -62,9 +63,8 @@ loopback with `from="127.0.0.1,::1"`. A reference token under
 while another still uses it. Historical user files in `~/.ssh` are otherwise user-owned and are not
 modified unless the user explicitly asks.
 
-The launched agent sees short commands (`ssh rlocal ...` or `ssh <server-alias> ...`). When a temp
-config is required, `inject-rule.sh` creates a session `bin/ssh` wrapper and prepends it to `PATH`,
-so the rule never exposes `ssh -F <temp-config>`.
+Claude/Codex receive a session `PreToolUse` hook and `bin/rh-run`. opencode retains the short
+`ssh rlocal ...` / `ssh <server-alias> ...` instructions through the session `bin/ssh` wrapper.
 
 ## 5. Privacy Boundary
 
@@ -85,22 +85,27 @@ systemd/PAM `nofile`, and TCP queue guidance in
 This is not a hard prerequisite for one small session; it is an operational requirement for stable
 shared-server use.
 
-## 7. Rule Injection
+## 7. Rule And Hook Injection
 
 `inject-rule.sh` is session-scoped and direction-neutral. It writes under
-`$RH_HOME/.sessions/<key>` and never writes the mounted repository. It tells the launched agent:
+`$RH_HOME/.sessions/<key>` and never writes the mounted repository. For Claude and Codex it creates
+a `PreToolUse` hook plus `bin/rh-run`. The hook preserves the tool input, maps cwd relative to the
+mount, and replaces the Bash command with the runner. The runner transmits the encoded command
+through SSH and executes it in P's login shell with `GIT_OPTIONAL_LOCKS=0`.
 
-- local file reads/writes/edits/searches are allowed in the mount;
-- project commands must run on P through SSH;
-- mutating git commands and hooks count as project commands.
+The launch aborts when the rule, hook, runner, Python runtime, or session SSH config is unavailable.
+Once the hook is loaded, handler errors return denial and SSH failures do not fall back to the
+original command on A. Client hook frameworks remain guardrails rather than complete isolation.
 
 Agent-specific channels:
 
-- Claude: `--append-system-prompt-file <rule>`.
-- opencode: `OPENCODE_CONFIG=<session config>`.
-- Codex: `-c developer_instructions=<rule>`; non-yolo also enables workspace-write network access
-  and writable roots for the relevant `~/.remote-harness/.sessions/...` dirs so SSH can write its
-  temporary `known_hosts` there without touching `~/.ssh`.
+- Claude: `--append-system-prompt-file <rule> --settings <session settings>`.
+- Codex: session `developer_instructions`, inline `hooks.PreToolUse`, and explicit trust for the
+  generated hook; non-yolo also enables workspace-write network access and session writable roots.
+- opencode: `OPENCODE_CONFIG=<session config>` and instruction-based SSH routing.
+
+The hook is a command-routing guardrail, not a filesystem isolation boundary. SSHFS and the reverse
+SSH key still require A to be trusted with access to the selected project-host account.
 
 ## 8. Invariants
 

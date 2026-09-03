@@ -35,9 +35,11 @@ RH="${RH_HOME:-$HOME/.remote-harness}"
 
 - `"$RH/scripts/laptop-setup.sh"`：reverse 编排器，在笔记本运行。它检查本地 sshd；当收到 remote-harness 公钥时，
   管理带标签的临时 `authorized_keys` 块；通过会话级 ssh config 建立反向隧道；在远端挂载笔记本项目；
-  注入“在笔记本上运行”的规则；远端启动 Agent；退出时清理挂载、规则、隧道状态、本地会话 config 和托管授权引用。
+  为 Claude/Codex 安装严格路由或为 opencode 注入 SSH 规则；远端启动 Agent；退出时清理挂载、规则、
+  隧道状态、本地会话 config 和托管授权引用。
 - `"$RH/scripts/local-setup.sh"`：forward 编排器，在本地 Agent 所在机器运行。它通过会话级 ssh config 解析服务器目标；
-  将服务器项目 sshfs 挂载到本地；注入“在服务器上运行”的规则；在本地挂载目录启动 Agent；退出时卸载并删除会话 config。
+  将服务器项目 sshfs 挂载到本地；为 Claude/Codex 安装严格路由或为 opencode 注入 SSH 规则；在本地
+  挂载目录启动 Agent；退出时卸载并删除会话 config。
 
 ## 共享运行时 helper
 
@@ -48,9 +50,13 @@ RH="${RH_HOME:-$HOME/.remote-harness}"
   做真实 SSH 登录测试。
 - `"$RH/scripts/mount-project.sh"`：方向无关的 sshfs helper。它把 `<alias>:<remote-path>` 挂载到本地挂载点；
   默认拒绝非空目标（除非传 `--force`）；会重验陈旧挂载；支持 `--unmount`。
-- `"$RH/scripts/inject-rule.sh"`：方向无关的会话规则 helper，在 Agent 启动所在机器运行。它在
+- `"$RH/scripts/inject-rule.sh"`：方向无关的会话规则/hook helper，在 Agent 启动所在机器运行。它在
   `$RH_HOME/.sessions/<key>` 下写会话级产物，并返回 Claude、Codex 或 opencode 的启动环境/参数。
   它永不写全局 Agent 配置，也永不写入已挂载仓库。
+- `"$RH/scripts/route-command.py"`：Claude/Codex `PreToolUse` handler，保留工具输入，映射挂载点相对
+  cwd，并把 Bash 替换为会话 runner。
+- `"$RH/scripts/run-on-project-host.sh"`：通过 SSH 传输编码命令，在校验后的项目主机 cwd 和登录 shell
+  中执行。
 - `"$RH/scripts/_common.sh"`：setup 脚本共同 source 的库，提供输出辅助、安全 shell quoting、`parse_via`、
   会话级 ssh config 默认值和托管 Host block 写入。
 

@@ -327,7 +327,8 @@ cleanup() {
       case \"\$cfg\" in
         */.remote-harness/.sessions/*/ssh_config)
           dir=\$(dirname \"\$cfg\")
-          rm -f \"\$cfg\" \"\$dir\"/known_hosts_* 2>/dev/null || true
+          rm -f \"\$cfg\" 2>/dev/null || true
+          rm -rf \"\$dir/runtime\" 2>/dev/null || true
           rmdir \"\$dir\" 2>/dev/null || true
           ;;
       esac
@@ -474,7 +475,8 @@ mkdir -p "$HOME/.remote-harness/.sessions" 2>/dev/null || true
 LOCAL_SESSION_DIR="$(mktemp -d "$HOME/.remote-harness/.sessions/rev.XXXXXX")" || exit 2
 LOCAL_SSH_CONFIG="$LOCAL_SESSION_DIR/ssh_config"
 CFG="$LOCAL_SSH_CONFIG"; touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
-write_session_ssh_defaults "$LOCAL_SESSION_DIR"
+write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
+  || { err "could not create session SSH runtime directory"; exit 1; }
 write_target_forward() {
   local _port="$1" _rf_line
   _rf_line="    RemoteForward $_port 127.0.0.1:22"
@@ -862,7 +864,8 @@ if [ "$rh_status" = INJECTED ]; then
   EFF_LAUNCH="${rh_env:+$rh_env }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
-  warn "could not inject run-on-laptop rule ($rh_status) — agent may try to build/test on the box"
+  err "could not install strict run-on-laptop routing ($rh_status); refusing to launch the agent"
+  exit 1
 fi
 
 hdr "Phase 5: launching ${LAUNCH}"

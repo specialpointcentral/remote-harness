@@ -69,8 +69,8 @@ on readable continuation lines.
   directories at the end where possible. It does not write `~/.ssh/config`, `known_hosts`, or SSH
   keys. Its only `~/.ssh` mutation is the laptop `authorized_keys` managed block used for temporary
   reverse authentication.
-- The launched agent gets a session-local `ssh` wrapper in `PATH`, so instructions can say
-  `ssh rlocal ...` instead of `ssh -F <temp-config> rlocal ...`.
+- Claude/Codex get a session-local `PreToolUse` hook and runner that route Bash automatically.
+  opencode keeps the session-local `ssh` wrapper and short `ssh rlocal ...` instruction.
 - Local paths stay out of chat unless the user explicitly pastes them.
 
 ## Flow
@@ -90,9 +90,8 @@ on readable continuation lines.
 8. It delegates to the existing `laptop-setup.sh`, passing `--box-ssh-config <temp-config>`.
 9. `laptop-setup.sh` creates its own local session ssh config for the laptop-to-box RemoteForward
    alias and uses an internal `ssh` wrapper so script calls can stay short (`ssh <target>`).
-10. `laptop-setup.sh` uses the box temp config for all box-to-laptop operations: `check-tunnel.sh`,
-   `mount-project.sh`, port-switch alias rewrites, and the launched agent's session-local `ssh`
-   wrapper that resolves `ssh rlocal ...` through the temp config.
+10. `laptop-setup.sh` uses the box temp config for `check-tunnel.sh`, `mount-project.sh`, port-switch
+   alias rewrites, the Claude/Codex runner, and the opencode session `ssh` wrapper.
 11. On exit, cleanup unmounts sshfs, removes session rules, removes temp ssh configs, and removes
     default empty mountpoint directories under `~/.remote-harness/mounts`.
 

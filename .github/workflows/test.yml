@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: bash -n manage.sh tests/regression.sh scripts/*.sh
+      - name: Check Python syntax
+        run: python3 -m py_compile scripts/route-command.py tests/codex_tui_e2e.py
+      - name: Run regression tests
+        run: bash tests/regression.sh

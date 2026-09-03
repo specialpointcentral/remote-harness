@@ -29,7 +29,7 @@
 
 默认产品形态是 **simple reverse**：**A** = 运行编程 Agent 的远端机器，**P** = 位于 NAT 后、存放代码的用户笔记本。Agent 只返回一条本地 bootstrap 命令；所有具体 SSH/路径选择都在用户本地终端完成。对应支持的另一种形态是 **simple forward**：**A** = 运行 Codex/Agent 的本地机器，**P** = 存放项目和开发环境的 SSH 服务器。`reference/` 应与 simple 流程保持一致。
 
-内部仍使用通用角色定义：**A** = 智能体运行所在机器；**P** = 代码所在机器（通过 ssh `<alias>` 访问）。底层 reverse 流程使用反向 SSH 隧道；forward 流程使用直接 ssh。两种方向均会将 P 上的项目通过 sshfs 挂载到 A 上的空目录，通过 `inject-rule.sh` 注入"在 `<alias>` 上构建"规则，并在挂载目录中启动智能体。
+内部仍使用通用角色定义：**A** = 智能体运行所在机器；**P** = 代码所在机器（通过 ssh `<alias>` 访问）。底层 reverse 流程使用反向 SSH 隧道；forward 流程使用直接 ssh。两种方向均会将 P 上的项目通过 sshfs 挂载到 A 上的空目录；`inject-rule.sh` 为 Claude/Codex 安装严格 Bash 路由，或为 opencode 注入 SSH 指令，然后在挂载目录启动智能体。
 
 ## Simple Reverse 规则
 
@@ -71,9 +71,8 @@
 - remote-harness 的会话级 keepalive、`sshfs reconnect` 和临时 SSH config 不能替代服务器容量配置。
   多用户共享远程盒子或大量长期 SSHFS 挂载时，应在文档和用户提醒中指向
   `docs/ssh-sshfs-long-lived-connections*.md`，由服务器运维侧调整 sshd、`nofile` 和 TCP 队列。
-- 启动后的 Agent 应该只看到 `ssh rlocal 'cd ... && <command>'` 这样的短命令。临时 ssh config 必须通过
-  prepend 到 Agent `PATH` 的会话级 `bin/ssh` wrapper 隐藏；不要在注入规则里暴露
-  `ssh -F <临时config> ...`。
+- Claude/Codex 必须获得会话级 `PreToolUse` hook 和 `rh-run`，普通 Bash 命令按 cwd 自动映射并路由。
+  临时 `bin/ssh` wrapper 继续服务于 opencode 和内部 SSH config 解析。
 - 默认远端挂载点位于远端 `~/.remote-harness/mounts/<project>`，退出时如为空应清理。用户手动输入的
   挂载点属于明确选择，可以创建/使用。
 - `RH_LANG=zh` 时，本地脚本提示应使用中文。skill 命令只负责选择 `RH_LANG`；其余交互由本地脚本负责。
@@ -87,9 +86,8 @@
   remote-harness 脚本，forward 向导会另外询问项目服务器 target。
 - 服务器 SSH target、服务器项目目录、本地挂载点，以及调用中未明确指定的 YOLO 偏好，都由本地向导收集。
 - simple 路径不得扫描服务器来发现项目目录。缓存值只能作为提示默认值。
-- 映射目录用于本地文件读取、写入、编辑和搜索。项目命令（构建、运行、测试、安装、格式化、lint、
-  language server、迁移、会修改状态的 git 命令及其他工具链/运行时工作）必须通过注入的
-  `ssh <alias> 'cd ... && <cmd>'` 规则在服务器执行。
+- 映射目录用于本地文件读取、写入、编辑和搜索。Claude/Codex 的 Bash 调用由会话 hook 按 cwd
+  自动路由到服务器；opencode 继续使用注入的 `ssh <alias> 'cd ... && <cmd>'` 规则。
 - `local-setup.sh` 必须为每个服务器 target 使用会话级 SSH config，包括已有 Host alias。用户提供原始
   SSH 参数时可以创建 `<host>-dev`；用户提供 Host alias 时可通过会话 config 使用该短名。临时
   `known_hosts` 留在本地 `~/.remote-harness/.sessions/...` 下，并关闭 multiplexing。

@@ -2,9 +2,9 @@
 
 ## 结论
 
-可行。现有 forward 流程已经能把 SSH 服务器上的项目挂载到本地，注入“项目命令在服务器执行”的规则，
-并在本地挂载目录中启动 Agent。新的 simple 层增加一个本地终端向导，让 skill 只返回一条短命令，而不是让
-Agent 在聊天中收集服务器、路径和挂载点细节。
+可行。forward 流程把 SSH 服务器项目挂载到本地，为 Claude/Codex 安装严格 Bash 路由（或为
+opencode 注入 SSH 指令），并在挂载目录启动 Agent。simple 层增加本地终端向导，让 skill 只返回一条
+短命令，而不是让 Agent 在聊天中收集服务器、路径和挂载点细节。
 
 该模式面向：Codex/Agent 运行在本地；项目文件和开发环境位于可直接 SSH 访问的服务器。
 
@@ -15,8 +15,7 @@ simple reverse。若请求模糊，则输出不带 `--mode` 的 `simple-bootstra
 ## 边界
 
 - 本地文件工具可以在映射目录中读取、写入、编辑和搜索文件。
-- 项目命令必须通过 SSH 在服务器执行：构建、运行、测试、安装依赖、格式化、lint、language server、
-  迁移、会修改状态的 git 命令，以及其他工具链/运行时工作。
+- Claude/Codex Bash 命令按挂载点相对 cwd 自动路由到服务器；opencode 遵守注入的 SSH 指令。
 - 本地向导收集服务器 SSH target、服务器项目目录、可选本地挂载点和启动偏好。
 - simple 路径不扫描服务器来发现项目目录。缓存值只能作为提示默认值。
 - 调用中明确要求 YOLO 时即为最终选择；向导不会再询问 YOLO。
@@ -46,7 +45,7 @@ RH_LANG=zh bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh" 
 5. 它调用 `local-setup.sh`。
 6. `local-setup.sh` 为服务器 target 创建会话级 SSH config；若用户提供原始 SSH 参数，还会创建短 alias。
 7. `mount-project.sh` 将 `<server-alias>:<server-project>` 通过 sshfs 挂载到本地挂载点。
-8. `inject-rule.sh` 注入会话级规则，要求启动后的 Agent 把项目命令放到服务器执行。
+8. `inject-rule.sh` 为 Claude/Codex 安装严格 Bash 路由，或为 opencode 注入 SSH 指令。
 9. 选定的本地 Agent 在挂载目录中启动。
 10. Agent 退出后，脚本自动卸载 sshfs、删除会话规则、删除临时 ssh config，并在默认挂载点目录为空时清理它。
 

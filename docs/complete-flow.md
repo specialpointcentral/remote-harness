@@ -72,7 +72,8 @@ Key details:
   `remote-harness:reverse-auth:<tag>` block to `~/.ssh/authorized_keys`; it is reference-counted
   and removed when the last session exits.
 - Codex is launched on the remote box inside the remote mountpoint.
-- The injected rule tells Codex to run project commands through `ssh rlocal 'cd <project> && <cmd>'`.
+- The injected hook rewrites every Codex Bash command to a session runner. The runner maps the
+  SSHFS-relative cwd and executes the encoded command on the laptop through `rlocal`.
 
 ## Forward
 
@@ -101,8 +102,7 @@ Key details:
 - Raw SSH args become a session-local `<host>-dev` alias; an existing Host alias is used through a
   read-only include of the user's SSH config.
 - Files are read, written, edited, and searched in the local sshfs mount.
-- Project commands run on the server through
-  `ssh <server-alias> 'cd <server project> && <cmd>'`.
+- Every Codex Bash command is rewritten to the server with mount-relative cwd mapping.
 - Codex is launched locally inside the local mountpoint.
 
 ## Codex Injection
@@ -110,14 +110,14 @@ Key details:
 `inject-rule.sh` does not modify global Codex config. It writes session artifacts under
 `~/.remote-harness/.sessions/<session-key>`.
 
-| Mode | Codex cwd | File work | Project commands |
+| Mode | Codex cwd | File work | Bash commands |
 |---|---|---|---|
-| Reverse | remote mountpoint | remote mount, writes back to laptop | `ssh rlocal ...` |
-| Forward | local mountpoint | local mount, writes back to server | `ssh <server-alias> ...` |
+| Reverse | remote mountpoint | remote mount, writes back to laptop | Hook routes to laptop |
+| Forward | local mountpoint | local mount, writes back to server | Hook routes to server |
 
-For Codex, the rule is passed with `-c developer_instructions=<rule>`. Non-YOLO sessions also get
-workspace-write, network access, and writable roots for the session SSH runtime directories. YOLO
-sessions use Codex's dangerous bypass flag.
+For Codex, the rule and inline `PreToolUse` hook are passed as session config. The hook calls a
+generated runner under `~/.remote-harness/.sessions/<session-key>/bin`; routing setup failure aborts
+launch. Non-YOLO sessions also get workspace-write, network access, and session writable roots.
 
 ## Cleanup
 

@@ -101,7 +101,8 @@ mkdir -p "$HOME/.remote-harness/.sessions" 2>/dev/null || true
 LOCAL_SESSION_DIR="$(mktemp -d "$HOME/.remote-harness/.sessions/fwd.XXXXXX")" || exit 2
 LOCAL_SSH_CONFIG="$LOCAL_SESSION_DIR/ssh_config"
 CFG="$LOCAL_SSH_CONFIG"; touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
-write_session_ssh_defaults "$LOCAL_SESSION_DIR"
+write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
+  || { err "could not create session SSH runtime directory"; exit 1; }
 
 # Raw connection (explicit user/port/key/jump host) → create a session-local managed alias carrying
 # those exact params, so sshfs and the rule's `ssh <alias>` are stable. A bare alias/host is used
@@ -177,7 +178,8 @@ if [ "$(printf '%s\n' "$rh_out" | sed -n 's/^RH_STATUS=//p' | head -1)" = INJECT
   EFF_LAUNCH="${rh_env:+$rh_env }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session rule: run builds on '$SALIAS' (removed on exit)"
 else
-  warn "could not inject run-on-server rule — the agent may try to build on this machine"
+  err "could not install strict run-on-server routing; refusing to launch the agent"
+  exit 1
 fi
 
 # ---- launch the agent LOCALLY, in the mount cwd ----------------------------

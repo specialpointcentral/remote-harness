@@ -2,9 +2,9 @@
 
 ## Verdict
 
-Feasible. The existing forward flow already mounts an SSH server project onto the local machine,
-injects a rule that runs project commands on the server, and launches the agent locally in the
-mount. The new simple layer adds a local terminal wizard so the skill can return one short command
+Feasible. The forward flow mounts an SSH server project onto the local machine, installs strict
+Claude/Codex Bash routing to the server (or an opencode SSH instruction), and launches the agent in
+the mount. The simple layer adds a local terminal wizard so the skill can return one short command
 instead of asking the agent to collect server, path, and mountpoint details in chat.
 
 This mode targets: Codex/agent runs locally; project files and the development environment live on a
@@ -18,8 +18,8 @@ reverse and caches the mode choice.
 ## Boundary
 
 - Local file tools may read, write, edit, and search the mounted project directory.
-- Project commands must run on the server via SSH: build, run, test, install, format, lint, language
-  server, migrations, mutating git commands, and other toolchain/runtime work.
+- Claude/Codex Bash commands are automatically routed to the server with mount-relative cwd mapping.
+  opencode follows the injected SSH instruction.
 - The local wizard collects server SSH target, server project directory, optional local mountpoint,
   and launch preference.
 - The simple path does not scan the server for project directories. Cached values are prompt
@@ -57,8 +57,7 @@ server target.
 6. `local-setup.sh` creates a session-local SSH config for the server target and a short alias when
    raw SSH args were supplied.
 7. `mount-project.sh` sshfs-mounts `<server-alias>:<server-project>` onto the local mountpoint.
-8. `inject-rule.sh` injects the session-local rule telling the launched agent to run project
-   commands on the server.
+8. `inject-rule.sh` installs strict Claude/Codex Bash routing or the opencode SSH instruction.
 9. The chosen local agent launches in the mount.
 10. On exit, cleanup unmounts sshfs, removes the session rule, removes the temp ssh config, and
     removes the default mountpoint directory when it is empty.

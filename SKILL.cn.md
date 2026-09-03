@@ -43,8 +43,8 @@ Simple forward：
 - 项目和开发环境位于可直接 SSH 访问的服务器。
 - 命令在本地提示服务器 SSH target、服务器项目目录、可选本地挂载点和启动偏好。
 - 文件读取、写入、编辑、搜索都在本地 sshfs 映射目录中进行。
-- 构建、运行、测试、安装依赖、formatter、linter、language server、会修改状态的 git 命令，以及其他项目工具，
-  必须通过 `ssh <server-alias> 'cd <project> && <cmd>'` 在服务器执行。
+- Claude/Codex 的每个 Bash 调用都会按挂载点相对 cwd 自动路由到服务器；路由创建失败时拒绝启动。
+  opencode 仍使用注入的 SSH 提示词规则。
 
 reverse、forward 和无法判断的请求都使用统一的 simple bootstrap 流程。
 
@@ -151,8 +151,8 @@ ssh config：`~/.remote-harness/.sessions/.../ssh_config`，退出清理时删�
 追加前会先检查本机是否已有匹配且有效的授权；已有则复用，不重复追加。托管授权会在
 `~/.remote-harness/.sessions/authorized-keys/...` 下引用计数，退出时只有没有活动会话继续引用才删除。
 
-启动 Agent 时会在本次会话的 `PATH` 中加入临时 `ssh`
-包装器，所以注入规则里只需要写 `ssh rlocal ...`。
+Claude/Codex 会获得会话级 `PreToolUse` hook 和 runner。Agent 直接运行普通相对命令，hook 会把挂载
+目录 cwd 映射到笔记本项目并改写 Bash。opencode 继续使用会话级 `ssh` wrapper 和明确 SSH 指令。
 
 脚本会把上次确认过的值记录在本地 `~/.remote-harness/simple-cache.env`，下次作为默认值展示。
 该缓存只在本地；删除此文件即可重置默认值。
@@ -169,8 +169,9 @@ forward 模式启动后，终端会询问：
 - 是否用 YOLO/免审批模式启动，默认 yes，除非本地缓存记录为 no。若调用时已经明确要求 yolo，
   且命令包含 `--yolo`，则跳过这个问题。
 
-启动后的 Agent 工作在本地挂载目录中。注入规则允许本地文件读写、编辑和搜索，但要求项目命令通过
-SSH 在服务器执行。退出启动的 Agent 后，会自动卸载项目并删除本次会话规则。
+启动后的 Agent 工作在本地挂载目录中。Claude/Codex 的文件工具使用挂载目录，所有 Bash 自动改写到
+服务器；严格路由创建失败则中止启动。opencode 保留提示词 SSH 路由。退出 Agent 后自动卸载项目并
+删除会话产物。
 
 forward setup 始终使用本地 `~/.remote-harness/.sessions/.../ssh_config` 下的会话级 ssh config。
 当用户输入的是原始 SSH 参数而不是 Host alias 时，会在其中创建会话级 `<host>-dev` alias。它不会在本地
@@ -186,6 +187,7 @@ forward setup 始终使用本地 `~/.remote-harness/.sessions/.../ssh_config` �
   仅限回环来源的临时块写入 `~/.ssh/authorized_keys`，退出时删除；若本机已有匹配且有效的用户授权，
   则直接复用且不修改。
 - Simple reverse：远端有 `sshfs` 和要启动的 Agent CLI。
+- Claude/Codex：Agent 主机有 `python3`；项目主机有 POSIX `sh` 和 base64。
 - Simple reverse：笔记本可以运行 SSH server；必要时 `laptop-setup.sh` 会检测并提示开启。
 - Simple forward：本地机器可以 SSH 登录服务器，并且本地有 `sshfs`；缺失时脚本会提示安装。
 - 多用户共享远端服务器或存在大量长期 SSHFS 挂载时，建议优化 sshd 容量、keepalive、文件描述符和

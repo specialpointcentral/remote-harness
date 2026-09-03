@@ -12,7 +12,7 @@
   <img alt="transport" src="https://img.shields.io/badge/transport-SSH%20%2B%20sshfs-orange">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-FUSE--T%20(no%20kext)-brightgreen">
   <img alt="shell" src="https://img.shields.io/badge/built%20with-Bash-1f425f">
-  <img alt="deps" src="https://img.shields.io/badge/runtime%20deps-none%20(ssh%20%2B%20sshfs)-lightgrey">
+  <img alt="deps" src="https://img.shields.io/badge/runtime%20deps-ssh%20%2B%20sshfs%20%2B%20python3-lightgrey">
 </p>
 
 <p align="center"><b>中文</b> · <a href="#english">English</a></p>
@@ -47,11 +47,17 @@
 `/remote-harness` 触发；Codex 用 `$remote-harness` 直接调用技能。默认 simple reverse 模式下，Agent
 只给你一条命令；具体 SSH、路径、命名空间和挂载点都在你的本地终端里输入，不进入 Agent 聊天。
 
+本 fork 对 Claude Code 和 Codex 增加了严格命令路由：会话级 `PreToolUse` hook 会把每个 Bash 调用
+自动改写到代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook、runner
+或 SSH config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。opencode 当前仍使用
+提示词规则路由。
+
 记号：**A** = 运行 Agent 的机器；**P** = 存放代码的机器（用一个 ssh `<别名>` 指代）。
 
 ### 安装 Skill
 
-仓库地址：[`https://github.com/chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)
+维护仓库：[`https://github.com/specialpointcentral/remote-harness`](https://github.com/specialpointcentral/remote-harness)
+（基于 [`chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)）。
 
 把 remote-harness 安装到**启动 Agent 的那台机器**上：远程开发本地项目时，通常是远端盒子；本地开发服务器项目时，通常是本机。
 
@@ -70,7 +76,7 @@ cd remote-harness
 在目标机器上的 Codex / Claude Code / opencode 里粘贴：
 
 ```text
-请在当前机器上安装 remote-harness skill。GitHub 仓库是 https://github.com/chenjh16/remote-harness，请克隆或更新这个仓库，运行 ./manage.sh 安装到当前用户的 Claude Code / Codex / opencode 入口；不要修改 ~/.ssh；完成后告诉我可用的调用方式。
+请在当前机器上安装 remote-harness skill。GitHub 仓库是 https://github.com/specialpointcentral/remote-harness，请克隆或更新这个仓库，运行 ./manage.sh 安装到当前用户的 Claude Code / Codex / opencode 入口；不要修改 ~/.ssh；完成后告诉我可用的调用方式。
 ```
 
 | Agent | 入口位置 | 调用 |
@@ -114,7 +120,7 @@ Claude Code / opencode 使用 `/remote-harness 中文，本地开发远程项目
    如果脚本在远端 skill 目录，命令会先从远端读取它再在本地运行。
 2. 你在本地终端运行该命令，并按提示输入 SSH target、项目目录和可选挂载点。
 3. bootstrap 自动建立 reverse 隧道或 forward 直连，并通过 sshfs 完成挂载。
-4. 在挂载目录启动所选 Agent，并注入“项目命令必须在代码所在机器执行”的会话规则。
+4. 在挂载目录启动所选 Agent；Claude/Codex 安装会话级 hook，自动把 Bash 路由到代码所在机器。
 5. 退出 Agent 时**自动卸载**。随时再次启动 remote-harness 重新连接（幂等；陈旧挂载会被检测并重挂）。
 
 简短说“本地开发远程项目”即可触发 forward；简短说“远程开发本地”即可触发 reverse。若说法无法判断，
@@ -142,10 +148,10 @@ Claude Code / opencode 使用 `/remote-harness 中文，本地开发远程项目
 
 **② 正向（forward）— Agent 在本机，代码在可直连的远程服务器**
 
-无需隧道：本机直接 ssh 到服务器，把服务器项目挂到本地空目录，Agent 在本地启动，构建经
-`ssh <别名>` 在服务器上执行。
+无需隧道：本机直接 ssh 到服务器，把服务器项目挂到本地空目录，Agent 在本地启动；Claude/Codex
+的 Bash 调用由 hook 自动在服务器上执行。
 
-两个方向的不变式相同：**挂载到空目录 → 注入「在 `<别名>` 上构建」规则 → 在挂载点启动 Agent**。
+两个方向的不变式相同：**挂载到空目录 → 创建会话命令路由 → 在挂载点启动 Agent**。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -177,6 +183,8 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
     `brew install macos-fuse-t/homebrew-cask/fuse-t && brew install macos-fuse-t/homebrew-cask/sshfs-fuse-t`。
     **不要用 macFUSE**（它要求降低安全策略）。FUSE-T 保留 sshfs 的同步写，编辑会先落到代码所在机器
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
+- Claude/Codex 严格路由要求 Agent 所在机器有 `python3`。项目所在机器只需 POSIX `sh`、base64
+  解码器和项目自己的正常登录 shell。
 - 多用户共享远程开发服务器建议按
   [`docs/ssh-sshfs-long-lived-connections.cn.md`](docs/ssh-sshfs-long-lived-connections.cn.md)
   调整 sshd 容量、keepalive、`nofile` 和 TCP 队列。该优化不是 remote-harness 的硬性前置条件，
@@ -198,7 +206,9 @@ remote-harness/
 │   ├── simple-laptop-setup.sh simple-local-setup.sh  # 分模式本地向导
 │   ├── suggest-via.sh        # simple 反向：远端 SSH target 默认值
 │   ├── setup-tunnel.sh check-tunnel.sh   # 反向隧道的会话级别名 / 检查
-│   ├── mount-project.sh inject-rule.sh   # 两向复用的挂载与规则注入
+│   ├── mount-project.sh inject-rule.sh   # 两向复用的挂载与规则/hook 注入
+│   ├── route-command.py                  # PreToolUse JSON 改写与 cwd 映射
+│   ├── run-on-project-host.sh            # SSH 命令传输与项目主机 dispatcher
 │   ├── laptop-setup.sh       # 反向编排（在笔记本上跑）
 │   └── local-setup.sh        # 正向编排（在本机上跑）
 ├── adapters/{codex,opencode}.md   # 各 Agent 的入口（只设置 --launch）
@@ -230,7 +240,11 @@ remote-harness/
   最后一个会话退出时清理。
 - `--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow` 只写进**本次会话**
   的配置，退出即清。
-- 注入的规则是**会话级**的（不写全局文件、不碰挂载的仓库）；退出删除会话目录。
+- Claude/Codex 的 hook、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；退出删除
+  会话目录。hook 成功加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
+- 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
+  一把能访问本机 SSH/SFTP 的临时密钥；请只在你信任的 Agent 主机上使用，不要把敏感目录作为项目挂载。
+- opencode 当前没有启用本 fork 的强制 hook，仍依赖会话提示词遵守 SSH 路由。
 
 ### 故障排查
 
@@ -267,9 +281,15 @@ concrete SSH targets, paths, namespaces, and mountpoints are entered in the user
 not in chat. Generically: **A** = the machine the agent runs on; **P** = the
 machine the code lives on (an ssh `<alias>`).
 
+This fork adds strict routing for Claude Code and Codex. A session `PreToolUse` hook rewrites every
+Bash call to the project host and maps the SSHFS-relative cwd to its corresponding project-host
+directory. Hook, runner, or SSH-config setup failures abort the launch instead of falling back to
+the agent host. opencode currently retains instruction-only routing.
+
 ### Install the Skill
 
-Repository: [`https://github.com/chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)
+Maintained repository: [`https://github.com/specialpointcentral/remote-harness`](https://github.com/specialpointcentral/remote-harness)
+(based on [`chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)).
 
 Install remote-harness on the machine where you invoke the agent: for remote-dev-local-project,
 this is usually the remote box; for local-dev-server-project, this is usually your local machine.
@@ -289,7 +309,7 @@ cd remote-harness
 Paste this into Codex / Claude Code / opencode on the target machine:
 
 ```text
-Install the remote-harness skill on this machine. GitHub repository: https://github.com/chenjh16/remote-harness; clone or update that repository, run ./manage.sh to install it for the current user's Claude Code / Codex / opencode entries, do not modify ~/.ssh, and tell me the available invocation commands when done.
+Install the remote-harness skill on this machine. GitHub repository: https://github.com/specialpointcentral/remote-harness; clone or update that repository, run ./manage.sh to install it for the current user's Claude Code / Codex / opencode entries, do not modify ~/.ssh, and tell me the available invocation commands when done.
 ```
 
 | Agent | Location | Invoke |
@@ -340,8 +360,8 @@ Then:
 2. You run that command in your local terminal and enter the SSH target, project directory, and
    optional mountpoint.
 3. The bootstrap opens the reverse tunnel or forward connection and mounts the project with sshfs.
-4. It launches the chosen agent in the mount and injects a session rule: project commands must run
-   on the machine that hosts the code.
+4. It launches the chosen agent in the mount. Claude/Codex receive a session hook that routes Bash
+   automatically to the machine hosting the code.
 5. **Auto-unmounts on exit.** Start remote-harness again anytime to reconnect; stale mounts are
    detected and replaced.
 
@@ -372,10 +392,10 @@ removed on exit.
 
 **② Forward — agent local, code on a directly ssh-reachable server.** No tunnel: the local machine
 ssh's straight to the server, mounts its project onto a local empty dir, the agent runs locally, and
-builds run on the server via `ssh <alias>`.
+Claude/Codex Bash calls are routed automatically to the server.
 
-Both share the invariant: **mount onto an empty dir → inject "build on `<alias>`" → launch the agent
-in the mount.**
+Both share the invariant: **mount onto an empty dir → create session command routing → launch the
+agent in the mount.**
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 
@@ -413,6 +433,8 @@ See the full template, verification commands, and rollback notes in
     Avoid macFUSE (it requires lowering security). FUSE-T keeps sshfs's synchronous writes, so edits
     land on the host before remote builds. (Kext-less fallback: `rclone nfsmount`, but its writes are
     async — prefer FUSE-T for this edit-here/build-on-host workflow.)
+- Strict Claude/Codex routing requires `python3` on the agent host. The project host needs only
+  POSIX `sh`, a base64 decoder, and its normal login shell.
 - Shared remote development servers should use
   [`docs/ssh-sshfs-long-lived-connections.md`](docs/ssh-sshfs-long-lived-connections.md) to tune sshd
   capacity, keepalive, `nofile`, and TCP queues. This is not a hard prerequisite for remote-harness,
@@ -431,7 +453,9 @@ remote-harness/
 │   ├── simple-laptop-setup.sh simple-local-setup.sh  # mode-specific local wizards
 │   ├── suggest-via.sh                        # simple reverse remote SSH target default
 │   ├── setup-tunnel.sh check-tunnel.sh        # reverse session alias + tunnel check
-│   ├── mount-project.sh inject-rule.sh        # shared mount + session rule helpers
+│   ├── mount-project.sh inject-rule.sh        # shared mount + session rule/hook helpers
+│   ├── route-command.py                       # PreToolUse rewrite + cwd mapping
+│   ├── run-on-project-host.sh                 # SSH transport + project-host dispatcher
 │   ├── laptop-setup.sh                        # reverse orchestrator
 │   └── local-setup.sh                         # forward orchestrator
 ├── adapters/{codex,opencode}.md
@@ -468,8 +492,12 @@ remote-harness/
   the last session out cleans it up.
 - `--yolo` bypasses approvals and is applied **only when you ask**; opencode's `permission:allow`
   goes into the **per-session** config only and is gone on exit.
-- The injected rule is **session-scoped** (no global files, never touches the mounted repo); the
-  session dir is removed on exit.
+- Claude/Codex hooks, runners, and instructions are **session-scoped**. Once the hook is loaded,
+  handler errors deny the call and SSH failures do not fall back to the original command.
+- Strict command routing is not a filesystem sandbox. In reverse mode the trusted agent host holds
+  a temporary key capable of laptop SSH/SFTP access. Do not use an untrusted agent host or mount a
+  directory containing unrelated secrets.
+- opencode does not yet use this fork's enforcement hook and remains instruction-routed.
 
 ### Troubleshooting
 

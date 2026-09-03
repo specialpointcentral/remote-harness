@@ -148,7 +148,8 @@ sequenceDiagram
     - 远端缺 `sshfs` 或挂载点非空时会交互提示。
 11. 远端运行 `inject-rule.sh on codex ...`：
     - 生成会话级规则文件；
-    - 生成会话级 `bin/ssh` wrapper，使 Codex 看到短命令 `ssh rlocal ...`；
+    - 生成会话级 `PreToolUse` hook 和 `bin/rh-run`；
+    - hook 将挂载点相对 cwd 映射到笔记本项目，并改写每个 Bash 调用；
     - Codex 非 YOLO 时追加 `-s workspace-write`、网络访问和必要 writable roots；
     - Codex YOLO 时使用 Codex 自身 bypass 参数。
 12. `laptop-setup.sh` 最后执行：
@@ -166,7 +167,7 @@ flowchart LR
   subgraph B["远端盒子：Codex 所在机器"]
     C["Codex TUI"]
     M["远端挂载点<br/>~/.remote-harness/mounts/project"]
-    W["会话 ssh wrapper<br/>ssh rlocal ..."]
+    W["会话 PreToolUse hook<br/>rh-run"]
   end
   subgraph L["笔记本：项目和工具链所在机器"]
     P["本地项目目录"]
@@ -175,7 +176,7 @@ flowchart LR
   C -->|读/写/编辑/搜索| M
   M -->|sshfs over reverse tunnel| P
   C -->|构建/测试/运行/安装/git commit| W
-  W -->|ssh rlocal 'cd 项目 && 命令'| T
+  W -->|编码命令和相对 cwd| T
   T --> P
 ```
 
@@ -225,8 +226,8 @@ sequenceDiagram
    - 本地挂载点非空时提示更换。
 7. 本地运行 `inject-rule.sh on codex ...`：
    - 规则允许 Codex 在本地挂载目录中读写、编辑、搜索；
-   - 规则要求构建、运行、测试、安装依赖、lint、formatter、language server、迁移、会修改状态的 git 命令等，都通过 `ssh <server-alias> 'cd <服务器项目目录> && <cmd>'` 在服务器执行；
-   - 临时 `ssh` wrapper 隐藏 `-F <临时config>`。
+   - 会话 `PreToolUse` hook 将所有 Bash 调用自动改写到服务器；
+   - runner 按挂载点相对 cwd 映射服务器子目录，并隐藏临时 SSH config。
 8. `local-setup.sh` 在本地挂载点拉起 Codex：
 
 ```bash
@@ -242,7 +243,7 @@ flowchart LR
   subgraph L["本机：Codex 所在机器"]
     C["Codex TUI"]
     M["本地挂载点<br/>~/.remote-harness/mounts/project"]
-    W["会话 ssh wrapper<br/>ssh server-alias ..."]
+    W["会话 PreToolUse hook<br/>rh-run"]
   end
   subgraph S["服务器：项目和工具链所在机器"]
     P["服务器项目目录"]
@@ -251,7 +252,7 @@ flowchart LR
   C -->|读/写/编辑/搜索| M
   M -->|sshfs| P
   C -->|构建/测试/运行/安装/git commit| W
-  W -->|ssh server-alias 'cd 项目 && 命令'| R
+  W -->|编码命令和相对 cwd| R
   R --> P
 ```
 
@@ -259,14 +260,15 @@ flowchart LR
 
 remote-harness 对 Codex 使用会话级注入，不修改全局 Codex 配置：
 
-| 场景 | Codex 工作目录 | 文件操作 | 项目命令 | Codex 额外参数 |
+| 场景 | Codex 工作目录 | 文件操作 | Bash 命令 | Codex 额外参数 |
 |---|---|---|---|---|
-| Reverse | 远端挂载点 | 远端挂载点内进行，写回笔记本 | `ssh rlocal 'cd <本地项目> && <cmd>'` | `-c developer_instructions=<rule>` |
-| Forward | 本地挂载点 | 本地挂载点内进行，写回服务器 | `ssh <server-alias> 'cd <服务器项目> && <cmd>'` | `-c developer_instructions=<rule>` |
+| Reverse | 远端挂载点 | 远端挂载点内进行，写回笔记本 | hook 自动路由到笔记本 | instructions + `hooks.PreToolUse` |
+| Forward | 本地挂载点 | 本地挂载点内进行，写回服务器 | hook 自动路由到服务器 | instructions + `hooks.PreToolUse` |
 | 非 YOLO | 同上 | 同上 | 同上 | 额外加 `-s workspace-write`、网络访问和必要 writable roots |
 | YOLO | 同上 | 同上 | 同上 | `codex --dangerously-bypass-approvals-and-sandbox` |
 
-注入规则和临时 wrapper 都放在 `~/.remote-harness/.sessions/<session-key>`，退出时删除。
+注入规则、hook 和 runner 都放在 `~/.remote-harness/.sessions/<session-key>`，退出时删除。创建失败时
+启动器拒绝启动 Agent，原始命令不会回退到 Agent 主机执行。
 
 ## 文件、缓存与清理
 
@@ -311,6 +313,6 @@ remote-harness 的会话级 SSH config、临时 `known_hosts`、`sshfs reconnect
 
 ## 一句话总结
 
-- Reverse：**远端 Codex 看见一个远端挂载目录；真正项目和工具链在笔记本，命令走 `ssh rlocal` 回笔记本。**
-- Forward：**本地 Codex 看见一个本地挂载目录；真正项目和工具链在服务器，命令走 `ssh <server-alias>` 回服务器。**
+- Reverse：**远端 Codex 看见远端挂载目录；文件写回笔记本，Bash 由 hook 自动路由到笔记本。**
+- Forward：**本地 Codex 看见本地挂载目录；文件写回服务器，Bash 由 hook 自动路由到服务器。**
 - 两种模式都让 Agent 只看到短 alias 和挂载目录；敏感的 SSH target、路径、临时 config 都由本地脚本和会话目录管理。

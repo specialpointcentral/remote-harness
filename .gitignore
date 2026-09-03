@@ -2,6 +2,8 @@
 .DS_Store
 *.swp
 *~
+__pycache__/
+*.pyc
 
 # script-produced files (defensive; normally live outside the repo)
 *.rh-bak.*

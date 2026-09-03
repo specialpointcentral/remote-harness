@@ -68,8 +68,8 @@ ssh -n -o ClearAllForwardings=yes \
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`.
 5. It calls `laptop-setup.sh` with `--box-ssh-config <remote-session-config>`.
 6. `laptop-setup.sh` creates the laptop-side session config carrying `RemoteForward`, connects
-   through its internal ssh wrapper, mounts the laptop project on the box, injects the run-on-laptop
-   rule, and launches the selected agent on the remote box.
+   through its internal ssh wrapper, mounts the laptop project on the box, installs strict
+   Claude/Codex command routing (or the opencode SSH rule), and launches the selected agent.
 7. On exit, cleanup unmounts sshfs, removes the session rule, drops the reverse tunnel when no
    remaining mount needs it, removes temp ssh configs, and removes default empty mountpoint dirs.
 

@@ -8,8 +8,8 @@ with `--mode forward`.
 ## Boundary
 
 - File reads, writes, edits, and searches happen in the local sshfs mount.
-- Build, run, test, install, lint, format, language-server, migration, mutating git, and other
-  project/toolchain commands must run on the server through `ssh <alias> 'cd <project> && <cmd>'`.
+- Claude/Codex Bash calls are automatically rewritten to the server with mount-relative cwd mapping.
+  opencode continues to receive an explicit `ssh <alias> 'cd <project> && <cmd>'` instruction.
 - The simple path does not scan the server for project directories. The user types the server path;
   cached values are prompt defaults only.
 

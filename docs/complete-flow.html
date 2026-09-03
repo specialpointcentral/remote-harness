@@ -583,7 +583,7 @@
           <div class="mode-top">
             <span class="tag blue">Simple Reverse</span>
             <h3>远程开发本地项目</h3>
-            <p>Codex 在远端盒子；项目在笔记本；命令经 `ssh rlocal` 回到笔记本。</p>
+            <p>Codex 在远端盒子；项目在笔记本；Bash 由会话 hook 自动路由回笔记本。</p>
           </div>
           <div class="mode-body">
             <div class="route-line">
@@ -672,7 +672,7 @@
         </div>
         <div class="lane-row">
           <div></div>
-          <div><strong>注入规则</strong>生成 rule 和 `ssh` wrapper。</div>
+          <div><strong>安装严格路由</strong>生成 rule、`PreToolUse` hook 和 `rh-run`。</div>
           <div><strong>真实命令环境</strong>构建、测试、运行在这里执行。</div>
           <div><strong>启动远端 Codex</strong>`ssh -tt` 进入挂载点并运行 `codex`。</div>
         </div>
@@ -719,7 +719,7 @@
           <div></div>
         </div>
         <div class="lane-row">
-          <div><strong>注入规则</strong>本地生成 rule 和 `ssh` wrapper。</div>
+          <div><strong>安装严格路由</strong>本地生成 rule、`PreToolUse` hook 和 `rh-run`。</div>
           <div></div>
           <div><strong>真实命令环境</strong>构建、测试、运行通过 SSH 到这里。</div>
           <div><strong>启动本地 Codex</strong>`cd &lt;local-mount&gt; && codex`。</div>
@@ -731,24 +731,24 @@
       <div class="section-head">
         <div>
           <h2>Codex 看到什么</h2>
-          <p>两种模式都把复杂 SSH config 隐藏在会话 wrapper 后面，让 Codex 只看到短 alias。</p>
+          <p>两种模式都把 SSH config 隐藏在会话 runner 后面，让 Codex 运行普通相对命令。</p>
         </div>
       </div>
 
       <div class="grid cols-2">
         <div class="card">
-          <span class="tag blue">Reverse 规则</span>
+          <span class="tag blue">Reverse 路由</span>
           <h3>文件像在远端，命令回笔记本</h3>
-          <div class="terminal"><code>ssh rlocal 'cd /Users/me/project && npm test'
-ssh rlocal 'cd /Users/me/project && cargo build'</code></div>
-          <p style="margin-top:12px">Codex 工作目录是远端挂载点；项目命令必须通过 `ssh rlocal` 回到笔记本。</p>
+          <div class="terminal"><code>npm test
+cargo build</code></div>
+          <p style="margin-top:12px">Codex 工作目录是远端挂载点；hook 自动映射 cwd 并在笔记本执行 Bash。</p>
         </div>
         <div class="card">
-          <span class="tag green">Forward 规则</span>
+          <span class="tag green">Forward 路由</span>
           <h3>文件像在本地，命令回服务器</h3>
-          <div class="terminal"><code>ssh server-dev 'cd /srv/app && npm test'
-ssh server-dev 'cd /srv/app && pytest'</code></div>
-          <p style="margin-top:12px">Codex 工作目录是本地挂载点；项目命令必须通过服务器 alias 回到服务器。</p>
+          <div class="terminal"><code>npm test
+pytest</code></div>
+          <p style="margin-top:12px">Codex 工作目录是本地挂载点；hook 自动映射 cwd 并在服务器执行 Bash。</p>
         </div>
       </div>
 
@@ -758,7 +758,7 @@ ssh server-dev 'cd /srv/app && pytest'</code></div>
             <th>场景</th>
             <th>Codex 工作目录</th>
             <th>文件读写</th>
-            <th>项目命令</th>
+            <th>Bash 命令</th>
             <th>Codex 参数</th>
           </tr>
         </thead>
@@ -767,28 +767,28 @@ ssh server-dev 'cd /srv/app && pytest'</code></div>
             <td data-label="场景">Reverse</td>
             <td data-label="Codex 工作目录">远端挂载点</td>
             <td data-label="文件读写">写回笔记本项目</td>
-            <td data-label="项目命令">`ssh rlocal ...`</td>
-            <td data-label="Codex 参数">`-c developer_instructions=&lt;rule&gt;`</td>
+            <td data-label="Bash 命令">hook 自动路由到笔记本</td>
+            <td data-label="Codex 参数">instructions + `hooks.PreToolUse`</td>
           </tr>
           <tr>
             <td data-label="场景">Forward</td>
             <td data-label="Codex 工作目录">本地挂载点</td>
             <td data-label="文件读写">写回服务器项目</td>
-            <td data-label="项目命令">`ssh &lt;server-alias&gt; ...`</td>
-            <td data-label="Codex 参数">`-c developer_instructions=&lt;rule&gt;`</td>
+            <td data-label="Bash 命令">hook 自动路由到服务器</td>
+            <td data-label="Codex 参数">instructions + `hooks.PreToolUse`</td>
           </tr>
           <tr>
             <td data-label="场景">非 YOLO</td>
             <td data-label="Codex 工作目录">同上</td>
             <td data-label="文件读写">同上</td>
-            <td data-label="项目命令">允许 SSH 网络访问</td>
+            <td data-label="Bash 命令">允许 runner 使用 SSH 网络</td>
             <td data-label="Codex 参数">`-s workspace-write` 和必要 writable roots</td>
           </tr>
           <tr>
             <td data-label="场景">YOLO</td>
             <td data-label="Codex 工作目录">同上</td>
             <td data-label="文件读写">同上</td>
-            <td data-label="项目命令">同上</td>
+            <td data-label="Bash 命令">同上</td>
             <td data-label="Codex 参数">`--dangerously-bypass-approvals-and-sandbox`</td>
           </tr>
         </tbody>
@@ -891,12 +891,12 @@ ssh server-dev 'cd /srv/app && pytest'</code></div>
         <div class="card">
           <span class="tag blue">Reverse</span>
           <h3>远端 Codex，命令回笔记本</h3>
-          <p>远端盒子只是 Codex 和挂载目录所在处；真实项目、依赖和工具链在笔记本，所以项目命令必须 `ssh rlocal` 回去。</p>
+          <p>远端盒子承载 Codex 和挂载目录；真实项目和工具链在笔记本，Bash 由 hook 自动路由回去。</p>
         </div>
         <div class="card">
           <span class="tag green">Forward</span>
           <h3>本地 Codex，命令回服务器</h3>
-          <p>本机只是 Codex 和挂载目录所在处；真实项目、依赖和工具链在服务器，所以项目命令必须 `ssh server-alias` 回去。</p>
+          <p>本机承载 Codex 和挂载目录；真实项目和工具链在服务器，Bash 由 hook 自动路由回去。</p>
         </div>
       </div>
     </section>

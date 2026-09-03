@@ -45,8 +45,8 @@ Simple forward:
 - The command prompts locally for the server SSH target, server project directory, optional local
   mountpoint, and launch preference.
 - Files are read, written, edited, and searched in the local sshfs mount.
-- Builds, runs, tests, installs, formatters, linters, language servers, mutating git commands, and
-  other project tools must run on the server through `ssh <server-alias> 'cd <project> && <cmd>'`.
+- For Claude/Codex, every Bash call is automatically routed to the server with mount-relative cwd
+  mapping. Routing setup is fail-closed. opencode still follows an injected SSH instruction.
 
 Use the unified simple bootstrap flow for reverse, forward, and ambiguous requests.
 
@@ -166,8 +166,9 @@ append a duplicate. Managed entries are reference-counted under
 `~/.remote-harness/.sessions/authorized-keys/...` and removed on exit when no active session still
 uses them.
 
-The launched agent gets a session-local `ssh` wrapper in `PATH`, so the injected rule can simply say
-`ssh rlocal ...`.
+Claude/Codex receive a session-local `PreToolUse` hook and runner. The agent runs ordinary relative
+commands; the hook maps the mount cwd to the laptop project and rewrites the Bash call. opencode
+continues to receive the session-local `ssh` wrapper and explicit SSH instruction.
 
 The script remembers the last confirmed values in local `~/.remote-harness/simple-cache.env` and
 uses them as defaults next time. The cache is local-only; deleting that file resets the defaults.
@@ -184,9 +185,10 @@ In forward mode, the terminal will ask for:
 - whether to launch with YOLO/bypass mode, defaulting to yes unless the local cache says no. This
   question is skipped when the invocation already requested YOLO and the command includes `--yolo`.
 
-The launched agent works in the local mount. Its injected rule allows local file reads/writes/edits
-and searches, but requires project commands to run on the server over SSH. Exiting the launched agent
-unmounts the project and removes the session rule.
+The launched agent works in the local mount. Claude/Codex file tools use the mount and every Bash
+call is rewritten to the server; failure to create that route aborts launch. opencode keeps the
+instruction-based SSH route. Exiting the launched agent unmounts the project and removes session
+artifacts.
 
 The forward setup always uses a session-local ssh config under local
 `~/.remote-harness/.sessions/.../ssh_config`. When the user enters raw SSH args instead of a Host
@@ -207,6 +209,7 @@ is hidden from the launched agent with the same session `ssh` wrapper pattern.
   `~/.ssh/authorized_keys` as a tagged, loopback-scoped block, then remove it on exit. Existing
   active matching user keys are reused untouched.
 - Simple reverse: the remote box has `sshfs` and the chosen agent CLI installed.
+- Claude/Codex: the agent host has `python3`; the project host has POSIX `sh` and base64.
 - Simple reverse: the laptop can run an SSH server; `laptop-setup.sh` will detect and guide enabling
   it when needed.
 - Simple forward: the local machine can SSH into the server and has `sshfs`; the script guides

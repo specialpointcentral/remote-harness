@@ -99,7 +99,10 @@ case "$CFG_OVERRIDE" in *'
 CFG="$CFG_OVERRIDE"
 mkdir -p "$(dirname "$CFG")" 2>/dev/null || true
 touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
-KH="$(dirname "$CFG")/known_hosts_${ALIAS}"
+RUNTIME_DIR="$(dirname "$CFG")/runtime"
+mkdir -p "$RUNTIME_DIR" 2>/dev/null || die "could not create SSH runtime directory"
+chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+KH="$RUNTIME_DIR/known_hosts_${ALIAS}"
 
 # --- pick / create an identity key -----------------------------------------
 if [ -z "$IDENTITY" ]; then

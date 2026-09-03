@@ -38,12 +38,13 @@ RH="${RH_HOME:-$HOME/.remote-harness}"
 - `"$RH/scripts/laptop-setup.sh"` - reverse orchestrator, run on the laptop. It checks local sshd,
   manages a tagged temporary `authorized_keys` block when a remote-harness pubkey is provided,
   opens the reverse tunnel through a session-local ssh config, mounts the laptop project on the
-  remote box, injects the run-on-laptop rule, launches the agent remotely, then cleans up the mount,
-  rule, tunnel state, local session config, and managed auth reference on exit.
+  remote box, installs strict Claude/Codex routing or the opencode SSH rule, launches the agent
+  remotely, then cleans up the mount, rule, tunnel state, local session config, and managed auth
+  reference on exit.
 - `"$RH/scripts/local-setup.sh"` - forward orchestrator, run where the local agent runs. It resolves
   the server target through a session-local ssh config, sshfs-mounts the server project locally,
-  injects the run-on-server rule, launches the agent in the local mount, then unmounts and removes
-  the session config on exit.
+  installs strict Claude/Codex routing or the opencode SSH rule, launches the agent in the local
+  mount, then unmounts and removes the session config on exit.
 
 ## Shared Runtime Helpers
 
@@ -56,9 +57,13 @@ RH="${RH_HOME:-$HOME/.remote-harness}"
 - `"$RH/scripts/mount-project.sh"` - direction-neutral sshfs helper. It mounts
   `<alias>:<remote-path>` onto a local mountpoint, refuses non-empty targets unless `--force` is
   supplied, revalidates stale mounts, and supports `--unmount`.
-- `"$RH/scripts/inject-rule.sh"` - direction-neutral session rule helper, run where the agent
+- `"$RH/scripts/inject-rule.sh"` - direction-neutral session rule/hook helper, run where the agent
   launches. It writes per-session artifacts under `$RH_HOME/.sessions/<key>` and returns launch env
   / flags for Claude, Codex, or opencode. It never writes global agent config or the mounted repo.
+- `"$RH/scripts/route-command.py"` - Claude/Codex `PreToolUse` handler. It preserves tool input,
+  maps cwd relative to the mount, and replaces Bash with the session runner.
+- `"$RH/scripts/run-on-project-host.sh"` - transports encoded commands over SSH and executes them
+  inside the validated project-host cwd and login shell.
 - `"$RH/scripts/_common.sh"` - sourced library shared by setup scripts. It provides output helpers,
   safe shell quoting, `parse_via`, session-local ssh config defaults, and managed Host block writing.
 

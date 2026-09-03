@@ -9,8 +9,8 @@ Simple forward 表示：Codex 或其他编程 Agent 在本地运行，而项目�
 ## 边界
 
 - 文件读取、写入、编辑和搜索发生在本地 sshfs 挂载目录。
-- 构建、运行、测试、安装依赖、lint、格式化、language server、迁移、会修改状态的 git 命令及其他
-  项目/工具链命令，必须通过 `ssh <alias> 'cd <project> && <cmd>'` 在服务器执行。
+- Claude/Codex 的 Bash 调用会按挂载点相对 cwd 自动改写到服务器；opencode 继续接收明确的
+  `ssh <alias> 'cd <project> && <cmd>'` 指令。
 - simple 路径不扫描服务器项目目录。服务器路径由用户输入；缓存值只作为提示默认值。
 
 ## SSH 状态

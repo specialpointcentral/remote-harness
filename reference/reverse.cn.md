@@ -64,7 +64,8 @@ ssh -n -o ClearAllForwardings=yes \
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`。
 5. 它用 `--box-ssh-config <remote-session-config>` 调用 `laptop-setup.sh`。
 6. `laptop-setup.sh` 创建携带 RemoteForward 的笔记本侧会话 config，通过内部 ssh wrapper 连接，
-   在远端挂载笔记本项目，注入“在笔记本运行命令”的规则，并在远端启动选定 Agent。
+   在远端挂载笔记本项目，为 Claude/Codex 安装严格命令路由（或为 opencode 注入 SSH 规则），
+   然后在远端启动选定 Agent。
 7. 退出时自动卸载 sshfs、删除会话规则、在没有其它挂载需要时断开反向隧道、删除临时 ssh config，
    并清理默认空挂载目录。
 
