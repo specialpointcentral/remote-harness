@@ -154,18 +154,45 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
   printf '%s' "$_wsr_runner"
 }
 
-write_claude_settings() {  # $1=outfile $2=hook command
+write_claude_worktree_blocker() {  # $1=session dir
+  _wcw_blocker="$1/bin/deny-worktree"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf %s >&2\n' "$(sq 'remote-harness: Claude worktrees are unavailable in an SSHFS session; use a separate remote-harness session for isolated parallel work.\n')"
+    printf 'exit 2\n'
+  } > "$_wcw_blocker" || return 1
+  chmod +x "$_wcw_blocker" 2>/dev/null || return 1
+  printf '%s' "$_wcw_blocker"
+}
+
+write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker
   _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
+  _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
   cat > "$1" <<EOF
 {
+  "permissions": {
+    "deny": ["EnterWorktree", "ExitWorktree"]
+  },
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Agent",
         "hooks": [
           {
             "type": "command",
             "command": $_wcs_command,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_worktree,
             "timeout": 5
           }
         ]
@@ -205,6 +232,12 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
     printf 'Safe local work is file-oriented: use the agent read/edit/write/patch tools on the mount.\n'
     printf 'If routing is unavailable or the cwd is outside the mount, the Bash call is denied. Never\n'
     printf 'work around that failure by executing the project command on this machine.\n'
+    if [ "${5:-}" = claude ]; then
+      printf '\nClaude ordinary and nested subagents are supported and inherit this session hook.\n'
+      printf 'Agent Teams are disabled because independent teammate sessions do not have a documented\n'
+      printf 'guarantee that temporary `--settings` hooks are inherited. Do not request Agent\n'
+      printf '`isolation: worktree`; use a separate remote-harness session for isolated parallel work.\n'
+    fi
   } > "$1"
 }
 
@@ -240,8 +273,11 @@ case "${1:-}" in
     case "$agent" in
       claude)
         CLAUDE_SETTINGS="$SD/claude-settings.json"
-        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" \
+        worktree_blocker=$(write_claude_worktree_blocker "$SD") \
           || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" \
+          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
         ;;
       opencode)

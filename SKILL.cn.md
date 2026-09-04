@@ -173,6 +173,11 @@ forward 模式启动后，终端会询问：
 服务器；严格路由创建失败则中止启动。opencode 保留提示词 SSH 路由。退出 Agent 后自动卸载项目并
 删除会话产物。
 
+Claude 的普通、具名和嵌套 subagent 受支持，因为 settings hook 会继续在 subagent 内运行。严格会话
+会关闭实验性 Agent Teams，并阻止 Claude 创建 worktree。需要隔离并行写入时，应在项目主机创建多个
+Git worktree，每个 worktree 启动一个 remote-harness 会话，再用 cross-session messaging 协调。
+用户询问多个 Claude agents 时读取 `docs/claude-multi-agent.cn.md`。
+
 forward setup 始终使用本地 `~/.remote-harness/.sessions/.../ssh_config` 下的会话级 ssh config。
 当用户输入的是原始 SSH 参数而不是 Host alias 时，会在其中创建会话级 `<host>-dev` alias。它不会在本地
 `~/.ssh` 下创建或修改任何文件；临时 `known_hosts` 也位于 `~/.remote-harness/.sessions/...`，
@@ -200,6 +205,7 @@ forward setup 始终使用本地 `~/.remote-harness/.sessions/.../ssh_config` �
 - `docs/complete-flow.md`
 - `docs/complete-flow.cn.md`
 - `docs/complete-flow.html`
+- `docs/claude-multi-agent.cn.md`
 - `docs/simple-flow.md`
 - `docs/simple-flow.cn.md`
 - `docs/simple-forward-flow.md`

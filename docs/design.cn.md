@@ -99,6 +99,17 @@ hook 成功加载后，handler 错误返回拒绝，SSH 失败不会回退到 A 
 hook 是命令路由防护，不是文件系统隔离。SSHFS 和反向 SSH key 仍要求 A 是可信主机，并可访问所选
 项目主机账号。
 
+### Claude 多 Agent 边界
+
+Claude settings hooks 会在普通和嵌套 subagent 内运行，因此这些 agent 的 Bash 共用同一个 runner
+和 cwd 映射。具名 subagents 可以通过 `SendMessage` 通信；接收方仍使用自己的工具和路由 hook。同一
+会话内的 subagents 共用一个挂载点，并行写入必须拥有互不重叠的文件范围。
+
+严格会话关闭实验性 Agent Teams 并阻止 worktree 创建。teammates 是独立会话，官方没有保证 lead 的
+临时 `--settings` 被继承；Claude worktree 也跨越 Agent 主机与项目主机路径边界。隔离并行工作应为
+每个 agent 准备一个项目主机 Git worktree 和一个 remote-harness 会话，再用 cross-session messaging
+协调。
+
 ## 8. 不变量
 
 1. `simple-bootstrap.sh` 是唯一公开 simple 入口。

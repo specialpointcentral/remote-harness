@@ -26,6 +26,8 @@ cat > "$router_input" <<EOF
 {
   "hook_event_name": "PreToolUse",
   "cwd": "$router_tmp/mount",
+  "agent_id": "agent-child-1",
+  "agent_type": "general-purpose",
   "tool_name": "Bash",
   "tool_input": {
     "command": "printf routed",
@@ -54,6 +56,45 @@ argv = shlex.split(updated["command"])
 assert argv[0] == sys.argv[2]
 assert base64.b64decode(argv[1]).decode() == "packages/api"
 assert base64.b64decode(argv[2]).decode() == "printf routed"
+PY
+
+cat > "$router_tmp/agent.json" <<EOF
+{
+  "hook_event_name": "PreToolUse",
+  "cwd": "$router_tmp/mount",
+  "tool_name": "Agent",
+  "tool_input": {"subagent_type": "general-purpose", "name": "reviewer"}
+}
+EOF
+python3 "$ROOT/scripts/route-command.py" \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+  < "$router_tmp/agent.json" > "$router_tmp/agent-output.json"
+python3 - "$router_tmp/agent-output.json" <<'PY'
+import json
+import sys
+
+assert json.load(open(sys.argv[1], encoding="utf-8")) == {}
+PY
+
+cat > "$router_tmp/agent-worktree.json" <<EOF
+{
+  "hook_event_name": "PreToolUse",
+  "cwd": "$router_tmp/mount",
+  "tool_name": "Agent",
+  "tool_input": {"subagent_type": "general-purpose", "isolation": "worktree"}
+}
+EOF
+python3 "$ROOT/scripts/route-command.py" \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+  < "$router_tmp/agent-worktree.json" > "$router_tmp/agent-worktree-output.json"
+python3 - "$router_tmp/agent-worktree-output.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+specific = payload["hookSpecificOutput"]
+assert specific["permissionDecision"] == "deny"
+assert "worktree" in specific["permissionDecisionReason"].lower()
 PY
 
 python3 - "$router_tmp/outside.json" "$router_tmp/outside" <<'PY'
@@ -216,6 +257,7 @@ RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
 assert_grep "$tmp/inject-claude.out" "RH_LAUNCH_FLAGS=--append-system-prompt-file '" "inject claude flag quoted"
 assert_grep "$tmp/inject-claude.out" "--settings '" "inject claude session settings"
+assert_grep "$tmp/inject-claude.out" "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0" "inject claude disables experimental agent teams"
 claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
 python3 - "$claude_settings" <<'PY'
@@ -224,9 +266,23 @@ import sys
 
 settings = json.load(open(sys.argv[1], encoding="utf-8"))
 hook = settings["hooks"]["PreToolUse"][0]
-assert hook["matcher"] == "Bash"
+assert hook["matcher"] == "Bash|Agent"
 assert "route-command.py" in hook["hooks"][0]["command"]
+assert "EnterWorktree" in settings["permissions"]["deny"]
+assert "ExitWorktree" in settings["permissions"]["deny"]
+worktree_hook = settings["hooks"]["WorktreeCreate"][0]["hooks"][0]
+assert worktree_hook["type"] == "command"
+assert "deny-worktree" in worktree_hook["command"]
 PY
+claude_worktree_blocker="$rh_home/.sessions/$claude_session_key/bin/deny-worktree"
+[ -x "$claude_worktree_blocker" ] || fail "claude worktree blocker missing"
+if "$claude_worktree_blocker" >/dev/null 2>"$tmp/claude-worktree.err"; then
+  fail "claude worktree blocker exited successfully"
+fi
+assert_grep "$tmp/claude-worktree.err" "separate remote-harness session" "claude worktree blocker guidance"
+claude_rule="$rh_home/.sessions/$claude_session_key/rule.md"
+assert_grep "$claude_rule" "ordinary and nested subagents" "claude rule documents supported subagents"
+assert_grep "$claude_rule" "Agent Teams are disabled" "claude rule documents team boundary"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
@@ -585,6 +641,11 @@ assert_grep "$ROOT/scripts/simple-bootstrap.sh" "ssh -n -o ClearAllForwardings=y
 assert_grep "$ROOT/scripts/simple-bootstrap.sh" "simple-dispatch.sh" "simple bootstrap fetches dispatcher"
 assert_grep "$ROOT/scripts/simple-dispatch.sh" "--source-via" "simple dispatcher accepts bootstrap source"
 assert_grep "$ROOT/SKILL.md" "simple-bootstrap.sh" "skill uses unified simple bootstrap"
+assert_grep "$ROOT/SKILL.md" "docs/claude-multi-agent.md" "skill routes Claude multi-agent questions"
+assert_grep "$ROOT/README.md" "git clone https://github.com/specialpointcentral/remote-harness.git" "README installs maintained fork"
+if grep -F "git clone https://github.com/chenjh16/remote-harness.git" "$ROOT/README.md" >/dev/null; then
+  fail "README manual install still clones upstream instead of the maintained fork"
+fi
 assert_grep "$ROOT/SKILL.md" "script itself may be local" "skill does not assume local scripts"
 assert_grep "$ROOT/SKILL.md" "printf '%s' \"\$p\${d:+ [\$d]}: \" >/dev/tty" "skill fetch prompt is zsh-compatible"
 assert_grep "$ROOT/SKILL.md" "IFS= read -r h </dev/tty || exit 2" "skill aborts when tty prompt cannot read"
@@ -622,9 +683,12 @@ mkdir -p "$install_home"
 HOME="$install_home" CODEX_HOME="$install_home/.codex" RH_HOME="$install_home/.remote-harness" \
   bash "$ROOT/manage.sh" codex > "$tmp/manage-install.out"
 [ -f "$install_home/.remote-harness/docs/complete-flow.md" ] || fail "manage install did not copy shared docs"
+[ -f "$install_home/.remote-harness/docs/claude-multi-agent.md" ] || fail "manage install did not copy Claude multi-agent docs"
+[ -f "$install_home/.remote-harness/docs/claude-multi-agent.cn.md" ] || fail "manage install did not copy Chinese Claude multi-agent docs"
 [ -f "$install_home/.remote-harness/docs/complete-flow.html" ] || fail "manage install did not copy HTML flow doc"
 [ ! -e "$install_home/.remote-harness/docs/superpowers" ] || fail "manage install copied internal implementation plans"
 [ -f "$install_home/.codex/skills/remote-harness/docs/complete-flow.md" ] || fail "codex copy install did not include docs"
+[ -f "$install_home/.codex/skills/remote-harness/docs/claude-multi-agent.md" ] || fail "codex copy install did not include Claude multi-agent docs"
 [ ! -e "$install_home/.codex/skills/remote-harness/docs/superpowers" ] || fail "codex copy install copied internal implementation plans"
 [ -f "$install_home/.codex/skills/remote-harness/SKILL.cn.md" ] || fail "codex copy install did not include SKILL.cn.md"
 [ -x "$install_home/.remote-harness/scripts/simple-bootstrap.sh" ] || fail "manage install did not install executable simple-bootstrap.sh"

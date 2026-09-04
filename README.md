@@ -64,7 +64,7 @@
 **方式一：手动命令安装**
 
 ```bash
-git clone https://github.com/chenjh16/remote-harness.git
+git clone https://github.com/specialpointcentral/remote-harness.git
 cd remote-harness
 ./manage.sh            # 复制安装到 ~/.remote-harness + 各 Agent 的入口
 ./manage.sh --dev      # 开发模式：软链到本仓库，改动即时生效
@@ -103,6 +103,18 @@ $remote-harness 中文，远程开发本地，yolo
 ```
 
 Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yolo`。Agent 会返回一段在**本地终端**运行的命令。
+
+**Claude 多 Agent 支持**
+
+| Claude 模式 | 状态 | 说明 |
+|---|---|---|
+| 普通 / 具名 subagent | 支持 | settings hook 会在 subagent 内继续触发；具名 agents 可互发消息 |
+| 嵌套 subagent | 支持 | 每一层 Bash 继续经过同一 hook，深度和并发仍受 Claude 自身限制 |
+| Agent Teams | 默认禁用 | teammate 是独立 Claude 会话，临时 `--settings` hook 继承没有明确保证 |
+| `isolation: worktree` / `EnterWorktree` | 阻止 | Agent 主机 worktree 路径与项目主机路径映射不兼容 |
+| 多个独立 harness 会话 | 推荐 | 每个本机 Git worktree 启动一个 harness 会话，再用 cross-session messaging 协调 |
+
+详细边界和推荐拓扑见 [`docs/claude-multi-agent.cn.md`](docs/claude-multi-agent.cn.md)。
 
 **本地开发远程项目（forward）**
 
@@ -245,6 +257,9 @@ remote-harness/
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
   一把能访问本机 SSH/SFTP 的临时密钥；请只在你信任的 Agent 主机上使用，不要把敏感目录作为项目挂载。
 - opencode 当前没有启用本 fork 的强制 hook，仍依赖会话提示词遵守 SSH 路由。
+- Claude 严格模式会设置 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0`，并阻止 `WorktreeCreate`、
+  `EnterWorktree` 和 `ExitWorktree`。普通/嵌套 subagent 仍可使用；并行写入时应给 agents 分配互不
+  重叠的文件范围。
 
 ### 故障排查
 
@@ -297,7 +312,7 @@ this is usually the remote box; for local-dev-server-project, this is usually yo
 **Option 1: manual command install**
 
 ```bash
-git clone https://github.com/chenjh16/remote-harness.git
+git clone https://github.com/specialpointcentral/remote-harness.git
 cd remote-harness
 ./manage.sh            # copy-install to ~/.remote-harness + each agent's entry point
 ./manage.sh --dev      # dev mode: symlink to this repo (edits go live)
@@ -340,6 +355,18 @@ $remote-harness English, remote dev local project, yolo
 
 Claude Code / opencode use `/remote-harness English, remote dev local project, yolo`. The agent
 returns a command to run in your **local terminal**.
+
+**Claude multi-agent support**
+
+| Claude mode | Status | Behavior |
+|---|---|---|
+| Ordinary / named subagents | Supported | Settings hooks also run in subagents; named agents can message peers |
+| Nested subagents | Supported | Every layer's Bash calls use the same hook, subject to Claude's own limits |
+| Agent Teams | Disabled by default | Teammates are independent sessions without a documented temporary-settings guarantee |
+| `isolation: worktree` / `EnterWorktree` | Blocked | Agent-host worktree paths are incompatible with project-host path mapping |
+| Multiple harness sessions | Recommended for isolation | Mount one local Git worktree per session and coordinate with cross-session messaging |
+
+See [`docs/claude-multi-agent.md`](docs/claude-multi-agent.md) for the full boundary and topology.
 
 **Local agent, remote project (forward)**
 
@@ -498,6 +525,9 @@ remote-harness/
   a temporary key capable of laptop SSH/SFTP access. Do not use an untrusted agent host or mount a
   directory containing unrelated secrets.
 - opencode does not yet use this fork's enforcement hook and remains instruction-routed.
+- Claude strict mode sets `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0` and blocks `WorktreeCreate`,
+  `EnterWorktree`, and `ExitWorktree`. Ordinary and nested subagents remain available; parallel
+  writers need disjoint file ownership.
 
 ### Troubleshooting
 

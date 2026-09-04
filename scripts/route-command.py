@@ -36,9 +36,19 @@ def route(args: argparse.Namespace) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         return deny(f"remote-harness could not parse hook input: {error}")
 
+    tool_name = event.get("tool_name")
     tool_input = event.get("tool_input")
-    if event.get("tool_name") != "Bash" or not isinstance(tool_input, dict):
-        return deny("remote-harness only routes Bash tool calls")
+    if not isinstance(tool_input, dict):
+        return deny("remote-harness tool input is not an object")
+    if tool_name == "Agent":
+        if tool_input.get("isolation") == "worktree":
+            return deny(
+                "remote-harness does not support Claude subagent worktree isolation; "
+                "use an ordinary subagent or a separate harness session"
+            )
+        return {}
+    if tool_name != "Bash":
+        return deny("remote-harness only routes Bash and validates Agent tool calls")
 
     command = tool_input.get("command")
     if not isinstance(command, str):

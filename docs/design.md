@@ -107,6 +107,19 @@ Agent-specific channels:
 The hook is a command-routing guardrail, not a filesystem isolation boundary. SSHFS and the reverse
 SSH key still require A to be trusted with access to the selected project-host account.
 
+### Claude Multi-Agent Boundary
+
+Claude settings hooks run inside ordinary and nested subagents, so their Bash calls share the same
+runner and cwd mapping. Named subagents may communicate with `SendMessage`; the receiver still uses
+its own tools and routing hook. All subagents in one session share one mount, so parallel writers
+must own disjoint files.
+
+Strict sessions disable experimental Agent Teams and block worktree creation. Teammates are
+independent sessions without a documented guarantee that the lead's temporary `--settings` file is
+inherited. Claude worktrees also cross the agent-host/project-host path boundary. Isolated parallel
+work uses one project-host Git worktree and one remote-harness session per agent, coordinated through
+cross-session messaging.
+
 ## 8. Invariants
 
 1. `simple-bootstrap.sh` is the only public simple entry.

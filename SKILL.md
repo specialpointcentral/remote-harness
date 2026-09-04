@@ -190,6 +190,12 @@ call is rewritten to the server; failure to create that route aborts launch. ope
 instruction-based SSH route. Exiting the launched agent unmounts the project and removes session
 artifacts.
 
+For Claude, ordinary, named, and nested subagents are supported because settings hooks continue to
+run inside subagents. Strict sessions disable experimental Agent Teams and block Claude worktree
+creation. For isolated parallel writers, create separate project-host Git worktrees and launch one
+remote-harness session per worktree; those Claude sessions can coordinate through cross-session
+messaging. Read `docs/claude-multi-agent.md` when the user asks for multiple Claude agents.
+
 The forward setup always uses a session-local ssh config under local
 `~/.remote-harness/.sessions/.../ssh_config`. When the user enters raw SSH args instead of a Host
 alias, it creates a session-local `<host>-dev` alias there. It does not create or modify any file
@@ -225,6 +231,7 @@ The feasibility analysis and implementation plan live in:
 - `docs/complete-flow.md`
 - `docs/complete-flow.cn.md`
 - `docs/complete-flow.html`
+- `docs/claude-multi-agent.md`
 - `docs/simple-flow.md`
 - `docs/simple-flow.cn.md`
 - `docs/simple-forward-flow.md`
