@@ -148,6 +148,7 @@ tunnel_still_needed() {
 # ~/.remote-harness.
 AUTHKEY_TYPE="" AUTHKEY_BLOB="" AUTHKEY_TAG="" AUTHKEY_BEGIN="" AUTHKEY_END=""
 AUTHKEY_REF_DIR="" AUTHKEY_TOKEN="" AUTHKEY_MANAGED=0 AUTHKEY_LOCK_DIR="" AUTHKEY_LOCK_HELD=0
+GATEWAY_DIR="" GATEWAY_PATH="" GATEWAY_SESSION_DIR=""
 
 authkey_lock() {
   [ "$AUTHKEY_LOCK_HELD" = 1 ] && return 0
@@ -227,15 +228,41 @@ write_authorized_keys_without_managed_block() {
   mv "$_ak_tmp" "$_ak_file"
 }
 
+authorized_command_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+install_project_host_gateway() {
+  _ipg_scripts="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)" || return 1
+  [ -f "$_ipg_scripts/project-host-gateway.sh" ] && [ -f "$_ipg_scripts/run-on-project-host.sh" ] \
+    || { warn "missing project-host gateway scripts beside laptop-setup.sh"; return 1; }
+  GATEWAY_DIR="$HOME/.remote-harness/bin"
+  GATEWAY_PATH="$GATEWAY_DIR/project-host-gateway.sh"
+  GATEWAY_SESSION_DIR="$HOME/.remote-harness/.sessions/gateways/$AUTHKEY_TAG"
+  mkdir -p "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || return 1
+  chmod 700 "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || true
+  cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" || return 1
+  cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh" || return 1
+  chmod 700 "$GATEWAY_PATH" "$GATEWAY_DIR/run-on-project-host.sh" 2>/dev/null || return 1
+}
+
+register_gateway_project() {
+  [ -n "$GATEWAY_SESSION_DIR" ] || return 1
+  printf '%s' "$PROJ_DIR" | base64 | tr -d '\n' > "$GATEWAY_SESSION_DIR/project-root.b64" \
+    || return 1
+  chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" 2>/dev/null || true
+}
+
 append_managed_authorized_key() {
   _ak_file="$1"
+  _ak_command="$(sq "$GATEWAY_PATH") $(sq "$AUTHKEY_TAG")"
   write_authorized_keys_without_managed_block "$_ak_file" || return 1
   {
     [ -s "$_ak_file" ] && printf '\n'
     printf '%s\n' "$AUTHKEY_BEGIN"
     printf '# scope: remote-harness reverse tunnel; source limited to laptop loopback via from=127.0.0.1,::1\n'
-    printf 'from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty %s %s remote-harness:reverse:%s\n' \
-      "$AUTHKEY_TYPE" "$AUTHKEY_BLOB" "$AUTHKEY_TAG"
+    printf 'from="127.0.0.1,::1",command="%s",no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty %s %s remote-harness:reverse:%s\n' \
+      "$(authorized_command_escape "$_ak_command")" "$AUTHKEY_TYPE" "$AUTHKEY_BLOB" "$AUTHKEY_TAG"
     printf '%s\n' "$AUTHKEY_END"
   } >> "$_ak_file" || return 1
   chmod 600 "$_ak_file" 2>/dev/null || true
@@ -251,11 +278,12 @@ prepare_reverse_authorized_key() {
 
   authkey_lock || { warn "could not lock authorized_keys; not modifying SSH authorization"; return 1; }
   if authorized_key_match user "$_ak_file"; then
-    ok "authorized_keys: matching key already exists outside remote-harness; leaving it untouched"
     authkey_unlock
-    AUTHKEY_TOKEN=""
-    return 0
+    warn "authorized_keys contains the session key without the forced gateway; refusing unsafe reuse"
+    return 1
   fi
+
+  install_project_host_gateway || { authkey_unlock; return 1; }
 
   mkdir -p "$AUTHKEY_REF_DIR" 2>/dev/null || { authkey_unlock; return 1; }
   printf 'pid=%s\nstarted=%s\n' "$$" "$(date 2>/dev/null || true)" > "$AUTHKEY_TOKEN" 2>/dev/null || {
@@ -271,7 +299,7 @@ prepare_reverse_authorized_key() {
   fi
 
   if append_managed_authorized_key "$_ak_file"; then
-    ok "authorized_keys: temporarily authorized the box key for this reverse session"
+    ok "authorized_keys: temporarily authorized the forced project-host gateway"
     authkey_unlock
     return 0
   fi
@@ -300,6 +328,7 @@ cleanup_reverse_authorized_key() {
       warn "could not remove temporary remote-harness authorized_keys block"
     fi
   fi
+  [ -z "$GATEWAY_SESSION_DIR" ] || rm -rf "$GATEWAY_SESSION_DIR" 2>/dev/null || true
   authkey_unlock
 }
 
@@ -327,7 +356,7 @@ cleanup() {
       case \"\$cfg\" in
         */.remote-harness/.sessions/*/ssh_config)
           dir=\$(dirname \"\$cfg\")
-          rm -f \"\$cfg\" 2>/dev/null || true
+          rm -f \"\$cfg\" \"\$dir/id_ed25519\" \"\$dir/id_ed25519.pub\" 2>/dev/null || true
           rm -rf \"\$dir/runtime\" 2>/dev/null || true
           rmdir \"\$dir\" 2>/dev/null || true
           ;;
@@ -399,7 +428,7 @@ if [ -n "$PUBKEY" ]; then
   ok "box key visible: $(printf '%s' "$PUBKEY" | awk '{print $1, substr($2,1,14)"...", $3}')"
 fi
 say  "  Reverse auth: remote-harness may add a tagged temporary entry to ~/.ssh/authorized_keys."
-say  "  If a matching active key already exists, it will be reused and left untouched."
+say  "  A matching unrestricted key is rejected; only the managed forced-gateway entry is reusable."
 
 # -- ensure SSH server running --
 ssh_listening() { (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
@@ -487,7 +516,7 @@ write_target_forward() {
   if write_managed_alias "$TARGET" "$_rf_line" \
       "    ServerAliveInterval 30" "    ServerAliveCountMax 3" \
       "    ExitOnForwardFailure yes" "    TCPKeepAlive yes" \
-      "    ForwardAgent yes"; then
+      "    ForwardAgent no"; then
     ok "ssh config: prepared session Host '$TARGET' (HostName ${V_HOST:-?}, port ${V_PORT:-22}, user ${V_USER:-<login default>}) + RemoteForward $_port"
   else
     err "ssh config: could not write session Host '$TARGET'"
@@ -772,6 +801,7 @@ else
 fi
 ok "Selected: ${_B}${PROJ_DIR}${_0}"
 PROJ_NAME="$(basename "$PROJ_DIR")"
+register_gateway_project || { err "could not register the project with the forced gateway"; exit 1; }
 
 # ===========================================================================
 # Phase 4: Mount on the remote box
@@ -861,11 +891,48 @@ if [ "$rh_status" = INJECTED ]; then
   RULE_INJECTED=1
   rh_env=$(printf  '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_ENV=//p'   | head -1)
   rh_flags=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_FLAGS=//p' | head -1)
+  rh_ready=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_READY_FILE=//p' | head -1)
   EFF_LAUNCH="${rh_env:+$rh_env }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
   err "could not install strict run-on-laptop routing ($rh_status); refusing to launch the agent"
   exit 1
+fi
+
+if [ "$LAUNCH_BASE" = opencode ]; then
+  case "$rh_ready" in
+    /*) ;;
+    *) err "opencode routing plugin did not provide a readiness marker; refusing to launch"; exit 1;;
+  esac
+  case "$rh_ready" in *'
+'*) err "opencode routing plugin returned an invalid readiness marker; refusing to launch"; exit 1;; esac
+  if ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+    ready=$(sq "$rh_ready")
+    mount_root=$(sq "$REMOTE_MOUNTPOINT")
+    rm -f \"\$ready\" 2>/dev/null || true
+    cd \"\$mount_root\" || exit 1
+    (${rh_env:+$rh_env }opencode debug config </dev/null >/dev/null 2>&1) &
+    pid=\$!
+    i=0
+    while [ \"\$i\" -lt 60 ]; do
+      if [ -s \"\$ready\" ]; then
+        kill \"\$pid\" 2>/dev/null || true
+        wait \"\$pid\" 2>/dev/null || true
+        exit 0
+      fi
+      kill -0 \"\$pid\" 2>/dev/null || break
+      sleep 1
+      i=\$((i + 1))
+    done
+    kill \"\$pid\" 2>/dev/null || true
+    wait \"\$pid\" 2>/dev/null || true
+    exit 1
+  "; then
+    ok "opencode routing plugin loaded"
+  else
+    err "opencode routing plugin failed to load; refusing to launch the agent"
+    exit 1
+  fi
 fi
 
 hdr "Phase 5: launching ${LAUNCH}"

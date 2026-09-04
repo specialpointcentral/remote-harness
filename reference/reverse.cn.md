@@ -64,7 +64,7 @@ ssh -n -o ClearAllForwardings=yes \
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`。
 5. 它用 `--box-ssh-config <remote-session-config>` 调用 `laptop-setup.sh`。
 6. `laptop-setup.sh` 创建携带 RemoteForward 的笔记本侧会话 config，通过内部 ssh wrapper 连接，
-   在远端挂载笔记本项目，为 Claude/Codex 安装严格命令路由（或为 opencode 注入 SSH 规则），
+   在远端挂载笔记本项目，为 Claude/Codex 安装严格 hook，或为 opencode 安装路由 plugin，
    然后在远端启动选定 Agent。
 7. 退出时自动卸载 sshfs、删除会话规则、在没有其它挂载需要时断开反向隧道、删除临时 ssh config，
    并清理默认空挂载目录。
@@ -72,8 +72,8 @@ ssh -n -o ClearAllForwardings=yes \
 ## 前置条件
 
 - 笔记本可以用用户已有 SSH key 登录远端盒子。
-- 远端盒子通过反向隧道登录笔记本时，使用远端 `~/.remote-harness/keys` 下生成/复用的
-  remote-harness key。本地 setup 会先检查本机是否已有匹配且有效的授权；没有时才追加带
+- 远端盒子通过反向隧道登录笔记本时，使用与本次会话 SSH config 放在一起的新 key。本地 setup 会先
+  检查本机是否已有匹配且有效的授权；没有时才追加带
   `remote-harness:reverse-auth:<tag>` 标签、仅限回环来源的 `~/.ssh/authorized_keys` 托管块。
   托管块会引用计数，并在没有活动会话继续使用时于退出清理中删除。
 - 远端盒子已安装 remote-harness，默认在 `~/.remote-harness`，或设置了 `RH_HOME`。

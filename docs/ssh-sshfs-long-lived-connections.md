@@ -2,11 +2,10 @@
 
 Updated: 2026-06-27
 
-This document is for shared remote development servers that run remote-harness. remote-harness uses
-`ssh`, `sftp`, and `sshfs`: in simple reverse, the remote box mounts a user's local project through a
-reverse tunnel; in simple forward, the local machine mounts a server project over SSHFS. If one
-server hosts many users, many long-running agent sessions, or many SSHFS mounts, tune `sshd` and OS
-resource limits for capacity.
+This document is for shared remote development servers that run remote-harness. The remote server
+runs every coding Agent and uses `ssh`, `sftp`, and `sshfs` to mount each user's local project through
+a reverse tunnel. If one server hosts many users, many long-running Agent sessions, or many SSHFS
+mounts, tune `sshd` and OS resource limits for capacity.
 
 This is a generic operations template. It intentionally does not record concrete server IPs,
 hostnames, or accounts.

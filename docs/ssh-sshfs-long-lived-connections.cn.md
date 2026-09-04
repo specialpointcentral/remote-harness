@@ -4,10 +4,9 @@
 
 更新时间：2026-06-27
 
-本文面向运行 remote-harness 的共享远程开发服务器。remote-harness 会频繁使用 `ssh`、`sftp`
-和 `sshfs`：simple reverse 中，远端服务器通过反向隧道挂载用户本地项目；simple forward 中，本地机器通过
-SSHFS 挂载服务器项目。若一台服务器服务多个用户、多个长期 Agent 会话或大量 SSHFS 挂载，建议对服务器
-`sshd` 和系统资源上限做容量优化。
+本文面向运行 remote-harness 的共享远程开发服务器。所有编码 Agent 都运行在远端服务器；服务器通过
+反向隧道使用 `ssh`、`sftp` 和 `sshfs` 挂载每位用户的本机项目。若一台服务器服务多个用户、多个长期
+Agent 会话或大量 SSHFS 挂载，建议对服务器 `sshd` 和系统资源上限做容量优化。
 
 本文是通用运维模板，不记录具体服务器 IP、主机名或账号。
 

@@ -145,11 +145,11 @@ for script in \
   _common.sh \
   simple-dispatch.sh \
   simple-laptop-setup.sh \
-  simple-local-setup.sh \
   laptop-setup.sh \
-  local-setup.sh \
   mount-project.sh \
-  inject-rule.sh; do
+  inject-rule.sh \
+  run-on-project-host.sh \
+  project-host-gateway.sh; do
   if ! fetch_script "$script"; then
     if is_zh; then
       printf '无法从远端 remote-harness 读取 %s\n' "$script" >&2

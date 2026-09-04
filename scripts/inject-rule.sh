@@ -7,8 +7,8 @@
 # scoped channel:
 #   claude   → --append-system-prompt-file <rule>   (session-only flag; nothing on disk to clean up
 #              beyond the box-side rule file; never touches the mounted repo)
-#   opencode → OPENCODE_CONFIG=<session config: instructions[+permission=allow if yolo]>  (env;
-#              never touches the mounted repo)
+#   opencode → OPENCODE_CONFIG=<session config with instructions and tool hook plugin>
+#              (env; never touches the mounted repo)
 #   codex    → -c developer_instructions=<rule>  (session-only CLI config; avoids changing
 #              CODEX_HOME, because modern Codex can store ChatGPT credentials in an encrypted
 #              keyring keyed by the real home and would prompt for login under a synthetic home).
@@ -154,6 +154,65 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
   printf '%s' "$_wsr_runner"
 }
 
+write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker
+  _wop_dir="$1/plugins"
+  _wop_file="$_wop_dir/remote-harness.js"
+  _wop_runner_b64="$(printf '%s' "$2" | base64 | tr -d '\n')" || return 1
+  _wop_mount_b64="$(printf '%s' "$3" | base64 | tr -d '\n')" || return 1
+  _wop_ready_b64="$(printf '%s' "$4" | base64 | tr -d '\n')" || return 1
+  mkdir -p "$_wop_dir" 2>/dev/null || return 1
+  cat > "$_wop_file" <<EOF
+import fs from "node:fs"
+import path from "node:path"
+
+const runner = Buffer.from("$_wop_runner_b64", "base64").toString("utf8")
+const configuredMount = Buffer.from("$_wop_mount_b64", "base64").toString("utf8")
+const readyFile = Buffer.from("$_wop_ready_b64", "base64").toString("utf8")
+const mountRoot = fs.realpathSync(configuredMount)
+
+const encode = (value) => Buffer.from(value, "utf8").toString("base64")
+const apostrophe = String.fromCharCode(39)
+const doubleQuote = String.fromCharCode(34)
+const shellQuote = (value) =>
+  apostrophe +
+  value.split(apostrophe).join(apostrophe + doubleQuote + apostrophe + doubleQuote + apostrophe) +
+  apostrophe
+
+export const RemoteHarness = async ({ directory }) => {
+  fs.writeFileSync(readyFile, String(process.pid) + "\\n", { mode: 0o600 })
+  return {
+    "tool.execute.before": async (input, output) => {
+      if (String(input.tool).toLowerCase() !== "bash") return
+      const command = output.args?.command
+      if (typeof command !== "string" || command.trim() === "") {
+        throw new Error("remote-harness: opencode Bash input has no command")
+      }
+
+      const requested = output.args.workdir || directory || mountRoot
+      const candidate = path.resolve(directory || mountRoot, requested)
+      let cwd
+      try {
+        cwd = fs.realpathSync(candidate)
+      } catch {
+        throw new Error("remote-harness: opencode working directory is unavailable")
+      }
+      const relative = path.relative(mountRoot, cwd)
+      if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+        throw new Error("remote-harness: denied an opencode Bash command outside the SSHFS mount")
+      }
+
+      output.args.command = [runner, encode(relative || "."), encode(command)]
+        .map(shellQuote)
+        .join(" ")
+      output.args.workdir = mountRoot
+    },
+  }
+}
+EOF
+  chmod 600 "$_wop_file" 2>/dev/null || true
+  printf '%s' "$_wop_file"
+}
+
 write_claude_worktree_blocker() {  # $1=session dir
   _wcw_blocker="$1/bin/deny-worktree"
   mkdir -p "$1/bin" 2>/dev/null || return 1
@@ -205,23 +264,12 @@ EOF
 
 write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
   cmds="$(detect_cmds "$4")"
-  lpq="$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"   # path with single quotes escaped, for the 'cd ...' examples
-  if [ "${5:-}" = opencode ]; then
-    {
-      printf '# IMPORTANT - Remote dev harness rule\n\n'
-      printf 'This working directory is an SSHFS mount of `%s` on `%s`.\n' "$2" "$3"
-      printf 'File reads and edits may use the mount, but project commands must run on `%s`:\n\n' "$3"
-      printf '    ssh %s '\''cd %s && <command>'\''\n\n' "$3" "$lpq"
-      printf 'Do not install dependencies, build, test, format, lint, or mutate Git on this machine.\n'
-    } > "$1"
-    return
-  fi
   {
     printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
     printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools operate on the\n' "$2" "$3"
-    printf 'mount, while a session `PreToolUse` hook routes every Bash command to `%s`.\n\n' "$3"
+    printf 'mount, while a session router sends every Bash command to `%s`.\n\n' "$3"
     printf 'Run ordinary relative commands. Do not wrap them in `ssh`, and do not replace the routing\n'
-    printf 'runner. The hook maps the current mount-relative directory to the project host. Examples:\n\n'
+    printf 'runner. The router maps the current mount-relative directory to the project host. Examples:\n\n'
     printf '%s\n' "$cmds" | while IFS= read -r c; do
       [ -n "$c" ] && printf '    %s\n' "$c"
     done
@@ -252,21 +300,25 @@ case "${1:-}" in
     RULE="$SD/rule.md"
     write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || { echo "RH_STATUS=ERROR"; exit 1; }
 
-    env_out=""; flags_out=""
+    env_out=""; flags_out=""; ready_file=""
     if [ -n "$ssh_config" ]; then
       if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
       fi
     fi
-    if [ "$agent" = claude ] || [ "$agent" = codex ]; then
+    if [ "$agent" = claude ] || [ "$agent" = codex ] || [ "$agent" = opencode ]; then
       [ -n "$ssh_config" ] && [ -f "$ssh_config" ] \
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config") \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+    fi
+    if [ "$agent" = claude ] || [ "$agent" = codex ]; then
       PYTHON3=$(command -v python3 2>/dev/null || true)
       [ -n "$PYTHON3" ] && [ -x "$PYTHON3" ] \
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      [ -x "$SCRIPT_DIR/route-command.py" ] && [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config") \
+      [ -x "$SCRIPT_DIR/route-command.py" ] \
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
       hook_command="$(sq "$PYTHON3") $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
     fi
@@ -286,10 +338,16 @@ case "${1:-}" in
         # the user's config — that avoided a crash on a non-array `instructions` and a stale config
         # snapshot overriding a project-local opencode.json.
         CFG="$SD/opencode.json"
+        ready_file="$SD/opencode-plugin.ready"
+        rm -f "$ready_file" 2>/dev/null || true
+        opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file") \
+          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
         [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
-        # JSON-escape the rule path: escape \ then " (both legal in Unix paths; rare but correct).
+        # JSON-escape session paths: escape \ then " (both legal in Unix paths; rare but correct).
         rule_json="$(printf '%s' "$RULE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-        printf '{ "$schema": "https://opencode.ai/config.json", %s"instructions": ["%s"] }\n' "$perm" "$rule_json" > "$CFG"
+        plugin_json="$(printf '%s' "$opencode_plugin" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        printf '{ "$schema": "https://opencode.ai/config.json", %s"plugin": ["%s"], "instructions": ["%s"] }\n' \
+          "$perm" "$plugin_json" "$rule_json" > "$CFG"
         env_out="${env_out:+$env_out }OPENCODE_CONFIG=$(sq "$CFG")"
         ;;
       codex)
@@ -314,6 +372,7 @@ case "${1:-}" in
     printf 'RH_STATUS=INJECTED\n'
     printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
+    printf 'RH_READY_FILE=%s\n'   "$ready_file"
     ;;
   off)
     mp="${3:-}"; SD="$(session_dir "$mp")"

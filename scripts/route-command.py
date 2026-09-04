@@ -12,6 +12,11 @@ import sys
 from typing import Any
 
 
+AGENT_BINARIES = {"claude", "codex", "opencode"}
+COMMAND_WRAPPERS = {"command", "env", "exec", "nohup", "sudo", "time"}
+COMMAND_SEPARATORS = {";", "&", "&&", "|", "||", "(", ")"}
+
+
 def encode(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
@@ -28,6 +33,29 @@ def decision(kind: str, **values: Any) -> dict[str, Any]:
 
 def deny(reason: str) -> dict[str, Any]:
     return decision("deny", permissionDecisionReason=reason)
+
+
+def launches_agent(command: str) -> bool:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+    lexer.whitespace_split = True
+    expect_command = True
+    for token in lexer:
+        if token in COMMAND_SEPARATORS:
+            expect_command = True
+            continue
+        if not expect_command:
+            continue
+        if "=" in token and not token.startswith(("/", "./", "../")):
+            name = token.split("=", 1)[0]
+            if name.replace("_", "a").isalnum():
+                continue
+        executable = os.path.basename(token)
+        if executable in COMMAND_WRAPPERS:
+            continue
+        if executable in AGENT_BINARIES:
+            return True
+        expect_command = False
+    return False
 
 
 def route(args: argparse.Namespace) -> dict[str, Any]:
@@ -51,8 +79,16 @@ def route(args: argparse.Namespace) -> dict[str, Any]:
         return deny("remote-harness only routes Bash and validates Agent tool calls")
 
     command = tool_input.get("command")
-    if not isinstance(command, str):
+    if not isinstance(command, str) or not command.strip():
         return deny("remote-harness Bash input has no string command")
+    try:
+        if launches_agent(command):
+            return deny(
+                "Agent processes must run on the remote agent host; "
+                "use the Agent tool or another remote-harness session"
+            )
+    except ValueError as error:
+        return deny(f"remote-harness could not safely parse the Bash command: {error}")
 
     runner = os.path.realpath(os.path.expanduser(args.runner))
     if not os.path.isfile(runner) or not os.access(runner, os.X_OK):
@@ -71,8 +107,6 @@ def route(args: argparse.Namespace) -> dict[str, Any]:
         return deny("remote-harness denied a Bash command outside the SSHFS mount")
 
     relative_cwd = os.path.relpath(cwd, mount_root)
-    if relative_cwd == ".":
-        relative_cwd = ""
     updated_input = dict(tool_input)
     updated_input["command"] = " ".join(
         shlex.quote(part) for part in (runner, encode(relative_cwd), encode(command))

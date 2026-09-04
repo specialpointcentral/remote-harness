@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # remote-harness / _common.sh — shared helpers, SOURCED (not executed) by the two setup scripts:
 #   laptop-setup.sh  (reverse: agent on a remote box, code on the laptop — reverse tunnel)
-#   local-setup.sh   (forward: agent local, code on a directly-reachable remote server)
+#   local-setup.sh   (disabled compatibility entry; local agents are not supported)
 # Both source it via:  . "$(dirname "$0")/_common.sh"
 # For the reverse flow the skill's one-command fetches THIS file next to laptop-setup.sh so the
 # laptop (which usually has no install) still finds it. Sets colors + OS vars at source time and

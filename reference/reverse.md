@@ -69,15 +69,15 @@ ssh -n -o ClearAllForwardings=yes \
 5. It calls `laptop-setup.sh` with `--box-ssh-config <remote-session-config>`.
 6. `laptop-setup.sh` creates the laptop-side session config carrying `RemoteForward`, connects
    through its internal ssh wrapper, mounts the laptop project on the box, installs strict
-   Claude/Codex command routing (or the opencode SSH rule), and launches the selected agent.
+   strict Claude/Codex hooks or the opencode routing plugin, and launches the selected agent.
 7. On exit, cleanup unmounts sshfs, removes the session rule, drops the reverse tunnel when no
    remaining mount needs it, removes temp ssh configs, and removes default empty mountpoint dirs.
 
 ## Preconditions
 
 - The laptop can SSH into the remote box with the user's existing SSH key.
-- The remote box can authenticate back to the laptop through the reverse tunnel using the
-  remote-harness key generated/reused under the box's `~/.remote-harness/keys`. The laptop setup
+- The remote box can authenticate back to the laptop through the reverse tunnel using a new key
+  stored beside the session SSH config. The laptop setup
   checks for an existing active matching key first; otherwise it appends a tagged,
   loopback-scoped `remote-harness:reverse-auth:<tag>` block to `~/.ssh/authorized_keys`. Managed
   blocks are reference-counted and removed on exit when no active session still uses them.

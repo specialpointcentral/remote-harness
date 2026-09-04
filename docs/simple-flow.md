@@ -1,128 +1,103 @@
-# Simple Flow
+# Simple Remote-Only Flow
 
-## Verdict
+> Chinese counterpart: [simple-flow.cn.md](simple-flow.cn.md).
 
-Feasible. In the current reverse flow, the agent mainly collects connection details, project paths,
-the mountpoint, and launch preferences. The actual tunnel, SSH auth check, sshfs mount, rule
-injection, and launch are already deterministic scripts. Moving the prompts into a local CLI wizard
-lets the skill return one generic command while keeping concrete local and remote details out of the
-agent conversation. The one exception is a best-effort remote SSH target default, because the agent
-runs on that remote box and can already observe the remote username/address. That default remains
-editable and local cache still wins.
+## Contract
 
-This document covers simple reverse: agent on the remote box, code on the user's laptop. Simple
-forward is implemented separately in `docs/simple-forward-flow.md`.
+The maintained fork supports one topology:
 
-Short phrases such as "远程开发本地" or "remote dev local project" should select this mode. Short
-phrases such as "本地开发远程项目" should select simple forward. If the request is ambiguous, use
-`simple-bootstrap.sh` without `--mode`; it delegates to `simple-dispatch.sh`, which defaults to
-reverse.
+- Claude, Codex, opencode, subagents, nested agents, and independent agent sessions run on the
+  remote server.
+- The local project is mounted on that server through SSHFS.
+- Bash commands are returned through a forced SSH gateway and run inside the registered local
+  project root.
 
-## CodexMonitor Reference
+Local-agent/forward requests are rejected before mounting or launching anything. An omitted mode
+also selects reverse; there is no mode picker.
 
-The CodexMonitor fork in remote-harness-gui models the boundary this shell flow should keep:
+## Bootstrap
 
-- `AddWorkspacePrompt.tsx` collects SSH target, local folder, remote mount path, and launch options
-  in local UI.
-- `tauri.ts` and `workspaces/commands.rs` perform SSH checks, directory operations, and mount actions
-  on the local application side.
-- `backend/app_server.rs` builds the remote harness script and app-server connection after the
-  workspace has already been configured.
-- The remote daemon notes in `REMOTE_BACKEND_POC.md` keep execution authority outside the agent and
-  pass only prepared workspace context to it.
+The public entry is `scripts/simple-bootstrap.sh`. It runs on the local machine. When the local
+machine does not already have the helper bundle, the bootstrap fetches these scripts from the remote
+remote-harness installation into a temporary directory under `~/.remote-harness/.sessions/...`.
 
-The shell equivalent is a local terminal wizard plus deterministic scripts. The agent prints the
-bootstrap command; the user supplies details in their terminal.
+The coding agent returns the bootstrap command immediately. Concrete SSH targets, local paths,
+remote mountpoints, ports, and namespaces are collected by the local terminal rather than in the
+agent conversation. A remote `scripts/suggest-via.sh` result may be used only as an editable default.
 
-## Bootstrap Command Shape
+## Sequence
 
-The public simple entry is `scripts/simple-bootstrap.sh` for reverse, forward, and ambiguous mode.
-The command always runs locally, but the script may be loaded from either a local install or a remote
-skill/source install. Keep the bootstrap command to a small number of short lines; do not collapse it
-into a single long line that chat wrapping can split. Keep any remote `ssh ... | bash ...` pipeline
-on readable continuation lines.
+1. `simple-bootstrap.sh` invokes `simple-dispatch.sh`, which accepts reverse mode only.
+2. `simple-laptop-setup.sh` collects the remote SSH target, local project directory, optional remote
+   mountpoint, agent CLI, and approval mode.
+3. The remote `setup-tunnel.sh` creates a session directory, session-local SSH config, known-hosts
+   file, and a new per-session Ed25519 key.
+4. `laptop-setup.sh` installs stable copies of `project-host-gateway.sh` and
+   `run-on-project-host.sh` under local `~/.remote-harness/bin`.
+5. The local project root is registered under
+   `~/.remote-harness/.sessions/gateways/<session-tag>/project-root.b64`.
+6. The per-session public key is added to local `~/.ssh/authorized_keys` inside a tagged managed
+   block. Its line is limited to loopback tunnel sources, binds a forced gateway command, and
+   disables PTY, port, X11, and SSH-agent forwarding.
+7. The local SSH connection opens `RemoteForward <port> 127.0.0.1:22` to the remote server.
+8. The remote server uses the session key and config to mount the selected local project with
+   SSHFS.
+9. For opencode, the remote CLI preloads the session plugin and must create its readiness marker.
+   Failure aborts before the interactive Agent starts.
+10. The selected agent is launched only on the remote server, inside the SSHFS mount.
+11. Claude/Codex `PreToolUse` hooks or the opencode `tool.execute.before` plugin rewrite Bash to the
+    session runner. The runner sends only `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`
+    through the forced gateway.
+12. The local dispatcher verifies the project root and physical cwd, removes common AI credential
+    variables, shadows `claude`, `codex`, and `opencode` in `PATH`, then executes the project command
+    with the local login shell.
+13. Exit cleanup removes the mount, injected rules, remote session key/config/runtime directory,
+    local gateway registration, temporary authorization, and local session config.
 
-## Privacy Boundary
+## Gateway Protocol
 
-- The agent does not ask for or retain local laptop details, project paths, remote mount paths,
-  reverse ports, or namespaces.
-- The local terminal collects the SSH target, project directory, optional remote mountpoint, and
-  whether to launch in YOLO/bypass mode.
-- The local terminal stores the last confirmed values in `~/.remote-harness/simple-cache.env` and
-  uses them as defaults on the next run. Delete that file to reset the defaults.
-- If the local cache has no SSH target, the first SSH target prompt may use a server-side suggestion
-  generated by `scripts/suggest-via.sh`. That helper may use remote `id -un`, server address, and
-  server SSH port only.
-- When `SSH_CONNECTION` is used for the suggestion, only fields 3 and 4 (`server-ip` /
-  `server-port`) are allowed. Fields 1 and 2 are local/client data and must not be printed, cached,
-  or embedded in the command.
-- The suggested SSH target is only an editable default. It can be wrong for Host aliases, jump hosts,
-  NAT, VPN, IPv6, and private/public address choices, so the user can always replace it.
-- If the invocation already requested YOLO/bypass mode, the bootstrap command includes `--yolo` and
-  the local wizard does not ask that question again. Without an explicit request, the wizard asks
-  with the local cache as the default.
-- The remote server receives only the information required for the actual setup.
-- The simple reverse flow uses a fixed box-side laptop alias (`rlocal`) by default, written only
-  to a session-local remote ssh config under `~/.remote-harness/.sessions/.../ssh_config`.
-- The simple reverse flow keeps temporary SSH config and `known_hosts` under
-  `~/.remote-harness/.sessions/...`, disables OpenSSH multiplexing, and removes session-local
-  directories at the end where possible. It does not write `~/.ssh/config`, `known_hosts`, or SSH
-  keys. Its only `~/.ssh` mutation is the laptop `authorized_keys` managed block used for temporary
-  reverse authentication.
-- Claude/Codex get a session-local `PreToolUse` hook and runner that route Bash automatically.
-  opencode keeps the session-local `ssh` wrapper and short `ssh rlocal ...` instruction.
-- Local paths stay out of chat unless the user explicitly pastes them.
+The forced local gateway accepts only:
 
-## Flow
+- standard SFTP requests needed by SSHFS;
+- `remote-harness-health`;
+- the fixed `remote-harness-exec` request.
 
-1. Agent optionally runs `scripts/suggest-via.sh`, then emits one `simple-bootstrap.sh` command with
-   `--mode reverse` and that value as an editable SSH target default.
-2. If local remote-harness is not assumed, the command prompts locally for the remote-harness source
-   SSH target and fetches `~/.remote-harness/scripts/simple-bootstrap.sh` from that source.
-3. `simple-bootstrap.sh` fetches the local-side helper bundle into a temp directory under
-   `~/.remote-harness/.sessions`, then calls
-   `simple-dispatch.sh --mode reverse --source-via <source>`.
-4. `simple-dispatch.sh` hands off to `simple-laptop-setup.sh`.
-5. `simple-laptop-setup.sh` prompts locally for project dir, optional remote mountpoint, and YOLO
-   launch preference. The YOLO prompt is skipped when `--yolo` was already passed.
-6. It creates a temp remote ssh config path under `~/.remote-harness/.sessions/.../ssh_config`.
-7. It runs remote `setup-tunnel.sh --config <temp-config> --namespace rlocal --alias rlocal --gen-key`.
-8. It delegates to the existing `laptop-setup.sh`, passing `--box-ssh-config <temp-config>`.
-9. `laptop-setup.sh` creates its own local session ssh config for the laptop-to-box RemoteForward
-   alias and uses an internal `ssh` wrapper so script calls can stay short (`ssh <target>`).
-10. `laptop-setup.sh` uses the box temp config for `check-tunnel.sh`, `mount-project.sh`, port-switch
-   alias rewrites, the Claude/Codex runner, and the opencode session `ssh` wrapper.
-11. On exit, cleanup unmounts sshfs, removes session rules, removes temp ssh configs, and removes
-    default empty mountpoint directories under `~/.remote-harness/mounts`.
+Arbitrary SSH commands are rejected. A matching key already authorized outside the managed forced
+gateway block is also rejected, because that authorization would bypass the gateway.
+
+## Multi-Agent Behavior
+
+Claude ordinary, named, and nested subagents are created by the remote Claude process. Their Bash
+calls inherit the same hook and return to the local project host. Named agents may use Claude's own
+messaging features while staying remote.
+
+Agent Teams are disabled because temporary settings inheritance is not guaranteed across independent
+teammate sessions. Claude worktree creation is blocked because a remote Agent-host worktree has no
+valid mapping to the registered local project root. For isolated parallel work, create local Git
+worktrees and start one remote-harness session per worktree.
+
+## Security Boundary
+
+The forced gateway prevents the reverse key from opening an arbitrary local SSH shell. The hook and
+dispatcher also reject direct Agent CLI launches, scrub common AI credentials, and shadow common
+Agent binary names.
+
+These controls are policy enforcement around an intentionally general project shell, not a complete
+OS sandbox. An arbitrary shell is Turing-complete and SFTP is not chrooted to the selected project.
+For an absolute no-local-Agent and project-only filesystem boundary, run the local SSH gateway under
+a dedicated OS account that has access only to the intended project, has no Agent CLI installed, and
+has no AI credentials.
 
 ## Preconditions
 
-- remote-harness is installed on the remote box at `~/.remote-harness`, or remote `RH_HOME` points to it.
-- The user's local SSH public key is accepted by the remote server.
-- The remote box authenticates back to the laptop through the reverse tunnel with a remote-harness
-  key generated/reused under the box's `~/.remote-harness/keys`. The laptop setup first checks for
-  an existing active matching authorized key; otherwise it appends a tagged, loopback-scoped
-  `remote-harness:reverse-auth:<tag>` block to `~/.ssh/authorized_keys` and removes it on exit when
-  no active session still references it.
-- The laptop can run an SSH server.
-- The remote box has `sshfs` and FUSE available.
-- The remote box has the selected agent CLI installed: `codex`, `claude`, or `opencode`.
-- For shared remote boxes or many long-lived SSHFS mounts, tune sshd capacity, keepalive, `nofile`,
-  and TCP queues as described in `docs/ssh-sshfs-long-lived-connections.md`.
+- The local machine can SSH to the remote server, and the remote server has remote-harness plus the
+  selected Agent CLI installed.
+- The local machine runs an SSH server.
+- The remote server has SSHFS and FUSE.
+- Strict Claude/Codex routing requires Python 3 on the remote Agent host. opencode requires its
+  current `tool.execute.before` plugin interface.
+- The local project host needs POSIX `sh`, a base64 decoder, and its project toolchain.
+- The remote server's sshd permits reverse TCP forwarding.
 
-## Implemented
-
-- `scripts/simple-bootstrap.sh`
-- `scripts/simple-dispatch.sh`
-- `scripts/simple-laptop-setup.sh`
-- `scripts/setup-tunnel.sh --config`
-- `scripts/check-tunnel.sh --ssh-config`
-- `scripts/mount-project.sh --ssh-config`
-- `scripts/laptop-setup.sh --box-ssh-config`
-- Updated `SKILL.md` / `SKILL.cn.md`
-- Updated Codex and opencode adapter docs
-
-## Later
-
-- Continue hardening simple forward with more live two-host E2E coverage.
-- Add optional local/GUI directory selection without exposing paths to the agent.
+For shared or long-lived servers, see
+[ssh-sshfs-long-lived-connections.md](ssh-sshfs-long-lived-connections.md).

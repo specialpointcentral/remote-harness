@@ -11,9 +11,9 @@ Codex 不为这个流程暴露自定义 `/` 斜杠命令。`manage.sh codex` 会
 $remote-harness
 ```
 
-Codex 应读取 `SKILL.md` 并立即返回正确的 simple bootstrap 命令。不要在聊天中询问 SSH target、路径、端口或命名空间；这些信息会由命令在用户本地终端里提示输入。默认使用 simple reverse；当用户明确要求本地 Codex 连接 SSH 服务器上的项目/开发环境时，使用 simple forward。
+Codex 应读取 `SKILL.md` 并立即返回 reverse bootstrap 命令。不要在聊天中询问 SSH target、路径、端口或命名空间；这些信息会由命令在用户本地终端里提示输入。remote-only 模式是强制要求：Codex 及所有 subagent 都留在远端服务器。若用户要求在本机运行 Codex，应说明维护 fork 会拒绝该拓扑。
 setup 脚本使用 `~/.remote-harness` 下的会话级 SSH config 和 wrapper。只有 reverse 模式下
-`authorized_keys` 临时托管块需要提到 `~/.ssh` 修改；不要暗示会编辑 config、known_hosts 或 SSH key。
+`authorized_keys` 临时 forced-command 托管块需要提到 `~/.ssh` 修改；不要暗示会编辑 config、known_hosts 或用户管理的 SSH key。
 
 因为这是 Codex 适配入口，输出命令必须使用：
 

@@ -33,11 +33,32 @@ sq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+reject_direct_agent_launch() {
+  printf '%s\n' "$1" | grep -Eq '(^|[;&|()]|[[:space:]])(command[[:space:]]+|env([[:space:]]+[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+)*[[:space:]]+|exec[[:space:]]+|nohup[[:space:]]+|sudo[[:space:]]+|time[[:space:]]+)?([^;&|()[:space:]]*/)?(claude|codex|opencode)([[:space:];&|()]|$)'
+}
+
+make_agent_guard_path() {
+  _mag_dir=$(mktemp -d "${TMPDIR:-/tmp}/remote-harness-no-agent.XXXXXX") \
+    || fail "could not create the local no-agent guard"
+  for _mag_name in claude codex opencode; do
+    cat > "$_mag_dir/$_mag_name" <<'EOF'
+#!/usr/bin/env sh
+printf 'remote-harness: Agent processes must run on the remote agent host.\n' >&2
+exit 126
+EOF
+    chmod +x "$_mag_dir/$_mag_name"
+  done
+  printf '%s' "$_mag_dir"
+}
+
 dispatch() {
   [ "$#" -eq 3 ] || fail "internal dispatch needs project root, cwd, and command"
   project_root=$(decode_b64 "$1") || fail "could not decode project root"
   relative_cwd=$(decode_b64 "$2") || fail "could not decode relative working directory"
   command=$(decode_b64 "$3") || fail "could not decode command"
+  if reject_direct_agent_launch "$command"; then
+    fail "Agent processes must run on the remote agent host"
+  fi
 
   case "$project_root" in /*) ;; *) fail "project root must be absolute" ;; esac
   safe_relative_dir "$relative_cwd" || fail "invalid relative working directory"
@@ -57,8 +78,17 @@ dispatch() {
   case "$shell" in /*) ;; *) shell=/bin/sh ;; esac
   [ -x "$shell" ] || shell=/bin/sh
   export GIT_OPTIONAL_LOCKS=0
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR \
+    OPENAI_API_KEY CODEX_API_KEY CODEX_HOME 2>/dev/null || true
+  guard_path=$(make_agent_guard_path)
+  trap 'rm -rf "$guard_path"' EXIT HUP INT TERM
   cd "$target_physical"
-  exec "$shell" -lc "$command"
+  guarded_command="PATH=$(sq "$guard_path"):\$PATH; export PATH; $command"
+  "$shell" -lc "$guarded_command"
+  status=$?
+  rm -rf "$guard_path"
+  trap - EXIT HUP INT TERM
+  exit "$status"
 }
 
 if [ "${1:-}" = "--dispatch" ]; then
@@ -90,7 +120,7 @@ safe_relative_dir "$relative_decoded" || fail "invalid relative working director
 [ -n "$command_b64" ] || command_b64=$(encode_b64 "")
 
 project_root_b64=$(encode_b64 "$project_root")
-remote_command="sh -s -- --dispatch $(sq "$project_root_b64") $(sq "$relative_cwd") $(sq "$command_b64")"
+remote_command="remote-harness-exec $project_root_b64 $relative_cwd $command_b64"
 exec ssh -F "$ssh_config" -T \
   -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=15 \
-  "$alias_name" "$remote_command" < "$0"
+  "$alias_name" "$remote_command"

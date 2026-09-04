@@ -58,6 +58,31 @@ assert base64.b64decode(argv[1]).decode() == "packages/api"
 assert base64.b64decode(argv[2]).decode() == "printf routed"
 PY
 
+python3 - "$router_tmp/root-input.json" "$router_tmp/mount" <<'PY'
+import json
+import sys
+
+json.dump({
+    "hook_event_name": "PreToolUse",
+    "cwd": sys.argv[2],
+    "tool_name": "Bash",
+    "tool_input": {"command": "printf root-cwd"},
+}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+python3 "$ROOT/scripts/route-command.py" \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+  < "$router_tmp/root-input.json" > "$router_tmp/root-output.json"
+python3 - "$router_tmp/root-output.json" <<'PY'
+import base64
+import json
+import shlex
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+argv = shlex.split(payload["hookSpecificOutput"]["updatedInput"]["command"])
+assert base64.b64decode(argv[1]).decode() == "."
+PY
+
 cat > "$router_tmp/agent.json" <<EOF
 {
   "hook_event_name": "PreToolUse",
@@ -143,16 +168,89 @@ while [ "$#" -gt 0 ]; do
     *) shift; remote_command=${1:-}; break ;;
   esac
 done
-exec sh -c "$remote_command"
+set -- $remote_command
+[ "$#" -eq 4 ] && [ "$1" = remote-harness-exec ] || exit 2
+exec "${TEST_DISPATCHER:?}" --dispatch "$2" "$3" "$4"
 EOS
 chmod +x "$router_tmp/bin/ssh"
 printf 'Host project-host\n    HostName 127.0.0.1\n' > "$router_tmp/ssh_config"
-client_out=$(PATH="$router_tmp/bin:$PATH" SHELL=/bin/sh \
+client_out=$(PATH="$router_tmp/bin:$PATH" SHELL=/bin/sh TEST_DISPATCHER="$ROOT/scripts/run-on-project-host.sh" \
   sh "$ROOT/scripts/run-on-project-host.sh" \
     --ssh-config "$router_tmp/ssh_config" --alias project-host \
     --project-root "$router_tmp/project" --cwd-relative-b64 "$(b64 packages/api)" \
     --command-b64 "$(b64 'printf "%s" "$PWD"')")
 assert_eq "project-host client transport" "$client_out" "$router_tmp/project/packages/api"
+
+for blocked_command in \
+  'claude -p local-child' \
+  '/usr/local/bin/codex exec local-child' \
+  'env TEST=1 opencode run'; do
+  python3 - "$router_tmp/blocked.json" "$router_tmp/mount" "$blocked_command" <<'PY'
+import json
+import sys
+
+json.dump({
+    "hook_event_name": "PreToolUse",
+    "cwd": sys.argv[2],
+    "tool_name": "Bash",
+    "tool_input": {"command": sys.argv[3]},
+}, open(sys.argv[1], "w", encoding="utf-8"))
+PY
+  python3 "$ROOT/scripts/route-command.py" \
+    --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
+    < "$router_tmp/blocked.json" > "$router_tmp/blocked-output.json"
+  python3 - "$router_tmp/blocked-output.json" <<'PY'
+import json
+import sys
+
+specific = json.load(open(sys.argv[1], encoding="utf-8"))["hookSpecificOutput"]
+assert specific["permissionDecision"] == "deny"
+assert "agent" in specific["permissionDecisionReason"].lower()
+PY
+done
+
+if SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+    "$(b64 "$router_tmp/project")" "$(b64 packages/api)" "$(b64 'claude -p local-child')" \
+    >"$router_tmp/local-agent.out" 2>"$router_tmp/local-agent.err"; then
+  fail "project-host dispatcher allowed a direct local Claude launch"
+fi
+assert_grep "$router_tmp/local-agent.err" "Agent processes must run on the remote" "dispatcher direct agent denial"
+indirect_agent_command="sh -c 'codex exec local-child'"
+if SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+    "$(b64 "$router_tmp/project")" "$(b64 packages/api)" "$(b64 "$indirect_agent_command")" \
+    >"$router_tmp/indirect-agent.out" 2>"$router_tmp/indirect-agent.err"; then
+  fail "project-host dispatcher allowed an indirect local Codex launch"
+fi
+assert_grep "$router_tmp/indirect-agent.err" "Agent processes must run on the remote" "dispatcher PATH guard denial"
+
+gateway_home="$router_tmp/gateway-home"
+gateway_tag="session-test"
+mkdir -p "$gateway_home/.remote-harness/bin" "$gateway_home/.remote-harness/.sessions/gateways/$gateway_tag"
+cp "$ROOT/scripts/run-on-project-host.sh" "$gateway_home/.remote-harness/bin/"
+cp "$ROOT/scripts/project-host-gateway.sh" "$gateway_home/.remote-harness/bin/"
+chmod +x "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_home/.remote-harness/bin/run-on-project-host.sh"
+printf '%s' "$(b64 "$router_tmp/project")" > "$gateway_home/.remote-harness/.sessions/gateways/$gateway_tag/project-root.b64"
+gateway_health=$(HOME="$gateway_home" SSH_ORIGINAL_COMMAND=remote-harness-health \
+  sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag")
+case "$gateway_health" in RH_OK*) ;; *) fail "gateway health response invalid: $gateway_health";; esac
+gateway_exec=$(HOME="$gateway_home" \
+  SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 packages/api) $(b64 'printf gateway-ok')" \
+  sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag")
+assert_eq "forced-command gateway execution" "$gateway_exec" "gateway-ok"
+if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='uname -a' \
+    sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" \
+    >"$router_tmp/gateway-shell.out" 2>"$router_tmp/gateway-shell.err"; then
+  fail "forced-command gateway accepted an arbitrary local shell command"
+fi
+assert_grep "$router_tmp/gateway-shell.err" "unsupported SSH command" "gateway arbitrary shell denial"
+if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='internal-sftp -h' \
+    sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" \
+    </dev/null >"$router_tmp/gateway-sftp.out" 2>"$router_tmp/gateway-sftp.err"; then
+  :
+fi
+if grep -F "unsupported SSH command" "$router_tmp/gateway-sftp.err" >/dev/null; then
+  fail "forced-command gateway rejected the standard internal-sftp request"
+fi
 
 parse_via "ssh -J jump -p 2222 -i /tmp/key dev@example.com"
 assert_eq "host" "$V_HOST" "example.com"
@@ -241,7 +339,7 @@ assert_grep "$tmp/inject-wrapped.out" "RH_LAUNCH_ENV=PATH='" "inject wrapper exp
 [ -x "$wrapped_dir/bin/ssh" ] || fail "inject wrapper ssh missing"
 assert_grep "$wrapped_dir/bin/ssh" "cfg='$ssh_cfg'" "inject wrapper stores temp ssh config"
 assert_grep "$wrapped_dir/bin/ssh" '-F "$cfg"' "inject wrapper uses temp ssh config"
-assert_grep "$wrapped_dir/rule.md" 'routes every Bash command to `rlocal`' "inject rule documents automatic routing"
+assert_grep "$wrapped_dir/rule.md" 'session router sends every Bash command to `rlocal`' "inject rule documents automatic routing"
 if grep -F "ssh rlocal 'cd" "$wrapped_dir/rule.md" >/dev/null; then
   fail "strict inject rule still tells Codex to wrap commands in ssh"
 fi
@@ -289,10 +387,70 @@ missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount-no-config" 0 || true)
 assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex inject requires ssh config"
 RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 1 > "$tmp/inject-opencode.out"
-assert_grep "$tmp/inject-opencode.out" "RH_LAUNCH_ENV=OPENCODE_CONFIG='" "inject opencode env quoted"
+  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 1 "$basic_ssh_cfg" > "$tmp/inject-opencode.out"
+assert_grep "$tmp/inject-opencode.out" "OPENCODE_CONFIG='" "inject opencode env quoted"
+assert_grep "$tmp/inject-opencode.out" "RH_READY_FILE=" "inject opencode exposes a plugin readiness marker"
+opencode_session_key="$(printf '%s' "$tmp/mount-opencode" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+opencode_session_dir="$rh_home/.sessions/$opencode_session_key"
+opencode_plugin="$opencode_session_dir/plugins/remote-harness.js"
+opencode_ready="$opencode_session_dir/opencode-plugin.ready"
+[ -f "$opencode_plugin" ] || fail "inject opencode routing plugin missing"
+[ -x "$opencode_session_dir/bin/rh-run" ] || fail "inject opencode session runner missing"
+python3 - "$opencode_session_dir/opencode.json" "$opencode_plugin" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+assert config["plugin"] == [sys.argv[2]]
+PY
+mkdir -p "$tmp/mount-opencode/packages/api"
+node --input-type=module - "$opencode_plugin" "$tmp/mount-opencode" "$tmp/opencode-plugin.json" <<'JS'
+import fs from "node:fs"
+import { pathToFileURL } from "node:url"
+
+const pluginPath = process.argv[2]
+const mountRoot = process.argv[3]
+const outputPath = process.argv[4]
+const module = await import(pathToFileURL(pluginPath).href)
+const factory = Object.values(module).find((value) => typeof value === "function")
+if (!factory) throw new Error("generated opencode plugin exports no function")
+const hooks = await factory({ directory: mountRoot })
+const output = { args: { command: "printf opencode-routed", workdir: "packages/api", timeout: 3210 } }
+await hooks["tool.execute.before"]({ tool: "bash", sessionID: "test", callID: "call" }, output)
+let outsideDenied = false
+try {
+  await hooks["tool.execute.before"](
+    { tool: "bash", sessionID: "test", callID: "outside" },
+    { args: { command: "uname -a", workdir: "../outside" } },
+  )
+} catch {
+  outsideDenied = true
+}
+fs.writeFileSync(outputPath, JSON.stringify({ output, outsideDenied }))
+JS
+[ -s "$opencode_ready" ] || fail "opencode routing plugin did not write its readiness marker"
+python3 - "$tmp/opencode-plugin.json" "$opencode_session_dir/bin/rh-run" "$tmp/mount-opencode" <<'PY'
+import base64
+import json
+import shlex
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+args = payload["output"]["args"]
+argv = shlex.split(args["command"])
+assert argv[0] == sys.argv[2]
+assert base64.b64decode(argv[1]).decode() == "packages/api"
+assert base64.b64decode(argv[2]).decode() == "printf opencode-routed"
+assert args["workdir"] == sys.argv[3]
+assert args["timeout"] == 3210
+assert payload["outsideDenied"] is True
+PY
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/mount-opencode" >/dev/null
+missing_opencode_cfg=$(RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode-no-config" 0 || true)
+assert_grep <(printf '%s\n' "$missing_opencode_cfg") "RH_STATUS=ERROR" "strict opencode inject requires ssh config"
+assert_grep "$ROOT/scripts/laptop-setup.sh" "opencode routing plugin failed to load" "laptop setup fails closed when the opencode plugin is unavailable"
 
 cat > "$tmp/bin/sudo" <<'EOS'
 #!/usr/bin/env bash
@@ -330,6 +488,7 @@ assert_grep "$setup_cfg" "    RemoteForward 32022 127.0.0.1:22" "setup-only remo
 assert_grep "$setup_cfg" "UserKnownHostsFile $setup_home/.remote-harness/.sessions/" "setup-only known_hosts under remote-harness"
 assert_grep "$setup_cfg" "/runtime/known_hosts" "setup-only separates mutable SSH runtime from config"
 assert_grep "$setup_cfg" "    ControlMaster no" "setup-only disables multiplexing"
+assert_grep "$setup_cfg" "    ForwardAgent no" "setup-only disables SSH agent forwarding"
 [ ! -e "$setup_home/.ssh/config" ] || fail "laptop-setup wrote ~/.ssh/config"
 [ ! -e "$setup_home/.ssh/authorized_keys" ] || fail "laptop-setup wrote ~/.ssh/authorized_keys"
 [ -z "$(find "$setup_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "laptop-setup created config.rh-bak"
@@ -413,72 +572,9 @@ assert_grep "$tmp/laptop-bad-launch.err" "unsupported --launch" "laptop launch v
 if HOME="$tmp/local-launch-home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
   bash "$ROOT/scripts/local-setup.sh" --via "ssh user@example.com" --remote-path /srv/app \
     --launch "codex --flag" --yes >"$tmp/local-bad-launch.out" 2>"$tmp/local-bad-launch.err"; then
-  fail "local-setup accepted extra --launch words"
+  fail "remote-only local-setup launched locally"
 fi
-assert_grep "$tmp/local-bad-launch.err" "unsupported --launch" "local launch validation"
-
-local_session_scripts="$tmp/local-session-scripts"
-mkdir -p "$local_session_scripts"
-cp "$ROOT/scripts/_common.sh" "$ROOT/scripts/local-setup.sh" "$local_session_scripts/"
-cat > "$local_session_scripts/mount-project.sh" <<'EOS'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${LOCAL_MOUNT_ARGS:?}"
-printf 'STATUS=mounted\nMOUNTPOINT=%s\n' "${LOCAL_MOUNTPOINT:-/tmp/local-mount}"
-EOS
-cat > "$local_session_scripts/inject-rule.sh" <<'EOS'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${LOCAL_INJECT_ARGS:?}"
-case "${1:-}" in
-  on)
-    if [ "${LOCAL_INJECT_FAIL:-0}" = 1 ]; then printf 'RH_STATUS=ERROR\n';
-    else printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=PATH=%q\nRH_LAUNCH_FLAGS=\n' "/tmp/rh-bin:$PATH"; fi
-    ;;
-  off) printf 'RH_STATUS=RESTORED\n';;
-esac
-EOS
-chmod +x "$local_session_scripts/mount-project.sh" "$local_session_scripts/inject-rule.sh"
-cat > "$tmp/bin/fake-shell" <<'EOS'
-#!/usr/bin/env bash
-[ -n "${FAKE_SHELL_MARKER:-}" ] && printf 'launched\n' > "$FAKE_SHELL_MARKER"
-exit 0
-EOS
-cat > "$tmp/bin/ssh" <<'EOS'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${LOCAL_SSH_LOG:?}"
-exit 0
-EOS
-chmod +x "$tmp/bin/fake-shell" "$tmp/bin/ssh"
-local_session_home="$tmp/local-session-home"
-mkdir -p "$local_session_home" "$tmp/local-session-mount"
-HOME="$local_session_home" PATH="$tmp/bin:$PATH" RH_COMMON="$local_session_scripts/_common.sh" \
-  SHELL="$tmp/bin/fake-shell" LOCAL_MOUNT_ARGS="$tmp/local-mount.args" \
-  LOCAL_INJECT_ARGS="$tmp/local-inject.args" LOCAL_SSH_LOG="$tmp/local-ssh.log" \
-  LOCAL_MOUNTPOINT="$tmp/local-session-mount" \
-  bash "$local_session_scripts/local-setup.sh" \
-    --via "ssh -p 2222 dev@example.com" --remote-path /srv/app \
-    --mountpoint "$tmp/local-session-mount" --launch codex --yes > "$tmp/local-session.out"
-assert_grep "$tmp/local-session.out" "session ssh config removed" "local setup removes temp ssh config"
-assert_grep "$tmp/local-mount.args" "--ssh-config" "local setup passes temp config to mount"
-assert_grep "$tmp/local-inject.args" "$local_session_home/.remote-harness/.sessions/" "local setup passes temp config to rule wrapper"
-assert_grep "$tmp/local-ssh.log" "-F $local_session_home/.remote-harness/.sessions/" "local setup probes through temp config"
-[ ! -e "$local_session_home/.ssh/config" ] || fail "local-setup wrote ~/.ssh/config"
-[ -z "$(find "$local_session_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "local-setup created config.rh-bak"
-
-local_fail_home="$tmp/local-fail-home"
-mkdir -p "$local_fail_home" "$tmp/local-fail-mount"
-if HOME="$local_fail_home" PATH="$tmp/bin:$PATH" RH_COMMON="$local_session_scripts/_common.sh" \
-  SHELL="$tmp/bin/fake-shell" LOCAL_MOUNT_ARGS="$tmp/local-fail-mount.args" \
-  LOCAL_INJECT_ARGS="$tmp/local-fail-inject.args" LOCAL_SSH_LOG="$tmp/local-fail-ssh.log" \
-  LOCAL_MOUNTPOINT="$tmp/local-fail-mount" LOCAL_INJECT_FAIL=1 \
-  FAKE_SHELL_MARKER="$tmp/local-fail-launched" \
-  bash "$local_session_scripts/local-setup.sh" \
-    --via "ssh -p 2222 dev@example.com" --remote-path /srv/app \
-    --mountpoint "$tmp/local-fail-mount" --launch codex --yes \
-    >"$tmp/local-fail.out" 2>"$tmp/local-fail.err"; then
-  fail "local-setup continued after strict rule injection failed"
-fi
-[ ! -e "$tmp/local-fail-launched" ] || fail "local-setup launched the agent after injection failure"
-assert_grep "$tmp/local-fail.err" "refusing to launch" "local setup fails closed"
+assert_grep "$tmp/local-bad-launch.err" "remote-only" "local setup is permanently disabled"
 
 simple_dir="$tmp/simple-scripts"
 simple_project="$tmp/simple project"
@@ -546,41 +642,11 @@ assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_projec
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ "$YOLO_REQUESTED" = 1 ]; then' "explicit yolo has a no-reprompt branch"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'YOLO=1' "explicit yolo locks yolo on"
 
-cp "$ROOT/scripts/simple-local-setup.sh" "$simple_dir/"
-cat > "$simple_dir/local-setup.sh" <<'EOS'
-#!/usr/bin/env bash
-i=0
-for arg in "$@"; do
-  printf 'ARG_%s=%s\n' "$i" "$arg"
-  i=$((i + 1))
-done > "${SIMPLE_LOCAL_ARGS:?}"
-EOS
-chmod +x "$simple_dir/local-setup.sh"
-HOME="$tmp/simple-forward-home" RH_COMMON="$simple_dir/_common.sh" \
-  RH_SIMPLE_FORWARD_CACHE="$tmp/simple-forward-cache.env" \
-  SIMPLE_LOCAL_ARGS="$tmp/simple-local.args" \
-  bash "$simple_dir/simple-local-setup.sh" \
-    --via "ssh -p 2200 dev@example.com" \
-    --remote-path /srv/app \
-    --mountpoint "$tmp/local-mount" \
-    --launch codex \
-    --yolo \
-    --yes > "$tmp/simple-local.out"
-assert_grep "$tmp/simple-local.out" "Server project:   /srv/app" "simple forward plan"
-assert_grep "$tmp/simple-local.args" "ARG_0=--via" "simple forward handoff via flag"
-assert_grep "$tmp/simple-local.args" "ARG_1=-p 2200 dev@example.com" "simple forward handoff strips leading ssh"
-assert_grep "$tmp/simple-local.args" "ARG_2=--remote-path" "simple forward handoff remote path flag"
-assert_grep "$tmp/simple-local.args" "ARG_3=/srv/app" "simple forward handoff remote path"
-assert_grep "$tmp/simple-local.args" "ARG_5=codex" "simple forward handoff launch"
-assert_grep "$tmp/simple-local.args" "ARG_6=--mountpoint" "simple forward handoff mountpoint flag"
-assert_grep "$tmp/simple-local.args" "ARG_7=$tmp/local-mount" "simple forward handoff mountpoint"
-assert_grep "$tmp/simple-local.args" "ARG_8=--yolo" "simple forward explicit yolo"
-assert_grep "$tmp/simple-forward-cache.env" "LAST_VIA=-p 2200 dev@example.com" "simple forward cache via"
-assert_grep "$tmp/simple-forward-cache.env" "LAST_REMOTE_PROJECT_DIR=/srv/app" "simple forward cache remote project"
-assert_grep "$tmp/simple-forward-cache.env" "LAST_MOUNTPOINT=$tmp/local-mount" "simple forward cache mountpoint"
-assert_grep "$tmp/simple-forward-cache.env" "LAST_LAUNCH=codex" "simple forward cache launch"
-assert_grep "$tmp/simple-forward-cache.env" "LAST_YOLO=1" "simple forward cache yolo"
-assert_grep "$ROOT/scripts/simple-local-setup.sh" 'if [ "$YOLO_REQUESTED" = 1 ]; then' "simple forward explicit yolo has no-reprompt branch"
+if bash "$ROOT/scripts/simple-local-setup.sh" --launch codex \
+    >"$tmp/simple-local.out" 2>"$tmp/simple-local.err"; then
+  fail "remote-only simple-local-setup launched locally"
+fi
+assert_grep "$tmp/simple-local.err" "remote-only" "simple local setup is permanently disabled"
 
 dispatch_dir="$tmp/dispatch-scripts"
 mkdir -p "$dispatch_dir"
@@ -594,24 +660,29 @@ cat > "$dispatch_dir/simple-laptop-setup.sh" <<'EOS'
 printf 'REVERSE_ARGS=%s\n' "$*" > "${DISPATCH_MARKER:?}"
 EOS
 chmod +x "$dispatch_dir/simple-dispatch.sh" "$dispatch_dir/simple-local-setup.sh" "$dispatch_dir/simple-laptop-setup.sh"
-HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
+if HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-forward.out" \
-  bash "$dispatch_dir/simple-dispatch.sh" --mode "本地开发远程项目" --launch codex --yolo
-assert_grep "$tmp/dispatch-forward.out" "FORWARD_ARGS=--launch codex --yolo" "dispatch forwards explicit mode"
-assert_grep "$tmp/simple-mode-cache.env" "LAST_MODE=forward" "dispatch caches forward mode"
+  bash "$dispatch_dir/simple-dispatch.sh" --mode "本地开发远程项目" --launch codex --yolo \
+    >"$tmp/dispatch-forward.stdout" 2>"$tmp/dispatch-forward.stderr"; then
+  fail "remote-only dispatcher accepted forward mode"
+fi
+assert_grep "$tmp/dispatch-forward.stderr" "remote-only" "dispatch rejects local-agent forward mode"
+[ ! -e "$tmp/dispatch-forward.out" ] || fail "forward dispatcher launched a local-agent helper"
 HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-cached.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --launch codex --yolo
-assert_grep "$tmp/dispatch-cached.out" "FORWARD_ARGS=--launch codex --yolo" "dispatch uses cached mode without prompting"
+assert_grep "$tmp/dispatch-cached.out" "REVERSE_ARGS=--launch codex" "dispatch ignores cached forward mode"
 HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-reverse.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --mode "远程开发本地" --launch codex --source-via sourcebox
 assert_grep "$tmp/dispatch-reverse.out" "REVERSE_ARGS=--launch codex --via sourcebox" "dispatch passes source via only to reverse"
 assert_grep "$tmp/simple-mode-cache.env" "LAST_MODE=reverse" "dispatch caches reverse mode"
-assert_grep "$ROOT/scripts/simple-dispatch.sh" '_default="${1:-reverse}"' "dispatch defaults to reverse in prompt"
+if grep -F 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "$ROOT/scripts/simple-dispatch.sh" >/dev/null; then
+  fail "remote-only dispatcher still contains a local-agent launch path"
+fi
 
 cat > "$tmp/bin/ssh" <<'EOS'
 #!/usr/bin/env bash
@@ -646,27 +717,24 @@ assert_grep "$ROOT/README.md" "git clone https://github.com/specialpointcentral/
 if grep -F "git clone https://github.com/chenjh16/remote-harness.git" "$ROOT/README.md" >/dev/null; then
   fail "README manual install still clones upstream instead of the maintained fork"
 fi
-assert_grep "$ROOT/SKILL.md" "script itself may be local" "skill does not assume local scripts"
+assert_grep "$ROOT/SKILL.md" "remote-only" "skill declares remote-only topology"
 assert_grep "$ROOT/SKILL.md" "printf '%s' \"\$p\${d:+ [\$d]}: \" >/dev/tty" "skill fetch prompt is zsh-compatible"
 assert_grep "$ROOT/SKILL.md" "IFS= read -r h </dev/tty || exit 2" "skill aborts when tty prompt cannot read"
 if grep -F "read -r -p" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" "$ROOT/docs/simple-flow.cn.md" >/dev/null; then
   fail "fetch command templates must not use read -p; zsh treats -p as coprocess"
 fi
-assert_grep "$ROOT/SKILL.md" "RH_VIA=\"\$h\" RH_LANG=<lang> bash -s -- <mode-arg> --launch <launch>" "skill uses compact fetched bootstrap handoff"
+assert_grep "$ROOT/SKILL.md" "RH_VIA=\"\$h\" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>" "skill uses reverse-only fetched bootstrap handoff"
 assert_grep "$ROOT/SKILL.md" "--mode reverse" "skill documents reverse mode arg"
-assert_grep "$ROOT/SKILL.md" "--mode forward" "skill documents forward mode arg"
-assert_grep "$ROOT/SKILL.md" "must not ask the user to confirm YOLO" "skill says explicit yolo is final"
-assert_grep "$ROOT/SKILL.md" "source SSH target is only the remote-harness script source" "skill separates source host from forward project server"
-assert_grep "$ROOT/SKILL.md" "本地开发远程项目" "skill documents short forward trigger"
-assert_grep "$ROOT/SKILL.md" "远程开发本地" "skill documents short reverse trigger"
-assert_grep "$ROOT/SKILL.md" "simple-dispatch.sh" "skill documents ambiguous dispatcher"
-assert_grep "$ROOT/SKILL.md" "Files are read, written, edited, and searched" "skill documents local file work in simple forward"
-assert_grep "$ROOT/SKILL.md" "remote-harness:reverse-auth:<tag>" "skill documents scoped reverse authorized_keys"
+if grep -F -- "--mode forward" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" >/dev/null; then
+  fail "remote-only skill still documents a forward launch command"
+fi
+assert_grep "$ROOT/SKILL.md" "never launch an" "skill forbids local agent launch"
+assert_grep "$ROOT/SKILL.md" "local project host" "skill identifies the forbidden host"
+assert_grep "$ROOT/SKILL.md" "forced-command project-host gateway" "skill documents forced gateway"
+assert_grep "$ROOT/SKILL.md" "absolute guarantee" "skill states the absolute isolation boundary"
+assert_grep "$ROOT/SKILL.md" "OS account" "skill requires a dedicated runner account for absolute isolation"
 assert_grep "$ROOT/SKILL.md" "UserKnownHostsFile=\"\$s/known_hosts\"" "skill fetch command isolates known_hosts"
-assert_grep "$ROOT/SKILL.md" "Protect local/client information" "skill documents local/client privacy boundary"
 assert_grep "$ROOT/AGENTS.md" "Simple Reverse Rules" "agents docs carry simple reverse rules"
-assert_grep "$ROOT/AGENTS.md" "Simple Forward Rules" "agents docs carry simple forward rules"
-assert_grep "$ROOT/AGENTS.md" "Ambiguous Simple Mode" "agents docs carry ambiguous mode rules"
 assert_grep "$ROOT/AGENTS.md" "compact but copyable" "agents docs carry bootstrap command shape"
 assert_grep "$ROOT/AGENTS.md" "fields 1 and 2 are local/client data" "agents docs protect local/client ssh metadata"
 assert_grep "$ROOT/AGENTS.md" "must not ask for YOLO confirmation again" "agents docs forbid yolo reprompt"
@@ -675,7 +743,6 @@ assert_grep "$ROOT/AGENTS.cn.md" "Simple Reverse 规则" "Chinese agents docs ca
 assert_grep "$ROOT/AGENTS.cn.md" "紧凑但可复制" "Chinese agents docs carry bootstrap command shape"
 assert_grep "$ROOT/AGENTS.cn.md" "第 1/2 字段是本地客户端数据" "Chinese agents docs protect local/client ssh metadata"
 assert_grep "$ROOT/AGENTS.cn.md" "不得再二次询问" "Chinese agents docs forbid yolo reprompt"
-assert_grep "$ROOT/AGENTS.cn.md" "Simple Forward 规则" "Chinese agents docs carry simple forward rules"
 assert_grep "$ROOT/scripts/inject-rule.sh" "Safe local work is file-oriented" "inject rule allows local file work"
 
 install_home="$tmp/install-home"
@@ -694,6 +761,10 @@ HOME="$install_home" CODEX_HOME="$install_home/.codex" RH_HOME="$install_home/.r
 [ -x "$install_home/.remote-harness/scripts/simple-bootstrap.sh" ] || fail "manage install did not install executable simple-bootstrap.sh"
 [ -x "$install_home/.remote-harness/scripts/route-command.py" ] || fail "manage install did not install executable route-command.py"
 [ -x "$install_home/.remote-harness/scripts/run-on-project-host.sh" ] || fail "manage install did not install project-host runner"
+[ -x "$install_home/.remote-harness/scripts/project-host-gateway.sh" ] || fail "manage install did not install forced project-host gateway"
+assert_grep "$ROOT/scripts/laptop-setup.sh" 'command="%s"' "authorized key binds a forced command"
+assert_grep "$ROOT/scripts/laptop-setup.sh" "project-host-gateway.sh" "authorized key uses project-host gateway"
+assert_grep "$ROOT/scripts/check-tunnel.sh" "remote-harness-health" "tunnel check uses the gateway health protocol"
 
 suggest_user="$(id -un)"
 SSH_CONNECTION='198.51.100.10 55555 203.0.113.7 2222' \
@@ -767,6 +838,11 @@ cat > "$tmp/bin/ssh" <<'EOS'
 [ -n "${SSH_LOG:-}" ] && printf '%s\n' "$*" >> "$SSH_LOG"
 for arg in "$@"; do
   case "$arg" in
+    -tt)
+      if [ -n "${AUTH_KEYS_SNAPSHOT:-}" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
+        cp "$HOME/.ssh/authorized_keys" "$AUTH_KEYS_SNAPSHOT"
+      fi
+      ;;
     -N) printf 'unexpected ssh -N while reusable tunnel is up\n' >&2; exit 99;;
     *'check-tunnel.sh'*) printf 'SSH=up\n'; exit 0;;
     *'grep -qx'*) exit 0;;
@@ -777,13 +853,15 @@ done
 exit 0
 EOS
 chmod +x "$tmp/bin/ssh"
-proj_home="$tmp/project-dir-home"
+proj_home="$tmp/project dir 'home"
 valid_project="$tmp/valid project"
 created_project="$tmp/created project"
 file_project="$tmp/not-a-dir"
+auth_keys_snapshot="$tmp/authorized_keys.snapshot"
 mkdir -p "$proj_home" "$valid_project"
 printf 'x\n' > "$file_project"
 HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
+  AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" \
   bash "$ROOT/scripts/laptop-setup.sh" \
     --host example.com --port 32023 --via "ssh user@example.com" \
     --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
@@ -791,10 +869,27 @@ HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH
     --remote-mountpoint /tmp/rh-remote \
     --project-dir "$valid_project" --launch codex --yes > "$tmp/project-valid.out"
 assert_grep "$tmp/project-valid.out" "authorized_keys: temporarily authorized" "reverse authkey added"
+assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse authkey uses forced command gateway"
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"
 assert_grep "$ROOT/scripts/laptop-setup.sh" "exec 3</dev/tty" "phase5 attaches stdin to controlling tty"
+[ -f "$auth_keys_snapshot" ] || fail "did not capture the live forced-command authorized_keys entry"
+assert_grep "$auth_keys_snapshot" 'from="127.0.0.1,::1",command="' "authorized key is loopback-scoped and forced"
+assert_grep "$auth_keys_snapshot" '/project-host-gateway.sh' "authorized key invokes the project-host gateway"
+assert_grep "$auth_keys_snapshot" ',no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty ssh-ed25519 ' "authorized key disables interactive SSH capabilities"
+forced_command=$(python3 - "$auth_keys_snapshot" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r'command="((?:\\.|[^"\\])*)"', text)
+assert match, "forced command option missing"
+print(match.group(1).replace("\\\\", "\\").replace('\\"', '"'))
+PY
+)
+forced_health=$(HOME="$proj_home" SSH_ORIGINAL_COMMAND=remote-harness-health sh -c "$forced_command")
+case "$forced_health" in RH_OK*) ;; *) fail "generated forced command could not execute from a quoted HOME path";; esac
 if grep -Eq -- '(^| )-N( |$)' "$ssh_log" 2>/dev/null; then
   fail "laptop-setup opened a new ssh -N despite reusable tunnel"
 fi
@@ -809,14 +904,17 @@ preauth_home="$tmp/preauth-home"
 preauth_project="$tmp/preauth-project"
 mkdir -p "$preauth_home/.ssh" "$preauth_project"
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest existing-user-key\n' > "$preauth_home/.ssh/authorized_keys"
-HOME="$preauth_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
+if HOME="$preauth_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
   bash "$ROOT/scripts/laptop-setup.sh" \
     --host example.com --port 32028 --via "ssh user@example.com" \
     --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
     --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
     --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$preauth_project" --launch codex --yes > "$tmp/project-preauth.out"
-assert_grep "$tmp/project-preauth.out" "matching key already exists outside remote-harness" "existing authorized key reused"
+    --project-dir "$preauth_project" --launch codex --yes \
+    > "$tmp/project-preauth.out" 2> "$tmp/project-preauth.err"; then
+  fail "laptop-setup reused an unrestricted existing session key"
+fi
+assert_grep "$tmp/project-preauth.out" "refusing unsafe reuse" "existing unrestricted key is rejected"
 assert_eq "existing authorized key not duplicated" "$(grep -F "AAAAC3NzaC1lZDI1NTE5AAAAITest" "$preauth_home/.ssh/authorized_keys" | wc -l | tr -d ' ')" "1"
 if grep -F "remote-harness:reverse-auth:" "$preauth_home/.ssh/authorized_keys" >/dev/null; then
   fail "managed authorized_keys block added despite existing user key"
@@ -898,7 +996,8 @@ assert_grep "$st_cfg_ns" "    ControlMaster no" "setup-tunnel disables multiplex
 assert_grep "$st_cfg_ns" "/runtime/known_hosts_alice-mac" "setup-tunnel separates mutable SSH runtime"
 [ ! -e "$st_home/.ssh/config" ] || fail "setup-tunnel namespace wrote ~/.ssh/config"
 [ ! -e "$st_home/.ssh/id_ed25519" ] || fail "setup-tunnel namespace generated key under ~/.ssh"
-[ -f "$st_home/.remote-harness/keys/id_ed25519" ] || fail "setup-tunnel namespace did not generate key under ~/.remote-harness/keys"
+[ -f "$(dirname "$st_cfg_ns")/id_ed25519" ] || fail "setup-tunnel did not generate a per-session key"
+[ ! -e "$st_home/.remote-harness/keys/id_ed25519" ] || fail "setup-tunnel generated a reusable global reverse key"
 [ -z "$(find "$st_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "setup-tunnel namespace created config.rh-bak"
 # explicit --port still wins (the runtime port-switch path)
 st_home2="$tmp/st-home2"; mkdir -p "$st_home2/.ssh" "$tmp/st-session-port"

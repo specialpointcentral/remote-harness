@@ -4,7 +4,7 @@
 # reverse tunnel that the laptop opens with `RemoteForward <port> 127.0.0.1:22`.
 # Idempotent (re-runnable). Requires --config PATH and never writes ~/.ssh/config,
 # ~/.ssh/config.rh-bak.*, ~/.ssh/known_hosts_<alias>, or any other file under ~/.ssh.
-# Generates an ed25519 key under $RH_HOME/keys if asked.
+# Generates an ed25519 key beside the session config if asked.
 # Prints KEY=VALUE lines on stdout; human notes on stderr.
 set -euo pipefail
 
@@ -23,8 +23,8 @@ ssh_config_value() {
 
 RH_HOME="${RH_HOME:-$HOME/.remote-harness}"
 
-# Serialize first-time key generation on a shared account. The generated identity is remote-harness
-# owned and lives under $RH_HOME/keys; user-managed ~/.ssh keys are never created or modified.
+# Serialize key generation on a shared account. The generated identity is remote-harness owned and
+# lives beside the session config; user-managed ~/.ssh keys are never created or modified.
 LOCK="$RH_HOME/.locks/keygen.lock"
 rh_lock() {
   mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
@@ -104,18 +104,16 @@ mkdir -p "$RUNTIME_DIR" 2>/dev/null || die "could not create SSH runtime directo
 chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
 KH="$RUNTIME_DIR/known_hosts_${ALIAS}"
 
-# --- pick / create an identity key -----------------------------------------
+# --- pick / create a per-session identity key ------------------------------
 if [ -z "$IDENTITY" ]; then
-  [ -f "$RH_HOME/keys/id_ed25519" ] && IDENTITY="$RH_HOME/keys/id_ed25519"
+  IDENTITY="$(dirname "$CFG")/id_ed25519"
 fi
-if [ -z "$IDENTITY" ] && [ "$GEN_KEY" = 1 ]; then
-  IDENTITY="$RH_HOME/keys/id_ed25519"
-  # Serialize keygen on a SHARED box account: two concurrent first-time runs must not both write
-  # the same remote-harness keypair. Under the lock, generate only if it still doesn't exist;
-  # otherwise reuse the one the other run created.
+if [ ! -f "$IDENTITY" ] && [ "$GEN_KEY" = 1 ]; then
+  # Serialize keygen on a shared box account. Under the lock, generate only if the session key does
+  # not already exist.
   rh_lock
   if [ ! -f "$IDENTITY" ]; then
-    note "No SSH key found; generating $IDENTITY (no passphrase)."
+    note "No per-session SSH key found; generating $IDENTITY (no passphrase)."
     mkdir -p "$(dirname "$IDENTITY")" 2>/dev/null || true
     chmod 700 "$(dirname "$IDENTITY")" 2>/dev/null || true
     ssh-keygen -t ed25519 -N "" -f "$IDENTITY" -C "remote-harness@$(hostname 2>/dev/null || echo host)" >/dev/null
@@ -184,6 +182,6 @@ if [ -n "$IDENTITY" ] && [ -f "$IDENTITY.pub" ]; then
 else
   emit PUBKEY ""
   note "No remote-harness public key available; the laptop must already accept agent/key auth,"
-  note "or re-run with --gen-key to create a remote-harness key under $RH_HOME/keys."
+  note "or re-run with --gen-key to create a key beside the session SSH config."
 fi
 note "Wrote Host '$ALIAS' to $CFG (managed block)."

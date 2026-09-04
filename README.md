@@ -1,14 +1,14 @@
 <h1 align="center">remote-harness</h1>
 
 <p align="center">
-  <b>把「运行 Agent 的机器」和「存放代码的机器」连起来——两个方向都行，一条命令搞定。</b><br>
-  <i>Connect the machine your coding agent runs on with the machine your code lives on — either direction, one command.</i>
+  <b>Agent 只在远端服务器运行；本机只提供项目文件和命令执行环境。</b><br>
+  <i>Agents run only on the remote server; the local machine provides project files and command execution.</i>
 </p>
 
 <p align="center">
   <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20WSL-blue">
   <img alt="agents" src="https://img.shields.io/badge/agents-Claude%20Code%20%7C%20Codex%20%7C%20opencode-8A2BE2">
-  <img alt="directions" src="https://img.shields.io/badge/directions-reverse%20%E2%87%84%20forward-success">
+  <img alt="topology" src="https://img.shields.io/badge/topology-remote--only-success">
   <img alt="transport" src="https://img.shields.io/badge/transport-SSH%20%2B%20sshfs-orange">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-FUSE--T%20(no%20kext)-brightgreen">
   <img alt="shell" src="https://img.shields.io/badge/built%20with-Bash-1f425f">
@@ -32,7 +32,7 @@
 - [这是什么](#这是什么)
 - [安装 Skill](#安装-skill)
 - [Quick start](#quick-start)
-- [工作原理（两个方向）](#工作原理两个方向)
+- [工作原理（remote-only）](#工作原理remote-only)
 - [服务器 SSH/SSHFS 长连接优化提醒](#服务器-sshsshfs-长连接优化提醒)
 - [环境要求](#环境要求)
 - [仓库结构](#仓库结构)
@@ -41,16 +41,17 @@
 
 ### 这是什么
 
-你的**编码 Agent**（Claude Code / Codex / opencode）和你的**代码库**经常不在同一台机器上。
-`remote-harness` 把两者连起来：用 sshfs 把代码挂到 Agent 所在机器的一个空目录，注入一条规则让
-**编译/测试在「代码所在的那台机器」上跑**，然后在挂载目录里启动 Agent。Claude Code/opencode 通过
+你的**编码 Agent**（Claude Code / Codex / opencode）全部运行在远端服务器，代码库和真实命令环境
+保留在本机。`remote-harness` 用 sshfs 把代码挂到远端空目录，并通过 forced-command gateway 将
+**编译/测试导向本机**，然后只在远端挂载目录里启动 Agent。Claude Code/opencode 通过
 `/remote-harness` 触发；Codex 用 `$remote-harness` 直接调用技能。默认 simple reverse 模式下，Agent
 只给你一条命令；具体 SSH、路径、命名空间和挂载点都在你的本地终端里输入，不进入 Agent 聊天。
 
-本 fork 对 Claude Code 和 Codex 增加了严格命令路由：会话级 `PreToolUse` hook 会把每个 Bash 调用
-自动改写到代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook、runner
-或 SSH config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。opencode 当前仍使用
-提示词规则路由。
+本 fork 对 Claude Code、Codex 和 opencode 都启用严格命令路由：Claude/Codex 使用会话级
+`PreToolUse` hook，opencode 使用会话级 `tool.execute.before` 插件。它们会把每个 Bash 调用自动改写到
+代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook/plugin、runner 或 SSH
+config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。
+opencode 还必须在预加载时写出会话 plugin readiness marker，否则交互式 Agent 不会启动。
 
 记号：**A** = 运行 Agent 的机器；**P** = 存放代码的机器（用一个 ssh `<别名>` 指代）。
 
@@ -59,7 +60,7 @@
 维护仓库：[`https://github.com/specialpointcentral/remote-harness`](https://github.com/specialpointcentral/remote-harness)
 （基于 [`chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)）。
 
-把 remote-harness 安装到**启动 Agent 的那台机器**上：远程开发本地项目时，通常是远端盒子；本地开发服务器项目时，通常是本机。
+把 remote-harness 安装到**远端 Agent 服务器**。本机只运行 bootstrap、SSHFS 对端和项目命令 gateway。
 
 **方式一：手动命令安装**
 
@@ -92,7 +93,7 @@ cd remote-harness
 
 ### Quick start
 
-先确认 SSH key 已按你的方向配置好：反向模式需要笔记本能登录远端盒子；正向模式需要本机能登录项目服务器。挂载发生的机器还需要 `sshfs`。
+先确认本机能用已有 SSH 身份登录远端 Agent 服务器；远端还需要 `sshfs`。
 
 **远程开发本地项目（默认 reverse）**
 
@@ -116,31 +117,25 @@ Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yol
 
 详细边界和推荐拓扑见 [`docs/claude-multi-agent.cn.md`](docs/claude-multi-agent.cn.md)。
 
-**本地开发远程项目（forward）**
+**本机 Agent / forward 模式**
 
-在本机 Agent 输入：
-
-```text
-$remote-harness 中文，本地开发远程项目，yolo
-```
-
-Claude Code / opencode 使用 `/remote-harness 中文，本地开发远程项目，yolo`。Agent 会返回同样形态的本地 bootstrap 命令。
+本 fork 已永久禁用。`--mode forward`、`simple-local-setup.sh` 和 `local-setup.sh` 都会在挂载或启动前
+返回 remote-only 错误。
 
 随后按这个流程走：
 
 1. 让 Agent 直接返回一条本地 bootstrap 命令。公开入口统一是 `simple-bootstrap.sh`；
    如果脚本在远端 skill 目录，命令会先从远端读取它再在本地运行。
 2. 你在本地终端运行该命令，并按提示输入 SSH target、项目目录和可选挂载点。
-3. bootstrap 自动建立 reverse 隧道或 forward 直连，并通过 sshfs 完成挂载。
-4. 在挂载目录启动所选 Agent；Claude/Codex 安装会话级 hook，自动把 Bash 路由到代码所在机器。
+3. bootstrap 建立 reverse 隧道，通过 forced gateway 完成 SSHFS 和命令通道。
+4. 仅在远端挂载目录启动 Agent；会话 hook/plugin 自动把 Bash 路由到本机项目环境。
 5. 退出 Agent 时**自动卸载**。随时再次启动 remote-harness 重新连接（幂等；陈旧挂载会被检测并重挂）。
 
-简短说“本地开发远程项目”即可触发 forward；简短说“远程开发本地”即可触发 reverse。若说法无法判断，
-命令会在本地先让你选择模式，第一次默认 reverse，并记住上次选择。
+明确或模糊请求都使用 reverse；不会再显示模式选择。任何本机 Agent 请求都会被拒绝。
 
-### 工作原理（两个方向）
+### 工作原理（remote-only）
 
-默认使用 simple reverse：Agent 在远端盒子，代码在你的笔记本。当你明确要求本地 Codex/Agent 开发服务器项目时，使用 simple forward。`reference/` 记录当前 simple 流程和脚本契约。
+唯一模式是 simple reverse：Agent 在远端服务器，代码和项目命令环境在本机。
 
 **① 反向（reverse）— Agent 在远程盒子，代码在你的笔记本（NAT 后）**
 
@@ -154,16 +149,12 @@ Claude Code / opencode 使用 `/remote-harness 中文，本地开发远程项目
         sshfs <别名>:/项目  → 同一条隧道       → 笔记本文件挂载到这里
 ```
 
-反向和正向的 simple setup 都使用 `~/.remote-harness/.sessions/...` 下的会话级 SSH
-配置和 `known_hosts`，并关闭 OpenSSH multiplexing。唯一的 `~/.ssh` 写入例外是反向模式可在笔记本
+simple reverse 使用 `~/.remote-harness/.sessions/...` 下的会话级 SSH 配置和 `known_hosts`，并关闭
+OpenSSH multiplexing。唯一的 `~/.ssh` 写入例外是在笔记本
 `~/.ssh/authorized_keys` 中追加带标签的临时授权块，并在退出时清理。
 
-**② 正向（forward）— Agent 在本机，代码在可直连的远程服务器**
-
-无需隧道：本机直接 ssh 到服务器，把服务器项目挂到本地空目录，Agent 在本地启动；Claude/Codex
-的 Bash 调用由 hook 自动在服务器上执行。
-
-两个方向的不变式相同：**挂载到空目录 → 创建会话命令路由 → 在挂载点启动 Agent**。
+远端 key 在本机 `authorized_keys` 中绑定 forced command，只允许标准 SFTP、health 和
+`remote-harness-exec`。任意本机 SSH shell 命令会被 gateway 拒绝。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -186,17 +177,17 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
 - 你已经能从一台机器 ssh 到另一台（任意端口 / 常见 `-J` 跳板机都行）。复杂 SSH 选项
   （`ProxyCommand`、`-F`、带空格的引号路径、本地转发等）请先写进 `~/.ssh/config` 的 `Host` 别名，再把别名交给 remote-harness。
 - **反向 simple**：你已经把笔记本的 SSH 公钥配置到远端服务器账号，所以本地命令能先登录远端抓取脚本。
-  远端会在自己的 `~/.remote-harness/keys` 下生成/复用 remote-harness key；本地脚本可将其公钥作为
+  远端会在本次会话 SSH config 旁生成新的 remote-harness key；本地脚本可将其公钥作为
   `remote-harness:reverse-auth:<tag>` 临时块写入笔记本 `~/.ssh/authorized_keys`，限制为回环来源并在退出时清理。
   盒子的 sshd 需要允许 TCP 转发（默认即可）。
-- **挂载发生的那台机器需要 `sshfs` + FUSE**——反向是盒子、正向是本机：
+- **远端 Agent 服务器需要 `sshfs` + FUSE**：
   - Linux/WSL：`sudo apt-get install -y sshfs`（FUSE 通常已就绪；脚本会按发行版给正确命令）。
   - **macOS：用 FUSE-T——无内核扩展、无需降低系统安全级**：
     `brew install macos-fuse-t/homebrew-cask/fuse-t && brew install macos-fuse-t/homebrew-cask/sshfs-fuse-t`。
     **不要用 macFUSE**（它要求降低安全策略）。FUSE-T 保留 sshfs 的同步写，编辑会先落到代码所在机器
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
-- Claude/Codex 严格路由要求 Agent 所在机器有 `python3`。项目所在机器只需 POSIX `sh`、base64
-  解码器和项目自己的正常登录 shell。
+- Claude/Codex 严格路由要求远端 Agent 主机有 `python3`；opencode 要求支持
+  `tool.execute.before` 的当前插件接口。项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
 - 多用户共享远程开发服务器建议按
   [`docs/ssh-sshfs-long-lived-connections.cn.md`](docs/ssh-sshfs-long-lived-connections.cn.md)
   调整 sshd 容量、keepalive、`nofile` 和 TCP 队列。该优化不是 remote-harness 的硬性前置条件，
@@ -206,23 +197,25 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
 
 ```
 remote-harness/
-├── SKILL.md                  # simple reverse / simple forward 入口：只输出本地 bootstrap 命令
+├── SKILL.md                  # remote-only reverse 入口：只输出本地 bootstrap 命令
 ├── reference/
 │   ├── reverse.md            # 反向完整流程（建隧道 → 发命令）
-│   ├── forward.md            # 正向完整流程（选服务器 / 目录 → 发命令）
+│   ├── forward.md            # 已禁用本机 Agent 模式的兼容说明
 │   └── scripts.md            # 各脚本的 KEY=VALUE 契约
 ├── scripts/                  # 确定性逻辑（KEY=VALUE 输出），Agent 无关
 │   ├── _common.sh            # 共享库（颜色/ask/sq/parse_via/写托管别名/OS 变量）
 │   ├── simple-bootstrap.sh   # simple 统一入口（本地运行；可从远端读取）
-│   ├── simple-dispatch.sh    # 本地选择/分发 reverse/forward
-│   ├── simple-laptop-setup.sh simple-local-setup.sh  # 分模式本地向导
+│   ├── simple-dispatch.sh    # remote-only reverse dispatcher
+│   ├── simple-laptop-setup.sh # reverse 本地向导
+│   ├── simple-local-setup.sh local-setup.sh # 永久拒绝本机 Agent 的兼容 stub
 │   ├── suggest-via.sh        # simple 反向：远端 SSH target 默认值
 │   ├── setup-tunnel.sh check-tunnel.sh   # 反向隧道的会话级别名 / 检查
 │   ├── mount-project.sh inject-rule.sh   # 两向复用的挂载与规则/hook 注入
 │   ├── route-command.py                  # PreToolUse JSON 改写与 cwd 映射
 │   ├── run-on-project-host.sh            # SSH 命令传输与项目主机 dispatcher
+│   ├── project-host-gateway.sh            # forced-command SSH gateway
 │   ├── laptop-setup.sh       # 反向编排（在笔记本上跑）
-│   └── local-setup.sh        # 正向编排（在本机上跑）
+│   └── local-setup.sh        # 永久拒绝本机 Agent 的兼容 stub
 ├── adapters/{codex,opencode}.md   # 各 Agent 的入口（只设置 --launch）
 ├── manage.sh                 # 安装 / --dev / --uninstall
 ├── docs/                     # 设计与完整流程文档（安装时一并复制/软链）
@@ -239,12 +232,14 @@ remote-harness/
 
 ### 安全与隐私
 
-- simple setup 不在本地或远端 `~/.ssh/config`、`known_hosts`、SSH key、`config.rh-bak.*` 或
+- simple setup 不在本地或远端 `~/.ssh/config`、用户管理的 SSH key、`config.rh-bak.*` 或
   `known_hosts_<alias>` 下创建、修改、备份、追加或清理内容。所有临时 SSH alias 和 `known_hosts`
   都位于 `~/.remote-harness/.sessions/...`，并在会话结束时尽量清理；会话 config 关闭 OpenSSH multiplexing。
 - 反向模式的唯一 `~/.ssh` 写入例外是本机 `authorized_keys`：脚本会先检查是否已有匹配有效 key；
   没有时才追加带 `remote-harness:reverse-auth:<tag>` 标签、`from="127.0.0.1,::1"` 限制的临时块。
   托管块通过 `~/.remote-harness/.sessions/authorized-keys/...` 引用计数，最后一个会话退出时删除。
+- 每次会话使用独立远端 key；授权行绑定 `command="...project-host-gateway..."`。同一 key 若已存在为
+  无限制用户授权，setup 会拒绝复用。
 - 反向隧道用 `RemoteForward <端口> 127.0.0.1:22`（仅回环）；多用户盒子上同机其他用户能到达该端口，
   但没有你的私钥无法认证。
 - 多人共用同一个服务器账号时，simple reverse 默认使用会话别名 `rlocal`，别名和 known_hosts 都放在
@@ -252,18 +247,18 @@ remote-harness/
   最后一个会话退出时清理。
 - `--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow` 只写进**本次会话**
   的配置，退出即清。
-- Claude/Codex 的 hook、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；退出删除
-  会话目录。hook 成功加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
+- Claude/Codex hook、opencode plugin、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
+  退出删除会话目录。路由器加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
   一把能访问本机 SSH/SFTP 的临时密钥；请只在你信任的 Agent 主机上使用，不要把敏感目录作为项目挂载。
-- opencode 当前没有启用本 fork 的强制 hook，仍依赖会话提示词遵守 SSH 路由。
+- forced gateway 的 SFTP 是账号级文件访问，不是项目 chroot。绝对项目边界需要独立、受限的本机 OS 账号。
 - Claude 严格模式会设置 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0`，并阻止 `WorktreeCreate`、
   `EnterWorktree` 和 `ExitWorktree`。普通/嵌套 subagent 仍可使用；并行写入时应给 agents 分配互不
   重叠的文件范围。
 
 ### 故障排查
 
-详见 `reference/reverse.md` / `reference/forward.md` 末尾。常见：
+详见 `reference/reverse.md`；已禁用入口见 `reference/forward.md`。常见：
 - macOS 提示要 macFUSE → 改用 FUSE-T（见[环境要求](#环境要求)）。
 - 会话中文件突然读不了（`Transport endpoint is not connected`）→ 隧道断了，退出 Agent 后再次启动
   remote-harness，会自动检测陈旧挂载并重挂。
@@ -278,7 +273,7 @@ remote-harness/
 - [What it is](#what-it-is)
 - [Install the Skill](#install-the-skill)
 - [Quick start](#quick-start-1)
-- [How it works (two directions)](#how-it-works-two-directions)
+- [How it works (remote-only)](#how-it-works-remote-only)
 - [Server SSH/SSHFS Long-Lived Connection Tuning](#server-sshsshfs-long-lived-connection-tuning)
 - [Requirements](#requirements)
 - [Repo layout](#repo-layout)
@@ -287,27 +282,29 @@ remote-harness/
 
 ### What it is
 
-Your **coding agent** (Claude Code / Codex / opencode) and your **codebase** often live on different
-machines. `remote-harness` connects them: it sshfs-mounts the code onto an empty dir where the agent
-runs, injects a rule so **builds/tests run on the machine that hosts the code**, and launches the
+Your coding agents run only on the remote server while the repository and real command environment
+remain on the local project host. `remote-harness` SSHFS-mounts the local code on the server,
+routes builds/tests through a forced-command gateway, and launches the
 agent in the mount. Claude Code/opencode trigger it with `/remote-harness`; Codex users invoke the
 skill with `$remote-harness`. In the default simple reverse mode, the agent returns one command;
 concrete SSH targets, paths, namespaces, and mountpoints are entered in the user's local terminal,
 not in chat. Generically: **A** = the machine the agent runs on; **P** = the
 machine the code lives on (an ssh `<alias>`).
 
-This fork adds strict routing for Claude Code and Codex. A session `PreToolUse` hook rewrites every
-Bash call to the project host and maps the SSHFS-relative cwd to its corresponding project-host
-directory. Hook, runner, or SSH-config setup failures abort the launch instead of falling back to
-the agent host. opencode currently retains instruction-only routing.
+This fork adds strict routing for Claude Code, Codex, and opencode. Claude/Codex use a session
+`PreToolUse` hook; opencode uses a session `tool.execute.before` plugin. Each rewrites Bash calls to
+the project host and maps the SSHFS-relative cwd to the corresponding project-host directory.
+Hook/plugin, runner, or SSH-config failures abort launch instead of falling back to the agent host.
+opencode must also produce a session-plugin readiness marker during preloading before its interactive
+Agent is allowed to start.
 
 ### Install the Skill
 
 Maintained repository: [`https://github.com/specialpointcentral/remote-harness`](https://github.com/specialpointcentral/remote-harness)
 (based on [`chenjh16/remote-harness`](https://github.com/chenjh16/remote-harness)).
 
-Install remote-harness on the machine where you invoke the agent: for remote-dev-local-project,
-this is usually the remote box; for local-dev-server-project, this is usually your local machine.
+Install remote-harness on the remote agent server. The local machine runs only the bootstrap,
+SSHFS endpoint, and project-host command gateway.
 
 **Option 1: manual command install**
 
@@ -341,9 +338,8 @@ custom command that reads the shared `SKILL.md`.
 
 ### Quick start
 
-First make sure SSH keys are already configured for your direction: reverse needs your laptop to be
-able to SSH into the remote box; forward needs your local machine to SSH into the project server.
-The machine performing the mount also needs `sshfs`.
+First make sure the local project host can SSH into the remote Agent server with an existing SSH
+identity. The remote server also needs `sshfs`.
 
 **Remote agent, local project (default reverse)**
 
@@ -368,16 +364,8 @@ returns a command to run in your **local terminal**.
 
 See [`docs/claude-multi-agent.md`](docs/claude-multi-agent.md) for the full boundary and topology.
 
-**Local agent, remote project (forward)**
-
-In the local agent:
-
-```text
-$remote-harness English, local dev remote project, yolo
-```
-
-Claude Code / opencode use `/remote-harness English, local dev remote project, yolo`. The agent
-returns the same shape of local bootstrap command.
+**Local-agent forward mode** is permanently disabled. All compatibility entries return a
+remote-only error before mounting or launching anything.
 
 Then:
 
@@ -386,21 +374,16 @@ Then:
    from there and then runs it locally.
 2. You run that command in your local terminal and enter the SSH target, project directory, and
    optional mountpoint.
-3. The bootstrap opens the reverse tunnel or forward connection and mounts the project with sshfs.
-4. It launches the chosen agent in the mount. Claude/Codex receive a session hook that routes Bash
-   automatically to the machine hosting the code.
+3. The bootstrap opens the reverse tunnel and exposes only the forced SFTP/health/exec gateway.
+4. It launches the chosen agent only on the remote server; Bash is routed to the local project host.
 5. **Auto-unmounts on exit.** Start remote-harness again anytime to reconnect; stale mounts are
    detected and replaced.
 
-Short phrases like "local dev remote project" trigger forward; "remote dev local project" triggers
-reverse. If the wording is ambiguous, the command asks for the mode locally, defaults to reverse on
-first run, and remembers the last choice.
+Clear and ambiguous requests both use reverse. Any local-agent request is refused.
 
-### How it works (two directions)
+### How it works (remote-only)
 
-The default is simple reverse: agent on a remote box, code on your laptop. When you explicitly ask
-for local Codex/agent with a server project, use simple forward. `reference/` documents the current
-simple flows and script contracts.
+The only supported topology is a remote agent server with a local project host.
 
 **① Reverse — agent on a remote box, code on your laptop (behind NAT).** The box can't dial the
 laptop, so the laptop opens a **reverse SSH tunnel** and its project is sshfs-mounted onto the box.
@@ -412,17 +395,13 @@ box:   ssh <alias>          → 127.0.0.1:<PORT> → (tunnel) → laptop:22
        sshfs <alias>:/proj  → same tunnel       → laptop files mounted here
 ```
 
-Both simple directions use session-local SSH config files and `known_hosts` under
+Simple reverse uses session-local SSH config files and `known_hosts` under
 `~/.remote-harness/.sessions/...`, with OpenSSH multiplexing disabled. The only `~/.ssh` write
-exception is reverse mode: the laptop may get a tagged temporary `authorized_keys` block that is
+exception is that the laptop may get a tagged temporary `authorized_keys` block that is
 removed on exit.
 
-**② Forward — agent local, code on a directly ssh-reachable server.** No tunnel: the local machine
-ssh's straight to the server, mounts its project onto a local empty dir, the agent runs locally, and
-Claude/Codex Bash calls are routed automatically to the server.
-
-Both share the invariant: **mount onto an empty dir → create session command routing → launch the
-agent in the mount.**
+The per-session reverse key is bound to a forced SSH command. Only standard SFTP, health checks, and
+`remote-harness-exec` are accepted; arbitrary local SSH shell commands are rejected.
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 
@@ -447,12 +426,11 @@ See the full template, verification commands, and rollback notes in
   For complex SSH options (`ProxyCommand`, `-F`, quoted paths with spaces, local forwards, etc.),
   put them in `~/.ssh/config` as a `Host` alias and give remote-harness that alias.
 - **Simple reverse**: the laptop's SSH public key is already accepted by the remote server account,
-  so the local command can fetch scripts from the remote box. The box generates/reuses a
-  remote-harness key under its own `~/.remote-harness/keys`; the local setup may add that public key
+  so the local command can fetch scripts from the remote box. The box generates a new
+  remote-harness key beside the session SSH config; the local setup may add that public key
   to the laptop's `~/.ssh/authorized_keys` as a tagged, loopback-scoped temporary block and remove it
   on exit. The box's sshd must allow TCP forwarding (the default).
-- **The machine that does the MOUNT needs `sshfs` + FUSE** — the box (reverse) or your local machine
-  (forward):
+- **The remote agent server needs `sshfs` + FUSE**:
   - Linux/WSL: `sudo apt-get install -y sshfs` (FUSE usually present; the script gives the right
     per-distro command).
   - **macOS: use FUSE-T — no kernel extension, no reduced system security**:
@@ -460,8 +438,9 @@ See the full template, verification commands, and rollback notes in
     Avoid macFUSE (it requires lowering security). FUSE-T keeps sshfs's synchronous writes, so edits
     land on the host before remote builds. (Kext-less fallback: `rclone nfsmount`, but its writes are
     async — prefer FUSE-T for this edit-here/build-on-host workflow.)
-- Strict Claude/Codex routing requires `python3` on the agent host. The project host needs only
-  POSIX `sh`, a base64 decoder, and its normal login shell.
+- Strict Claude/Codex routing requires `python3` on the remote Agent host. opencode requires a
+  current plugin interface with `tool.execute.before`. The project host needs POSIX `sh`, a base64
+  decoder, and its normal login shell.
 - Shared remote development servers should use
   [`docs/ssh-sshfs-long-lived-connections.md`](docs/ssh-sshfs-long-lived-connections.md) to tune sshd
   capacity, keepalive, `nofile`, and TCP queues. This is not a hard prerequisite for remote-harness,
@@ -471,20 +450,22 @@ See the full template, verification commands, and rollback notes in
 
 ```
 remote-harness/
-├── SKILL.md                  # simple reverse / simple forward entry: emits one local bootstrap command
-├── reference/{reverse,forward,scripts}.md   # per-direction flows + script contracts
+├── SKILL.md                  # remote-only reverse entry: emits one local bootstrap command
+├── reference/{reverse,forward,scripts}.md   # active reverse flow, disabled-mode note, script contracts
 ├── scripts/                  # deterministic helpers (KEY=VALUE stdout), agent-agnostic
 │   ├── _common.sh            # shared lib (colors/ask/sq/parse_via/managed-alias/OS vars)
 │   ├── simple-bootstrap.sh                   # unified simple entry (local run; remote-fetchable)
-│   ├── simple-dispatch.sh                    # local reverse/forward selector + dispatcher
-│   ├── simple-laptop-setup.sh simple-local-setup.sh  # mode-specific local wizards
+│   ├── simple-dispatch.sh                    # remote-only reverse dispatcher
+│   ├── simple-laptop-setup.sh                # reverse local wizard
+│   ├── simple-local-setup.sh local-setup.sh  # local-agent rejection stubs
 │   ├── suggest-via.sh                        # simple reverse remote SSH target default
 │   ├── setup-tunnel.sh check-tunnel.sh        # reverse session alias + tunnel check
 │   ├── mount-project.sh inject-rule.sh        # shared mount + session rule/hook helpers
 │   ├── route-command.py                       # PreToolUse rewrite + cwd mapping
 │   ├── run-on-project-host.sh                 # SSH transport + project-host dispatcher
+│   ├── project-host-gateway.sh                 # forced-command SSH gateway
 │   ├── laptop-setup.sh                        # reverse orchestrator
-│   └── local-setup.sh                         # forward orchestrator
+│   └── local-setup.sh                         # permanent local-agent rejection stub
 ├── adapters/{codex,opencode}.md
 ├── manage.sh
 ├── docs/                            # design and complete-flow docs (installed with the skill)
@@ -503,7 +484,7 @@ remote-harness/
 ### Security & privacy
 
 - Simple setup does not create, modify, back up, append to, or clean up local or remote
-  `~/.ssh/config`, `known_hosts`, SSH keys, `config.rh-bak.*`, or `known_hosts_<alias>`. Temporary
+  `~/.ssh/config`, user-managed SSH keys, `config.rh-bak.*`, or `known_hosts_<alias>`. Temporary
   SSH aliases and `known_hosts` live under `~/.remote-harness/.sessions/...` and are cleaned up at
   session end where possible; session configs disable OpenSSH multiplexing.
 - The only `~/.ssh` write exception is reverse-mode laptop `authorized_keys`: setup checks for an
@@ -511,6 +492,8 @@ remote-harness/
   `remote-harness:reverse-auth:<tag>` block restricted with `from="127.0.0.1,::1"`. Managed blocks
   are reference-counted under `~/.remote-harness/.sessions/authorized-keys/...` and removed when the
   last session exits.
+- Every session uses a separate remote key bound to `project-host-gateway`. Setup refuses a matching
+  unrestricted user authorization for that key.
 - The reverse tunnel binds loopback only (`RemoteForward <PORT> 127.0.0.1:22`); on a multi-user box
   other local users can reach that port but cannot authenticate without your private key.
 - When several people share one server account, simple reverse uses the session alias `rlocal` and
@@ -519,19 +502,22 @@ remote-harness/
   the last session out cleans it up.
 - `--yolo` bypasses approvals and is applied **only when you ask**; opencode's `permission:allow`
   goes into the **per-session** config only and is gone on exit.
-- Claude/Codex hooks, runners, and instructions are **session-scoped**. Once the hook is loaded,
-  handler errors deny the call and SSH failures do not fall back to the original command.
+- Claude/Codex hooks, the opencode plugin, runners, and instructions are **session-scoped**. Once
+  routing is loaded, handler errors deny the call and SSH failures do not fall back to the original
+  command.
 - Strict command routing is not a filesystem sandbox. In reverse mode the trusted agent host holds
   a temporary key capable of laptop SSH/SFTP access. Do not use an untrusted agent host or mount a
   directory containing unrelated secrets.
-- opencode does not yet use this fork's enforcement hook and remains instruction-routed.
+- Gateway SFTP is account-level access, not a project chroot. An absolute project boundary requires
+  a dedicated, restricted local OS account.
 - Claude strict mode sets `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0` and blocks `WorktreeCreate`,
   `EnterWorktree`, and `ExitWorktree`. Ordinary and nested subagents remain available; parallel
   writers need disjoint file ownership.
 
 ### Troubleshooting
 
-See the end of `reference/reverse.md` / `reference/forward.md`. Common ones:
+See `reference/reverse.md`; disabled compatibility entries are documented in `reference/forward.md`.
+Common issues:
 - macOS asks for macFUSE → use FUSE-T instead (see [Requirements](#requirements)).
 - Files become unreadable mid-session (`Transport endpoint is not connected`) → the tunnel dropped;
   exit the agent and start remote-harness again (it detects the stale mount and remounts).

@@ -144,4 +144,4 @@ fi
 echo
 [ "$MODE" = dev ] && echo "DEV install: edits in $SRC are live immediately." || true
 echo "Done. Start it in your agent:  /remote-harness  (Claude Code / opencode)  ·  '\$remote-harness' in Codex"
-echo "  reverse: agent on a remote box, code on your laptop  |  forward: agent local, code on a remote server"
+echo "  remote-only: agent on the remote server; project files and commands on the local machine"

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # remote-harness / simple-dispatch.sh - run ON THE LOCAL MACHINE.
 #
-# Internal local dispatcher for simple mode. simple-bootstrap.sh calls this with
-# --mode reverse/forward, or omits --mode so the user chooses locally. It then
-# hands off to the mode-specific local wizard.
+# Remote-only local dispatcher. The coding agent always runs on the remote box;
+# this script only hands off to the reverse local wizard.
 set -uo pipefail
 set -f
 
@@ -41,7 +40,7 @@ cache_get_mode() {
 
 cache_save_mode() {
   _cache="$(cache_file)"
-  case "$MODE" in reverse|forward) ;; *) return 0;; esac
+  [ "$MODE" = reverse ] || return 0
   mkdir -p "$(dirname "$_cache")" 2>/dev/null || true
   _tmp="$(mktemp "${_cache}.XXXXXX" 2>/dev/null)" || return 0
   if [ -f "$_cache" ]; then
@@ -62,35 +61,6 @@ normalize_mode() {
   esac
 }
 
-prompt_mode() {
-  _default="${1:-reverse}"
-  case "$_default" in reverse|forward) ;; *) _default=reverse;; esac
-  while :; do
-    if is_zh; then
-      _prompt="$(printf '开发模式：1=远程开发本地项目(reverse)，2=本地开发远程项目(forward) [%s]: ' "$_default")"
-    else
-      _prompt="$(printf 'Development mode: 1=remote develops local project (reverse), 2=local develops server project (forward) [%s]: ' "$_default")"
-    fi
-    if [ -t 0 ] && [ -w /dev/tty ] 2>/dev/null; then printf '%s' "$_prompt" >/dev/tty; else printf '%s' "$_prompt" >&2; fi
-    _answer=""
-    if [ -t 0 ] && [ -r /dev/tty ] 2>/dev/null; then
-      IFS= read -r _answer </dev/tty || _answer=""
-    else
-      IFS= read -r _answer || _answer=""
-    fi
-    [ -n "$_answer" ] || _answer="$_default"
-    if MODE="$(normalize_mode "$_answer")"; then
-      printf '%s' "$MODE"
-      return 0
-    fi
-    if is_zh; then
-      warn "请输入 1/reverse 或 2/forward。"
-    else
-      warn "Please enter 1/reverse or 2/forward."
-    fi
-  done
-}
-
 MODE="" SOURCE_VIA="" LAUNCH="codex" YOLO=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -109,22 +79,19 @@ esac
 if [ -n "$MODE" ]; then
   MODE="$(normalize_mode "$MODE")" || { printf 'unsupported --mode %s\n' "$MODE" >&2; exit 2; }
 else
-  cached_mode="$(cache_get_mode)"
-  if [ -n "$cached_mode" ] && ! [ -t 0 ]; then
-    MODE="$(normalize_mode "$cached_mode")" || MODE=reverse
-  else
-    MODE="$(prompt_mode "$cached_mode")"
-  fi
+  MODE=reverse
 fi
+[ "$MODE" = reverse ] || {
+  if is_zh; then
+    err "remote-only 模式不允许在本机启动 Agent；请使用 reverse。"
+  else
+    err "remote-only mode cannot launch an agent locally; use reverse."
+  fi
+  exit 2
+}
 cache_save_mode
 
 case "$MODE" in
-  forward)
-    [ -x "$SCRIPT_DIR/simple-local-setup.sh" ] || { err "missing simple-local-setup.sh in $SCRIPT_DIR"; exit 2; }
-    args=(--launch "$LAUNCH")
-    [ "$YOLO" = 1 ] && args+=(--yolo)
-    exec bash "$SCRIPT_DIR/simple-local-setup.sh" "${args[@]}"
-    ;;
   reverse)
     [ -x "$SCRIPT_DIR/simple-laptop-setup.sh" ] || { err "missing simple-laptop-setup.sh in $SCRIPT_DIR"; exit 2; }
     args=(--launch "$LAUNCH")
