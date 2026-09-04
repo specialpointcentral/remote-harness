@@ -91,6 +91,6 @@
 - [x] Document Claude multi-agent inheritance and the opencode plugin.
 - [x] Document account-level SFTP and the dedicated-account absolute boundary.
 - [x] Run regression, shell syntax, Python compile, skill validation, YAML parse, and `git diff --check`.
-- [ ] Inspect the staged diff and scan it for credentials.
-- [ ] Commit with the configured GitHub noreply identity and push the feature branch.
-- [ ] Wait for Ubuntu and macOS CI, fast-forward fork `main`, and verify `main` CI.
+- [x] Inspect the staged diff and scan it for credentials.
+- [x] Commit with the configured GitHub noreply identity and push the feature branch.
+- [x] Wait for Ubuntu and macOS CI, fast-forward fork `main`, and verify `main` CI.
