@@ -479,13 +479,18 @@ load_effective_ssh_alias() {
   V_PORT=$(printf '%s\n' "$_cfg" | awk 'tolower($1)=="port"{print $2; exit}')
   V_USER=$(printf '%s\n' "$_cfg" | awk 'tolower($1)=="user"{print $2; exit}')
   V_PROXYJUMP=$(printf '%s\n' "$_cfg" | awk 'tolower($1)=="proxyjump" && $2!="none"{print $2; exit}')
+  # The session Host is a new name, so options the user's `Host <alias>` block supplies only by name
+  # (e.g. a gcloud IAP ProxyCommand) must be carried over explicitly.
+  V_PROXYCOMMAND=$(printf '%s\n' "$_cfg" | awk 'tolower($1)=="proxycommand" && $2!="none"{sub(/^[^ \t]+[ \t]+/, ""); print; exit}')
+  V_IDENTITIESONLY=$(printf '%s\n' "$_cfg" | awk 'tolower($1)=="identitiesonly" && ($2=="yes" || $2=="no"){print $2; exit}')
   V_IDENTITY=""
   while IFS= read -r _identity; do
-    case "$_identity" in ~/*) _identity="$HOME/${_identity#~/}";; esac
-    [ -f "$_identity" ] && { V_IDENTITY="$_identity"; break; }
+    case "$_identity" in "~/"*) _identity="$HOME/${_identity#"~/"}";; esac
+    if [ -f "$_identity" ]; then V_IDENTITY="$_identity"; break; fi
   done <<EOF
 $(printf '%s\n' "$_cfg" | awk 'tolower($1)=="identityfile"{print $2}')
 EOF
+  return 0
 }
 # The --via connection is the GROUND TRUTH for how to reach the box. Use a DEDICATED session-local
 # alias for the harness connection even when --via is a normal `Host <alias>` alias; ordinary
@@ -517,7 +522,7 @@ write_target_forward() {
       "    ServerAliveInterval 30" "    ServerAliveCountMax 3" \
       "    ExitOnForwardFailure yes" "    TCPKeepAlive yes" \
       "    ForwardAgent no"; then
-    ok "ssh config: prepared session Host '$TARGET' (HostName ${V_HOST:-?}, port ${V_PORT:-22}, user ${V_USER:-<login default>}) + RemoteForward $_port"
+    ok "ssh config: prepared session Host '$TARGET' (HostName ${V_HOST:-?}, port ${V_PORT:-22}, user ${V_USER:-<login default>}${V_PROXYCOMMAND:+, ProxyCommand}) + RemoteForward $_port"
   else
     err "ssh config: could not write session Host '$TARGET'"
     return 1

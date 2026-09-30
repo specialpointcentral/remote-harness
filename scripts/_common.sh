@@ -119,7 +119,8 @@ parse_ssh_option() {
   esac
 }
 parse_via() {
-  V_HOST="" V_PORT="" V_USER="" V_IDENTITY="" V_PROXYJUMP="" V_UNSUPPORTED_SSH_OPTIONS=""
+  V_HOST="" V_PORT="" V_USER="" V_IDENTITY="" V_PROXYJUMP="" V_PROXYCOMMAND="" V_IDENTITIESONLY=""
+  V_UNSUPPORTED_SSH_OPTIONS=""
   [ -n "${1:-}" ] || return 0
   # shellcheck disable=SC2086 # intentional ssh-arg word splitting; never eval'd.
   set -- $1
@@ -174,6 +175,9 @@ write_managed_alias() {
   [ -z "${V_HOST:-}" ] || safe_ssh_token "$V_HOST" || { printf 'unsafe ssh HostName: %s\n' "$V_HOST" >&2; return 2; }
   [ -z "${V_USER:-}" ] || safe_ssh_token "$V_USER" || { printf 'unsafe ssh User: %s\n' "$V_USER" >&2; return 2; }
   [ -z "${V_PROXYJUMP:-}" ] || safe_ssh_token "$V_PROXYJUMP" || { printf 'unsafe ssh ProxyJump: %s\n' "$V_PROXYJUMP" >&2; return 2; }
+  case "${V_PROXYCOMMAND:-}" in *"$(printf '\r')"*|*'
+'*) printf 'unsafe ssh ProxyCommand: contains a line break\n' >&2; return 2;; esac
+  case "${V_IDENTITIESONLY:-}" in ""|yes|no) ;; *) printf 'unsafe ssh IdentitiesOnly: %s\n' "$V_IDENTITIESONLY" >&2; return 2;; esac
   remove_host_block "$_wma_alias"
   { printf '\nHost %s\n' "$_wma_alias"
     [ -n "${V_HOST:-}" ]                            && printf '    HostName %s\n' "$(ssh_config_value "$V_HOST")"
@@ -181,6 +185,10 @@ write_managed_alias() {
     [ -n "${V_USER:-}" ]                            && printf '    User %s\n' "$(ssh_config_value "$V_USER")"
     [ -n "${V_IDENTITY:-}" ]                        && printf '    IdentityFile %s\n' "$(ssh_config_value "$V_IDENTITY")"
     [ -n "${V_PROXYJUMP:-}" ]                       && printf '    ProxyJump %s\n' "$(ssh_config_value "$V_PROXYJUMP")"
+    # ProxyCommand takes the rest of the line verbatim (quoting it would break the command). It only
+    # comes from the user's own resolved Host alias (ssh -G), never from parsed --via words.
+    [ -z "${V_PROXYJUMP:-}" ] && [ -n "${V_PROXYCOMMAND:-}" ] && printf '    ProxyCommand %s\n' "$V_PROXYCOMMAND"
+    [ -n "${V_IDENTITIESONLY:-}" ]                  && printf '    IdentitiesOnly %s\n' "$V_IDENTITIESONLY"
     for _wma_line in "$@"; do printf '%s\n' "$_wma_line"; done
   } >> "$CFG"
 }

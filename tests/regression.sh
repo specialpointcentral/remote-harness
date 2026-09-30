@@ -499,6 +499,11 @@ if [ "${1:-}" = "-G" ] && [ "${2:-}" = "mybox" ]; then
   printf 'user mybox\nhostname 203.0.113.7\nport 22\nidentityfile ~/.ssh/id_ed25519\n'
   exit 0
 fi
+if [ "${1:-}" = "-G" ] && [ "${2:-}" = "iapbox" ]; then
+  printf 'user dev\nhostname iapbox\nport 22\nidentitiesonly yes\nidentityfile ~/.ssh/google_compute_engine\nproxyjump none\n'
+  printf 'proxycommand gcloud compute start-iap-tunnel iapbox %%p --listen-on-stdin --zone=zone-a --project=demo\n'
+  exit 0
+fi
 exit 0
 EOS
 chmod +x "$tmp/bin/ssh"
@@ -530,6 +535,25 @@ if grep -q "mybox-remote-harness" "$alias_home/.ssh/config"; then
   fail "laptop-setup wrote dedicated alias to user ~/.ssh/config"
 fi
 [ -z "$(find "$alias_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "alias setup created config.rh-bak"
+
+iap_home="$tmp/iap-home"
+mkdir -p "$iap_home/.ssh"
+: > "$iap_home/.ssh/google_compute_engine"
+printf 'Host iapbox\n    HostName iapbox\n' > "$iap_home/.ssh/config"
+HOME="$iap_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
+  bash "$ROOT/scripts/laptop-setup.sh" \
+    --host iapbox --port 22023 --via "iapbox" \
+    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
+    --box-alias laptop --setup-only --yes > "$tmp/setup-iap.out" 2>&1
+iap_cfg="$(find "$iap_home/.remote-harness/.sessions" -name ssh_config -print -quit 2>/dev/null)"
+[ -n "$iap_cfg" ] || fail "ProxyCommand alias session ssh config missing"
+assert_grep "$iap_cfg" "Host iapbox-remote-harness" "ProxyCommand alias dedicated host"
+assert_grep "$iap_cfg" "    ProxyCommand gcloud compute start-iap-tunnel iapbox %p --listen-on-stdin --zone=zone-a --project=demo" "session alias keeps the user's ProxyCommand"
+assert_grep "$iap_cfg" "    IdentitiesOnly yes" "session alias keeps IdentitiesOnly"
+assert_grep "$iap_cfg" "    IdentityFile $iap_home/.ssh/google_compute_engine" "session alias expands ~/ identity paths"
+if grep -q "could not resolve Host" "$tmp/setup-iap.out"; then
+  fail "ssh -G alias resolution reported a spurious failure"
+fi
 
 if HOME="$tmp/unsafe-rh" RH_HOME=/ bash "$ROOT/manage.sh" --uninstall >/dev/null 2>"$tmp/manage-rh-root.err"; then
   fail "manage accepted RH_HOME=/"

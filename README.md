@@ -176,6 +176,8 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
 
 - 你已经能从一台机器 ssh 到另一台（任意端口 / 常见 `-J` 跳板机都行）。复杂 SSH 选项
   （`ProxyCommand`、`-F`、带空格的引号路径、本地转发等）请先写进 `~/.ssh/config` 的 `Host` 别名，再把别名交给 remote-harness。
+  会话隧道别名会继承该别名经 `ssh -G` 解析出的 HostName、Port、User、IdentityFile、IdentitiesOnly、
+  ProxyJump 和 ProxyCommand（例如 `gcloud compute start-iap-tunnel` 这类 Google Cloud IAP 连接）。
 - **反向 simple**：你已经把笔记本的 SSH 公钥配置到远端服务器账号，所以本地命令能先登录远端抓取脚本。
   远端会在本次会话 SSH config 旁生成新的 remote-harness key；本地脚本可将其公钥作为
   `remote-harness:reverse-auth:<tag>` 临时块写入笔记本 `~/.ssh/authorized_keys`，限制为回环来源并在退出时清理。
@@ -425,6 +427,9 @@ See the full template, verification commands, and rollback notes in
 - You can already ssh from one machine to the other (any port / common `-J` jump host is fine).
   For complex SSH options (`ProxyCommand`, `-F`, quoted paths with spaces, local forwards, etc.),
   put them in `~/.ssh/config` as a `Host` alias and give remote-harness that alias.
+  The session tunnel alias inherits the alias's `ssh -G` HostName, Port, User, IdentityFile,
+  IdentitiesOnly, ProxyJump, and ProxyCommand (for example a Google Cloud IAP
+  `gcloud compute start-iap-tunnel` connection).
 - **Simple reverse**: the laptop's SSH public key is already accepted by the remote server account,
   so the local command can fetch scripts from the remote box. The box generates a new
   remote-harness key beside the session SSH config; the local setup may add that public key
