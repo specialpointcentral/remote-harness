@@ -18,13 +18,15 @@
 #              known_hosts there. It never makes ~/.ssh writable.
 #              The project's own AGENTS.md is still read additively; the mounted repo is never touched.
 #
-#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [yolo:0|1] [ssh_config]
-#   inject-rule.sh off <agent> <mountpoint>
+#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [yolo:0|1] [ssh_config] [session_id]
+#   inject-rule.sh off <agent> <mountpoint> [session_id]
 #
 # 'on'  prints: RH_STATUS=INJECTED  RH_LAUNCH_ENV=<env prefix>  RH_LAUNCH_FLAGS=<trailing flags>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
-# Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine (key derived from
-# mountpoint), so 'on'/'off' agree without extra state and concurrent harness sessions don't clash.
+# Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
+# from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
+# second launch (or a stale launch's cleanup) for the same mountpoint never deletes the hook/runner of
+# a session that is still running. Without session_id the key is the mountpoint alone (legacy).
 set -uo pipefail
 
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -37,9 +39,17 @@ safe_ssh_token() {
   esac
 }
 
-session_dir() {  # $1 = mountpoint (session key) -> box-side per-session dir
+valid_session_id() {
+  case "${1:-}" in
+    ""|.|..|*[!A-Za-z0-9._-]*) return 1;;
+    *) return 0;;
+  esac
+}
+
+session_dir() {  # $1 = mountpoint, $2 = optional session id -> box-side per-session dir
   key="$(printf '%s' "${1:-default}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
   case "$key" in ""|.|..) key=default;; esac   # never let the key escape $RH_HOME/.sessions/ (e.g. "..")
+  [ -z "${2:-}" ] || key="$key.$2"
   printf '%s/.sessions/%s' "${RH_HOME:-$HOME/.remote-harness}" "$key"
 }
 
@@ -291,10 +301,11 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
 
 case "${1:-}" in
   on)
-    agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; yolo="${6:-0}"; ssh_config="${7:-}"
+    agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; yolo="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
     case "$agent" in claude|codex|opencode) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
     [ -n "$lp" ] && [ -n "$ba" ] || { echo "RH_STATUS=ERROR"; exit 2; }
-    SD="$(session_dir "$mp")"
+    [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
+    SD="$(session_dir "$mp" "$sid")"
     rm -rf "$SD" 2>/dev/null || true
     mkdir -p "$SD" 2>/dev/null || { echo "RH_STATUS=ERROR"; exit 1; }
     RULE="$SD/rule.md"
@@ -375,7 +386,9 @@ case "${1:-}" in
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
     ;;
   off)
-    mp="${3:-}"; SD="$(session_dir "$mp")"
+    mp="${3:-}"; sid="${4:-}"
+    [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
+    SD="$(session_dir "$mp" "$sid")"
     # All agents' artifacts (the rule file, and for opencode its session config) live in the session
     # dir; none of them touched the mounted repo — so cleanup is just removing that dir.
     if [ -d "$SD" ]; then
@@ -385,6 +398,6 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [yolo] | off <agent> <box_mountpoint>" >&2
+    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [yolo] [ssh_config] [session_id] | off <agent> <box_mountpoint> [session_id]" >&2
     echo "RH_STATUS=ERROR"; exit 2;;
 esac

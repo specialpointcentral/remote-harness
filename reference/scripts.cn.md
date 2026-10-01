@@ -12,6 +12,8 @@
 - `mount-project.sh`：在远端 Agent 主机通过 SSHFS 挂载本机项目。
 - `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
   opencode 还会返回启动前必须出现的 readiness marker 路径。
+  会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
+  不会删除其它仍在运行的会话的 hook 或 runner。
 - `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。
 - `run-on-project-host.sh`：校验并执行本机项目命令。
 - `project-host-gateway.sh`：只接受 SFTP、health 和固定 exec 协议的 forced SSH command。

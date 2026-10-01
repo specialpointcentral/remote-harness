@@ -10,6 +10,8 @@
 - `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS.
 - `inject-rule.sh`: installs session instructions, Claude/Codex hooks or the opencode plugin, and the
   remote runner. opencode emits a readiness marker path that must be observed before launch.
+  Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
+  project or cleaning up a dead launch never removes another live session's hook or runner.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
 - `run-on-project-host.sh`: validates and executes the local project command.
 - `project-host-gateway.sh`: forced SSH command accepting only SFTP, health, and fixed exec protocol.

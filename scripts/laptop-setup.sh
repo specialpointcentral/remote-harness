@@ -83,7 +83,7 @@ else printf 'error: missing _common.sh next to %s — re-copy the full command\n
 
 # ---- auto-cleanup on exit/disconnect ---------------------------------------
 TUNNEL_PID=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0
-LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""
+LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""; RULE_SESSION_ID=""
 # The box logs into THIS laptop as the box alias's `User`, so the login user must be US. The laptop's
 # own `id -un` is the single source of truth (whatever the box-side setup guessed, e.g. from a
 # project path); we force the box alias to it in Phase 2. In the simple reverse flow remote-harness
@@ -347,7 +347,7 @@ cleanup() {
   fi
   if [ "${RULE_INJECTED:-0}" = 1 ]; then
     ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" \
-      "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" off $(sq "${LAUNCH_BASE:-claude}") $(sq "${REMOTE_MOUNTPOINT:-}")" >/dev/null 2>&1 \
+      "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" off $(sq "${LAUNCH_BASE:-claude}") $(sq "${REMOTE_MOUNTPOINT:-}") $(sq "${RULE_SESSION_ID:-}")" >/dev/null 2>&1 \
       && ok "session-scoped rule removed" || true
   fi
   if [ -n "${BOX_SSH_CONFIG:-}" ] && [ -n "${TARGET:-}" ]; then
@@ -888,8 +888,11 @@ fi
 # unaffected) and prints how to launch so ONLY this agent reads it — a session flag for claude, or
 # an env/config prefix (Codex developer_instructions / OPENCODE_CONFIG) for codex/opencode. For opencode, YOLO's
 # permission=allow is folded into that per-session config too.
+# The box-side session dir is keyed by mountpoint AND this launch's unique session dir name, so a
+# relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
+RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 rh_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
-     "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG")" \
+     "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")" \
      2>/dev/null || printf 'RH_STATUS=ERROR\n')
 rh_status=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_STATUS=//p' | head -1)
 if [ "$rh_status" = INJECTED ]; then

@@ -897,6 +897,10 @@ assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse auth
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"
+grep -E "inject-rule.sh\" on .*'/home/box/.remote-harness/.sessions/test/ssh_config' 'rev\.[A-Za-z0-9]+'" "$ssh_log" >/dev/null \
+  || fail "laptop-setup did not pass its per-launch session id to inject-rule on"
+grep -E "inject-rule.sh\" off 'codex' '/tmp/rh-remote' 'rev\.[A-Za-z0-9]+'" "$ssh_log" >/dev/null \
+  || fail "laptop-setup cleanup did not remove only its own inject-rule session"
 assert_grep "$ROOT/scripts/laptop-setup.sh" "exec 3</dev/tty" "phase5 attaches stdin to controlling tty"
 [ -f "$auth_keys_snapshot" ] || fail "did not capture the live forced-command authorized_keys entry"
 assert_grep "$auth_keys_snapshot" 'from="127.0.0.1,::1",command="' "authorized key is loopback-scoped and forced"
@@ -1059,6 +1063,26 @@ RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/
 [ ! -e "$ir_rh/rule.md" ] || fail "inject-rule: '..' mountpoint escaped to RH_HOME"
 RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude ".." >/dev/null
 [ ! -d "$ir_rh/.sessions/default" ] || fail "inject-rule: '..' session dir not cleaned"
+
+# --- inject-rule.sh: two launches for one mountpoint keep separate runners ----------------------
+ir_mp="$tmp/ir-shared-mount"
+ir_key="$(printf '%s' "$ir_mp" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+for ir_sid in rev.first rev.second; do
+  RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_sid" > "$tmp/ir-$ir_sid.out"
+  assert_grep "$tmp/ir-$ir_sid.out" "RH_STATUS=INJECTED" "inject-rule on with session id $ir_sid"
+  assert_grep "$tmp/ir-$ir_sid.out" "$ir_rh/.sessions/$ir_key.$ir_sid/claude-settings.json" "inject-rule uses session-id dir for $ir_sid"
+done
+[ -x "$ir_rh/.sessions/$ir_key.rev.first/bin/rh-run" ] || fail "inject-rule: second launch deleted the first session runner"
+RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude "$ir_mp" rev.first >/dev/null
+[ ! -d "$ir_rh/.sessions/$ir_key.rev.first" ] || fail "inject-rule: off did not remove its own session dir"
+[ -x "$ir_rh/.sessions/$ir_key.rev.second/bin/rh-run" ] || fail "inject-rule: off removed another live session runner"
+RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude "$ir_mp" rev.second >/dev/null
+[ ! -d "$ir_rh/.sessions/$ir_key.rev.second" ] || fail "inject-rule: second session dir not cleaned"
+for ir_bad in .. 'a/b' 'a b'; do
+  ir_bad_out=$(RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_bad" || true)
+  assert_grep <(printf '%s\n' "$ir_bad_out") "RH_STATUS=ERROR" "inject-rule rejects unsafe session id '$ir_bad'"
+done
+[ -z "$(find "$ir_rh/.sessions" -mindepth 1 -maxdepth 1 -name "$ir_key*" -print -quit)" ] || fail "inject-rule: unsafe session id created a session dir"
 
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   doc_list() { git -C "$ROOT" ls-files --cached --others --exclude-standard '*.md'; }
