@@ -60,7 +60,8 @@ it provides files over SSHFS and executes project commands through a forced gate
   and keep path discovery (`rev-parse`, `config`, ...) on the remote host.
 - Calls outside the mount, or naming another repository/index, run the real tool unchanged.
 - A routed call that cannot reach the project host fails non-zero; it never reports clean or
-  no-match and never falls back to scanning SSHFS.
+  no-match and never falls back to scanning SSHFS. Only an explicit "tool not installed" answer
+  from a reachable project host switches that tool to the remote host for the rest of the session.
 - Routed calls share a per-session concurrency cap and a short-lived OpenSSH multiplexing master
   passed on the command line only; generated `ssh_config` files keep `ControlMaster no`.
 

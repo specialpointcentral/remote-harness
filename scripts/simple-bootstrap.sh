@@ -192,7 +192,9 @@ if ! tar -xf "$archive" -C "$unpack" \
     || ! cmp -s "$unpack/SHA256SUMS" "$tmp/computed-sha256"; then
   bootstrap_fail 'helper 包解包或 SHA-256 校验失败。' 'helper bundle extraction or SHA-256 verification failed'
 fi
-if [ -f "${BASH_SOURCE[0]}" ] && ! cmp -s "${BASH_SOURCE[0]}" "$unpack/simple-bootstrap.sh"; then
+# A piped bootstrap (`ssh ... cat ... | bash -s`) has no local copy to compare; the bundle digest
+# check above still applies.
+if [ -f "${BASH_SOURCE[0]:-}" ] && ! cmp -s "${BASH_SOURCE[0]}" "$unpack/simple-bootstrap.sh"; then
   bootstrap_fail '远端 bootstrap 在下载期间发生变化，请重新启动。' \
     'remote bootstrap changed between downloads; restart the bootstrap'
 fi

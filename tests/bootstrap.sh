@@ -104,6 +104,11 @@ PY
   [ "$(cat "$BOOTSTRAP_MARKER")" = '--mode reverse --launch codex --source-via testbox' ] || fail "$document handoff"
   [ "$(wc -l < "$BOOTSTRAP_CONNECTIONS" | tr -d ' ')" = 2 ] || fail "$document should use one bootstrap and one bundle transfer"
 done
+# The earlier published form pipes the bootstrap into `bash -s`, where BASH_SOURCE is unset.
+rm -f "$BOOTSTRAP_MARKER"
+bash -s -- --mode reverse --launch codex < "$BOOTSTRAP_SOURCE/scripts/simple-bootstrap.sh" \
+  > "$fixture/out" 2> "$fixture/err" || fail "piped bootstrap failed: $(cat "$fixture/err")"
+[ "$(cat "$BOOTSTRAP_MARKER")" = '--mode reverse --launch codex --source-via testbox' ] || fail 'piped bootstrap handoff'
 # macOS uses shasum while the Linux server commonly uses sha256sum: manifests must agree.
 if command -v shasum >/dev/null 2>&1; then
   mkdir "$fixture/shasum-bin"

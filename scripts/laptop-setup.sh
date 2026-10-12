@@ -951,10 +951,16 @@ RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
 inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+# Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
+# shell) would hang here forever, so bound the whole step on the box and keep its stderr.
+inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
+inject_err="$LOCAL_SESSION_DIR/inject.err"
+rh_rc=0
 rh_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
-     "exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")" \
-     2>/dev/null || printf 'RH_STATUS=ERROR\n')
+     "if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 120 $inject_shell; else exec $inject_shell; fi" \
+     2>"$inject_err") || rh_rc=$?
 rh_status=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_STATUS=//p' | head -1)
+[ "$rh_rc" = 0 ] || rh_status=ERROR
 if [ "$rh_status" = INJECTED ]; then
   RULE_INJECTED=1
   rh_env=$(printf  '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_ENV=//p'   | head -1)
@@ -972,7 +978,18 @@ if [ "$rh_status" = INJECTED ]; then
   EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
-  err "could not install strict run-on-laptop routing ($rh_status); refusing to launch the agent"
+  err "could not install strict run-on-laptop routing (${rh_status:-no status}); refusing to launch the agent"
+  if [ "$rh_rc" = 124 ] || [ "$rh_rc" = 137 ]; then
+    say "  The remote login shell did not finish within 120s; check its startup files (~/.bashrc,"
+    say "  ~/.zshrc, ~/.profile) for prompts or commands that wait or exec another program."
+  fi
+  # Interactive shells without a terminal always print job-control notices; show only the rest.
+  inject_tail=$(grep -v -e 'cannot set terminal process group' -e 'no job control in this shell' \
+    "$inject_err" 2>/dev/null | tail -n 8)
+  if [ -n "$inject_tail" ]; then
+    say "  Remote output (last lines):"
+    printf '%s\n' "$inject_tail" | sed 's/^/    /'
+  fi
   exit 1
 fi
 

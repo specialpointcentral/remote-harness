@@ -84,7 +84,13 @@ project host:
   SSH channel closes, so a cancelled caller or dropped link does not leave a scan running;
 - a per-session cap (default 6 concurrent calls) keeps routed calls under the project host's sshd
   `MaxSessions`; a transport failure retries once without the multiplexing master and then fails
-  non-zero, never as clean or no-match.
+  non-zero, never as clean or no-match;
+- a reachable project host that answers that the tool is not installed (for example a Mac without
+  ripgrep) is recorded once per session, and that tool then runs on the remote host over the mount.
+  This keeps Claude's Grep/Glob working; it is not a transport fallback;
+- routed calls read the project host's Git configuration (global excludes, `core.autocrlf`, ...),
+  while path discovery kept remote reads the remote user's global configuration plus the shared
+  repository `.git/config`. Repository-level settings therefore agree; user-level ones may differ.
 
 ## Connections
 

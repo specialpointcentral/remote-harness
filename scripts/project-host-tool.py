@@ -89,6 +89,10 @@ class StayLocal(Exception):
     """The call must run with the agent host's real tool."""
 
 
+class ToolMissing(Exception):
+    """The project host answered that the tool is not installed there."""
+
+
 class Context:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -415,6 +419,8 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
             )
     finally:
         os.close(slot)
+    if status == 127 and not emitted and missing_message(args.tool) in stderr:
+        raise ToolMissing()
     sys.stderr.buffer.write(stderr)
     sys.stderr.flush()
     if status == TRANSPORT_FAILURE and not emitted:
@@ -423,6 +429,15 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
             "not falling back to scanning the SSHFS mount\n"
         )
     return status
+
+
+def missing_message(tool: str) -> bytes:
+    return f"remote-harness: {tool} is not installed on the project host".encode()
+
+
+def missing_marker(args: argparse.Namespace) -> str:
+    """Session-scoped record that the project host has no such tool (it sits beside the slots)."""
+    return os.path.join(os.path.dirname(args.slots_dir.rstrip("/")), f"tool-missing.{args.tool}")
 
 
 def run_local(ctx: Context, argv: list[str]) -> int:
@@ -486,10 +501,25 @@ def main() -> int:
             effective, routed = rg_plan(ctx, argv, cwd)
     except StayLocal:
         return run_local(ctx, argv)
+    # The project host was reachable but lacks this tool (e.g. a Mac without ripgrep): keep the
+    # agent-host tool for the rest of the session. This is not a transport failure, so it does not
+    # weaken the rule that an unreachable project host never falls back to scanning the mount.
+    if os.path.exists(missing_marker(args)):
+        return run_local(ctx, argv)
 
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, handle_signal)
-    return route(ctx, effective, routed)
+    try:
+        return route(ctx, effective, routed)
+    except ToolMissing:
+        try:
+            with open(missing_marker(args), "w", encoding="utf-8") as handle:
+                handle.write(f"{args.tool} is not installed on the project host\n")
+        except OSError:
+            pass
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_DFL)
+        return run_local(ctx, argv)
 
 
 if __name__ == "__main__":

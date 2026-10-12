@@ -371,6 +371,34 @@ if [ -n "$rg_real" ]; then
   fi
 fi
 
+# A reachable project host without the tool (a Mac without ripgrep): the session keeps using the
+# agent-host tool instead of failing every search, and asks the project host only once.
+missing_bin="$router_tmp/missing-bin"
+missing_log="$router_tmp/missing-ssh.log"
+mkdir -p "$missing_bin" "$router_tmp/missing-runtime"
+cat > "$missing_bin/ssh" <<EOS
+#!/bin/sh
+printf '%s\n' "\$*" >> '$missing_log'
+printf 'remote-harness: rg is not installed on the project host\n' >&2
+exit 127
+EOS
+cat > "$missing_bin/local-rg" <<'EOS'
+#!/bin/sh
+printf 'local-rg %s\n' "$*"
+EOS
+chmod +x "$missing_bin/ssh" "$missing_bin/local-rg"
+run_missing_rg() {
+  (cd "$tool_mount" && PATH="$missing_bin:$PATH" python3 -I "$ROOT/scripts/project-host-tool.py" \
+    --tool rg --real "$missing_bin/local-rg" --runner "$ROOT/scripts/run-on-project-host.sh" \
+    --ssh-config "$router_tmp/shim_ssh_config" --alias project-host --project-root "$tool_proj" \
+    --mount-root "$tool_mount" --control-path "" --slots-dir "$router_tmp/missing-runtime/tool-slots" \
+    -- "$@")
+}
+assert_eq "rg missing on the project host falls back to the agent-host rg" \
+  "$(run_missing_rg --files 2>&1)" "local-rg --files"
+assert_eq "later rg calls keep the agent-host rg" "$(run_missing_rg -n hello 2>&1)" "local-rg -n hello"
+assert_eq "a missing project-host tool is detected once per session" "$(grep -c . "$missing_log")" "1"
+
 # Concurrency cap: with one slot, routed calls never overlap.
 cap_runner="$router_tmp/cap-runner"
 printf '#!/bin/sh\nprintf "start\\n" >> %s\nsleep 1\nprintf "end\\n" >> %s\n' \
@@ -606,6 +634,62 @@ assert version.startswith("ripgrep "), version
 PY
   RH_HOME="$rh_home" HOME="$home_dir" \
     "$ROOT/scripts/inject-rule.sh" off codex "$tool_mount" "codex.$codex_yolo" >/dev/null
+done
+
+# Native Claude install: no rg in the login PATH, but the claude binary serves ripgrep. Claude's
+# Grep/Glob then use the session rg shim, which searches on the project host. A claude without an
+# embedded ripgrep gets no rg shim and keeps its own search.
+claude_tool_bin="$tmp/claude tools"
+mkdir -p "$claude_tool_bin"
+for claude_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp git python3 grep cksum base64; do
+  ln -s "$(command -v "$claude_dep")" "$claude_tool_bin/$claude_dep"
+done
+cp "$codex_tool_bin/ssh" "$claude_tool_bin/ssh"
+for claude_variant in native plain; do
+  rm -f "$claude_tool_bin/claude"
+  if [ "$claude_variant" = plain ]; then
+    printf '#!/bin/sh\nprintf "2.0.0 (Claude Code)\\n"\n' > "$claude_tool_bin/claude"
+    chmod +x "$claude_tool_bin/claude"
+  elif [ -n "$rg_real" ]; then
+    ln -s "$rg_real" "$claude_tool_bin/claude"
+  else
+    printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\n' > "$claude_tool_bin/claude"
+    chmod +x "$claude_tool_bin/claude"
+  fi
+  PATH="$claude_tool_bin" RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" on claude "$tool_proj" project-host "$tool_mount" 0 \
+      "$router_tmp/shim_ssh_config" "claude.$claude_variant" > "$tmp/claude-tools.out"
+  claude_tool_sd="$rh_home/.sessions/$(printf '%s' "$tool_mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').claude.$claude_variant"
+  python3 - "$tmp/claude-tools.out" "$tool_mount" "$claude_tool_sd/bin" "$claude_tool_bin" "$claude_variant" "$rg_real" <<'PY'
+import os
+import shlex
+import subprocess
+import sys
+
+out, mount, session_bin, tool_bin, variant, rg_real = sys.argv[1:]
+lines = dict(line.rstrip("\n").split("=", 1) for line in open(out, encoding="utf-8"))
+assert lines["RH_STATUS"] == "INJECTED"
+launch_env = shlex.split(lines["RH_LAUNCH_ENV"])
+env = os.environ.copy()
+env["PATH"] = session_bin + ":" + tool_bin
+status = subprocess.check_output(["git", "status", "--porcelain"], cwd=mount, env=env, text=True)
+assert "?? src/new.txt" in status and "mount-only" not in status, status
+if variant == "plain":
+    assert not os.path.exists(os.path.join(session_bin, "rg")), "rg shim without an rg-capable claude"
+    assert "USE_BUILTIN_RIPGREP=0" not in launch_env, launch_env
+    sys.exit(0)
+assert os.access(os.path.join(session_bin, "rg"), os.X_OK), "native claude rg did not get a shim"
+assert "USE_BUILTIN_RIPGREP=0" in launch_env, launch_env
+if rg_real:
+    # The same calls Claude's Grep and Glob make, relative to the project directory.
+    found = subprocess.check_output(["rg", "-l", "--null", "hello", "."], cwd=mount, env=env)
+    assert found == b"./src/a.txt\0", found
+    files = subprocess.check_output(["rg", "--files", "--null", "--glob", "**/*.txt", "."],
+                                    cwd=mount, env=env).split(b"\0")
+    assert b"./src/new.txt" in files and b"./src/mount-only.txt" not in files, files
+PY
+  RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" off claude "$tool_mount" "claude.$claude_variant" >/dev/null
 done
 
 RH_HOME="$rh_home" HOME="$home_dir" \
