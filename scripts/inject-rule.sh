@@ -382,9 +382,10 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
     printf '\n'
     printf 'Git commands you run through the Bash tool are routed with the rest of the command. Git\n'
     printf 'and ripgrep calls that the agent makes internally (status snapshots, file search) go through\n'
-    printf 'session shims: work-tree scans run on `%s`; path discovery such as `git rev-parse` stays on\n' "$3"
-    printf 'this host. If such a call reports that the project host is unreachable, do not retry it\n'
-    printf 'against the mount with another tool; report the connection problem instead.\n'
+    printf 'session shims: work-tree scans and read-only lookups such as `git rev-parse` run on `%s`;\n' "$3"
+    printf 'git calls that write stay on this host. If such a call reports that the project host is\n'
+    printf 'unreachable, do not retry it against the mount with another tool; report the connection\n'
+    printf 'problem instead.\n'
     printf 'Use relative project paths in Bash commands; absolute mount paths name the agent host and\n'
     printf 'are not portable to `%s`. Interactive PTY commands are not supported by strict routing.\n' "$3"
     printf 'Commands read stdin from /dev/null. Stopping a command, its timeout, or the end of this\n'

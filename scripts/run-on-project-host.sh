@@ -319,12 +319,13 @@ fi
 # Per-connection tuning. Command-line -o values take precedence over the session ssh_config.
 # ServerAlive detects a dead reverse tunnel in ~30s, so a wedged multiplexing master exits instead of
 # hanging every later call; ControlPersist lets an idle master exit on its own even if session cleanup
-# never runs. A stale socket left by a killed master is unlinked automatically by ControlMaster=auto.
+# never runs (cleanup stops it at session end; an hour keeps it across normal pauses, since reopening
+# it costs a full SSH handshake on every first call after the idle period). A stale socket left by a killed master is unlinked automatically by ControlMaster=auto.
 set -- -F "$ssh_config" -T \
   -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 \
   -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o Compression=yes
 if [ "$use_mux" = 1 ] && [ -n "$control_path" ] && control_path_usable "$control_path"; then
-  set -- "$@" -o ControlMaster=auto -o "ControlPath=$control_path" -o ControlPersist=300
+  set -- "$@" -o ControlMaster=auto -o "ControlPath=$control_path" -o ControlPersist=3600
 else
   set -- "$@" -o ControlMaster=no -o ControlPath=none
 fi

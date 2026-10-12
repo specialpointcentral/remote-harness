@@ -52,9 +52,10 @@
 
 ## 内部 Git 与搜索
 
-- Agent 内部发起的 `git`/`rg` 调用不经过 PreToolUse hook。会话 PATH 垫片只把工作区扫描
-  （`status`、`diff`、`log`、`ls-files`、`grep`、`rg` 等）路由到项目主机，路径发现命令
-  （`rev-parse`、`config` 等）保留在远端执行。
+- Agent 内部发起的 `git`/`rg` 调用不经过 PreToolUse hook。会话 PATH 垫片把工作区扫描
+  （`status`、`diff`、`log`、`ls-files`、`grep`、`rg` 等）和只读的仓库发现命令（`rev-parse`、
+  `config --get`、`branch --show-current`、`symbolic-ref` 等）路由到项目主机，并把发现命令输出中
+  项目主机的绝对路径映射回挂载点；会写入的 git 调用留在远端执行。
 - 挂载点之外、或指定了其它仓库/index 的调用，原样执行真实工具。
 - 无法连到项目主机的路由调用必须以非零退出；绝不报告 clean 或无匹配，也不回退为扫描 SSHFS。
   只有可达的项目主机明确答复"未安装该工具"时，本会话此后才改用远端的该工具。

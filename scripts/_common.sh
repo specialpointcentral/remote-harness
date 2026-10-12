@@ -54,7 +54,9 @@ STEP_N="${RH_STEP_BASE:-0}" STEP_TOTAL=0 STEP_LABEL="" STEP_T0=0 STEP_SPIN_PID="
 step_tty() { [ -t 1 ] && [ -z "${RH_NO_PROGRESS:-}" ] && [ "${TERM:-dumb}" != dumb ]; }
 step_stop_spinner() {
   [ -n "$STEP_SPIN_PID" ] || return 0
-  kill "$STEP_SPIN_PID" 2>/dev/null || true
+  # SIGKILL: the spinner needs no cleanup, and a trapped TERM in a subshell makes macOS bash 3.2
+  # print "run_pending_traps: bad value in trap_list" warnings.
+  kill -KILL "$STEP_SPIN_PID" 2>/dev/null || true
   wait "$STEP_SPIN_PID" 2>/dev/null || true
   STEP_SPIN_PID=""
   printf '\r\033[K'
@@ -62,13 +64,12 @@ step_stop_spinner() {
 step_spin() {  # draw the current step until stopped; exits on its own if the main shell dies
   local _prefix="[$STEP_N/$STEP_TOTAL]"
   (
-    trap 'exit 0' TERM
     _owner=$$ _i=0 _frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
     while kill -0 "$_owner" 2>/dev/null; do
       printf "\r\033[K  %s ${_C}%s${_0} %s…  ${_D}%ss${_0}" "$_prefix" "${_frames[$_i]}" "$STEP_LABEL" "$((SECONDS - STEP_T0))"
       _i=$(( (_i + 1) % 10 )); sleep 0.15
     done
-  ) &
+  ) 2>/dev/null &
   STEP_SPIN_PID=$!
 }
 # Freeze a running spinner into a static line. Only the main shell owns the spinner; output from a

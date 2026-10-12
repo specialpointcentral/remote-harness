@@ -123,13 +123,15 @@ ssh_uses_session_config() {
 # (TCP + key exchange + authentication). Once the session config exists, a multiplexing master carries
 # those calls instead; until its socket appears they simply connect directly. It is passed on the
 # command line only (generated ssh_config files keep ControlMaster no) and lives under a short /tmp
-# path because macOS limits socket path length. The reverse tunnel (-N, it owns the RemoteForward)
-# and control commands (-O, -M) keep their own connection; callers pass those flags as separate words.
+# path because macOS limits socket path length. The reverse tunnel (-N, it owns the RemoteForward),
+# control commands (-O, -M) and the interactive agent session (-t/-tt: a multiplexed session from
+# macOS was seen to get a 0x0 pty, which leaves the agent's TUI unable to redraw) keep their own
+# connection; callers pass those flags as separate words.
 SETUP_MUX_DIR=""
 ssh() {
   if ssh_uses_session_config "$@"; then
     case " $* " in
-      *" -N "*|*" -O "*|*" -M "*) ;;
+      *" -N "*|*" -O "*|*" -M "*|*" -t "*|*" -tt "*) ;;
       *) if [ -S "$SETUP_MUX_DIR/m" ]; then
            command ssh -F "$LOCAL_SSH_CONFIG" -o ControlMaster=no -o "ControlPath=$SETUP_MUX_DIR/m" "$@"
            return
@@ -1132,9 +1134,61 @@ sep
 # The simple bootstrap path runs this script from a pipe (`ssh cat ... | bash -s`), so stdin is not
 # a terminal even though the user has a controlling tty. Attach the final interactive ssh to
 # /dev/tty explicitly; otherwise OpenSSH refuses to allocate a pty and TUI agents fail immediately.
+# Shown by the remote side before the agent takes over the terminal (this script can no longer print
+# once ssh -tt owns it). The prewarm reads, in parallel, the metadata an agent probes one by one at
+# startup (.git HEAD/config/refs, the tracked upstream ref, .mcp.json, CLAUDE.md, .claude settings,
+# ...), including files that do not exist, so the SSHFS lookup cache already holds those answers when
+# the agent starts. In the background it also runs a no-op routed command, which opens the session's
+# multiplexing master to the project host (one SSH handshake, ~5s on a slow link) before the agent's
+# first routed git/rg/Bash call needs it. POSIX sh; every step is best effort.
+remote_launch_prelude() {
+  local _conn _warming _warm _start
+  _conn=$(tr2 "Remote session connected" "远端会话已连接")
+  _warming=$(tr2 "Prewarming project metadata (.git, settings files)" "正在预热项目元数据（.git、设置文件）")
+  _warm=$(tr2 "Prewarmed project metadata (.git, settings files)" "预热项目元数据（.git、设置文件）")
+  _start=$(tr2 "Starting ${LAUNCH_BASE} (a folder used for the first time asks whether you trust it)..." \
+               "启动 ${LAUNCH_BASE}（第一次进入的目录会先询问是否信任）…")
+  cat <<EOF
+printf '  \342\234\223 %s\n' $(sq "$_conn")
+rh_t0=\$(date +%s)
+rh_spin() {
+  set -- ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+  while :; do for rh_c in "\$@"; do
+    printf "\\r\\033[K  \$rh_c %s...  %ss" $(sq "$_warming") "\$((\$(date +%s) - rh_t0))"; sleep 0.15
+  done; done
+}
+rh_sp=""
+if [ -t 1 ]; then rh_spin & rh_sp=\$!; fi
+$( [ -n "$REMOTE_SESSION_DIR" ] && printf '%s
+' "[ ! -x $(sq "$REMOTE_SESSION_DIR/bin/rh-run") ] || $(sq "$REMOTE_SESSION_DIR/bin/rh-run") Lg== dHJ1ZQ== >/dev/null 2>&1 </dev/null &" )
+rh_warm() {  # parallel reads; waits for exactly these readers, never for the spinner
+  rh_pids=""
+  for rh_f in "\$@"; do cat -- "\$rh_f" >/dev/null 2>&1 & rh_pids="\$rh_pids \$!"; done
+  wait \$rh_pids 2>/dev/null
+}
+ls -A .git/refs/heads .git/refs/remotes .git/refs/remotes/* .claude >/dev/null 2>&1 &
+rh_warm .git/HEAD .git/config .git/packed-refs .git/commondir .git/info/exclude .mcp.json CLAUDE.md CLAUDE.local.md AGENTS.md .gitignore .claude/settings.json .claude/settings.local.json
+rh_b=\$(sed -n 's#^ref: refs/heads/##p' .git/HEAD 2>/dev/null)
+rh_up=\$(awk -v b="\$rh_b" '/^\[/ { s = (\$0 == "[branch \"" b "\"]") } s && \$1 == "remote" { r = \$3 } s && \$1 == "merge" { m = \$3; sub("^refs/heads/", "", m) } END { if (r != "" && m != "") print r "/" m }' .git/config 2>/dev/null)
+rh_warm ".git/refs/heads/\$rh_b" ".git/refs/remotes/origin/\$rh_b" ".git/refs/remotes/\$rh_up" .git/refs/remotes/origin/HEAD
+if [ -n "\$rh_sp" ]; then kill -9 "\$rh_sp" 2>/dev/null; wait "\$rh_sp" 2>/dev/null; printf '\r\033[K'; fi
+printf '  \342\234\223 %s  %ss\n' $(sq "$_warm") "\$((\$(date +%s) - rh_t0))"
+printf '  \342\213\257 %s\n' $(sq "$_start")
+EOF
+}
 launch_remote_agent() {
   local _remote_cmd _rc
-  _remote_cmd="cd $(sq "$REMOTE_MOUNTPOINT") && exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
+  _remote_cmd="cd $(sq "$REMOTE_MOUNTPOINT") || exit 1
+$(remote_launch_prelude)
+exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
+  # Also hand the local terminal size to the remote pty, so the agent never starts on a 0x0 terminal.
+  local _size _rows _cols
+  _size=$(stty size 2>/dev/null </dev/tty) || _size=""
+  _rows=${_size% *} _cols=${_size#* }
+  case "$_rows$_cols" in ''|*[!0-9]*) ;; *)
+    [ "$_rows" -gt 0 ] && [ "$_cols" -gt 0 ] && _remote_cmd="stty rows $_rows cols $_cols 2>/dev/null; $_remote_cmd" ;;
+  esac
+  say "  ${_C}⋯${_0} $(tr2 "Connecting the remote session..." "正在连接远端会话…")"
   if { exec 3</dev/tty; } 2>/dev/null; then
     ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd" <&3
     _rc=$?

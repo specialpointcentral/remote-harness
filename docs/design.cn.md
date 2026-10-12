@@ -21,8 +21,8 @@ forward/本机 Agent 模式已禁用；兼容入口在执行任何工作前失�
 
 远端文件工具 -> SSHFS -> 本机项目文件
 远端 Bash     -> Claude/Codex hook 或 opencode plugin -> rh-run -> forced gateway -> 本机项目命令
-远端 git/rg   -> 会话 PATH 垫片 -> （工作区扫描）forced gateway 工具动词 -> 本机 git/rg
-                               -> （路径发现 / 挂载点外）远端 git/rg
+远端 git/rg   -> 会话 PATH 垫片 -> （扫描 / 只读发现）forced gateway 工具动词 -> 本机 git/rg
+                               -> （写操作 / 挂载点外）远端 git/rg
 远端 Agent 工具 -> 远端 subagent 进程，绝不导向本机
 ```
 
@@ -66,7 +66,13 @@ PATH 垫片（`project-host-tool.py`）。在 SSHFS 上，这类扫描的每次 
 
 - 路由：有效 cwd 在挂载点内时的 `git status|diff|diff-files|diff-index|diff-tree|log|show|shortlog|
   whatchanged|ls-files|ls-tree|grep|blame|rev-list` 和 `rg`；
-- 留在远端：路径发现（`rev-parse`、`config`、`branch` 等）、写操作、设置了
+- 路由并映射输出：只读发现命令（`rev-parse`、`config --get/--list`、列出用的 `branch`、
+  `symbolic-ref`、`show-ref`、`for-each-ref`、`describe`、`merge-base`、`cat-file`、`remote -v`、
+  `worktree list` 等）。在 SSHFS 上，每条都要逐个往返读取十几个 `.git` 文件（慢速链路上每条 5–20
+  秒，Agent 在首次提示前就会执行好几条）；输出中出现在路径边界上的项目主机根路径都会映射回挂载点
+  （如 `<path>  <sha> [branch]`、`worktree <path>`），而 rg 的输出只改写每条记录开头的路径，因为其余
+  部分可能是文件内容；
+- 留在远端：会写入的发现命令形式（`config key value`、`branch -d` 等）、其它写操作、设置了
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` 的调用、`--stdin`/`--batch`，以及参数里出现挂载点外
   已存在的远端路径。在挂载点上远端执行的 git 会带上 `-c core.checkStat=minimal
   -c core.trustctime=false`，避免项目主机写入的 index 迫使逐个读取文件内容；
@@ -80,7 +86,7 @@ PATH 垫片（`project-host-tool.py`）。在 SSHFS 上，这类扫描的每次 
   master 重试一次，之后以非零退出，绝不表现为 clean 或无匹配；
 - 项目主机可达但答复未安装该工具时（例如 Mac 未装 ripgrep），本会话记录一次，此后该工具在远端
   经挂载点执行。这样 Claude 的 Grep/Glob 仍可用；这不属于传输失败后的回退；
-- 路由调用读取项目主机的 Git 配置（全局 excludes、`core.autocrlf` 等），留在远端的路径发现读取
+- 路由调用读取项目主机的 Git 配置（全局 excludes、`core.autocrlf` 等），留在远端的 git 读取
   远端用户的全局配置和共享的仓库 `.git/config`。因此仓库级设置一致，用户级设置可能不同。
 
 ## 连接

@@ -2,10 +2,11 @@
 """Session PATH shim that runs IO-heavy git/rg calls on the project host.
 
 The agent host sees the project through SSHFS, where every lstat, readdir, and file read crosses the
-reverse tunnel. Work-tree scans (`git status`, `git diff`, `rg`) are therefore routed to the project
-host through the forced gateway's `remote-harness-tool` verb, while lightweight and path-discovery
-commands (`git rev-parse`, `git config`, ...) keep their agent-host semantics so the project root and
-memory paths seen by the agent never change.
+reverse tunnel. Work-tree scans (`git status`, `git diff`, `rg`) and read-only repository discovery
+(`git rev-parse`, `git config --get`, ...) are therefore routed to the project host through the
+forced gateway's `remote-harness-tool` verb. Absolute project-host paths in discovery output are
+mapped back to the mount, so the project root and memory paths seen by the agent never change. git
+calls that write keep running on the agent host.
 
 Calls outside the mount run the real tool unchanged. A routed call that cannot reach the project host
 fails with a non-zero status; it never falls back to a silent success, a clean status, or "no match".
@@ -45,6 +46,52 @@ GIT_ROUTED_SUBCOMMANDS = {
     "status",
     "whatchanged",
 }
+# Read-only repository discovery. Over SSHFS each of these reads a dozen .git files one round trip
+# at a time (5-20 s per call on a slow link), and agents run several before their first prompt, so
+# they run on the project host too; absolute project-host paths in their output are mapped back to
+# the mount. Commands whose arguments make them write stay on the agent host.
+GIT_DISCOVERY_SUBCOMMANDS = {
+    "branch",
+    "cat-file",
+    "config",
+    "count-objects",
+    "describe",
+    "for-each-ref",
+    "merge-base",
+    "name-rev",
+    "remote",
+    "rev-parse",
+    "show-ref",
+    "symbolic-ref",
+    "var",
+    "worktree",
+}
+GIT_CONFIG_READS = {"-l", "--list", "--get-color", "--get-colorbool"}  # plus --get*, and get/list verbs
+GIT_BRANCH_WRITES = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f",
+                     "--force", "-u", "--set-upstream-to", "--unset-upstream", "--edit-description",
+                     "--track", "--no-track", "-t", "--create-reflog"}
+
+
+def git_discovery_reads(subcommand: str, rest: list[str]) -> bool:
+    """True when a discovery subcommand only reads the repository."""
+    positional = [arg for arg in rest if not arg.startswith("-")]
+    if subcommand == "config":
+        if rest[:1] in (["get"], ["list"]):
+            return True
+        return any(arg in GIT_CONFIG_READS or arg.startswith("--get") for arg in rest)
+    if subcommand == "branch":
+        if any(arg in GIT_BRANCH_WRITES or arg.startswith("--set-upstream-to=") for arg in rest):
+            return False
+        return not positional or "-l" in rest or "--list" in rest
+    if subcommand == "symbolic-ref":
+        return len(positional) <= 1 and not {"-d", "--delete"} & set(rest)
+    if subcommand == "remote":
+        return not rest or rest[0] in ("-v", "--verbose", "get-url")
+    if subcommand == "worktree":
+        return rest[:1] == ["list"]
+    return True
+
+
 GIT_PASSTHROUGH_GLOBALS = {
     "--glob-pathspecs",
     "--icase-pathspecs",
@@ -103,6 +150,7 @@ class Context:
         self.root = args.project_root.rstrip("/") or "/"
         self.used_mount = self.mount_real
         self.touches_mount = False
+        self.rewrite_output = False  # discovery output names project-host paths
 
     def inside(self, path: str) -> bool:
         real = os.path.realpath(path)
@@ -215,15 +263,18 @@ def git_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
         if arg.startswith("-"):
             raise StayLocal()
         break
-    if i >= len(argv) or argv[i] not in GIT_ROUTED_SUBCOMMANDS:
+    subcommand = argv[i] if i < len(argv) else ""
+    rest = argv[i + 1:]
+    discovery = subcommand in GIT_DISCOVERY_SUBCOMMANDS and git_discovery_reads(subcommand, rest)
+    if subcommand not in GIT_ROUTED_SUBCOMMANDS and not discovery:
         if ctx.inside(effective):
             ctx.touches_mount = True
         raise StayLocal()
     if not ctx.inside(effective):
         raise StayLocal()
     ctx.touches_mount = True
-    subcommand = argv[i]
-    rest = argv[i + 1:]
+    ctx.rewrite_output = discovery
+    ctx.used_mount = ctx.mount_prefix(os.path.abspath(effective)) or ctx.mount_real
     for arg in rest:
         if arg.startswith(GIT_LOCAL_ARGS) or arg == "--no-index":
             raise StayLocal()
@@ -257,13 +308,21 @@ def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
 
 
 class OutputRewriter:
-    """Rewrite project-host path prefixes back to the mount at the start of each output record."""
+    """Rewrite project-host paths back to the mount in each output record.
 
-    def __init__(self, old: str, new: str, json_mode: bool) -> None:
+    rg records start with a path and may contain file text, so only that leading path is rewritten.
+    git discovery output carries paths after labels or before columns (`worktree <path>`,
+    `<path>  <sha> [branch]`), so with `anywhere` every occurrence on a path boundary is rewritten.
+    """
+
+    def __init__(self, old: str, new: str, json_mode: bool, anywhere: bool = False) -> None:
         self.enabled = old != new
         self.old = os.fsencode(old)
         self.new = os.fsencode(new)
         self.json_mode = json_mode
+        self.anywhere = re.compile(
+            rb"(?:(?<=^)|(?<=[\s:=]))" + re.escape(self.old) + rb"(?=$|[/\s:])"
+        ) if anywhere else None
         if json_mode:
             import json
 
@@ -274,6 +333,8 @@ class OutputRewriter:
     def _record(self, record: bytes) -> bytes:
         if self.json_mode:
             return record.replace(b'"' + self.old_json, b'"' + self.new_json)
+        if self.anywhere is not None:
+            return self.anywhere.sub(lambda _match: self.new, record)
         if record.startswith(self.old):
             tail = record[len(self.old):len(self.old) + 1]
             if tail in (b"", b"/", b":"):
@@ -409,9 +470,10 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
     json_mode = args.tool == "rg" and "--json" in routed
 
     def rewriter() -> OutputRewriter:
-        # git output is repository-relative; only rg echoes the (translated) absolute search paths.
-        target = ctx.used_mount if args.tool == "rg" else ctx.root
-        return OutputRewriter(ctx.root, target, json_mode)
+        # git scan output is repository-relative; rg and git discovery (rev-parse --show-toplevel,
+        # worktree list, ...) print absolute project-host paths that must name the mount again.
+        target = ctx.used_mount if args.tool == "rg" or ctx.rewrite_output else ctx.root
+        return OutputRewriter(ctx.root, target, json_mode, anywhere=ctx.rewrite_output)
 
     try:
         limit = max(1, int(os.environ.get("RH_TOOL_CONCURRENCY") or args.concurrency))

@@ -7,13 +7,16 @@
 - `simple-laptop-setup.sh`：本地 reverse 向导。记住的远端挂载点只在对应的项目目录下作为默认值；
   其它情况默认 auto（`~/.remote-harness/mounts/<项目目录名>`）。
 - `laptop-setup.sh`：建立反向隧道、forced 授权、挂载、远端 Agent 和清理。本机检查完成后建立一条只通过
-  命令行参数启用的复用主连接（短路径 `/tmp/rh.*` socket，`ControlPersist=300`），后续 setup 调用、
-  启动 Agent 和清理都复用它，省去每次 SSH 握手；反向隧道仍使用独立连接。
+  命令行参数启用的复用主连接（短路径 `/tmp/rh.*` socket，`ControlPersist=300`），后续 setup 调用和
+  清理都复用它，省去每次 SSH 握手；反向隧道和交互式 Agent 会话仍使用独立连接，启动前还会把本机终端
+  尺寸设置到远端 pty 上。
 - `simple-local-setup.sh`、`local-setup.sh`：拒绝本机 Agent 的兼容 stub。
 - `setup-tunnel.sh`：创建远端会话 SSH config 和每会话 key。
 - `check-tunnel.sh`：通过 `remote-harness-health` 检查 forced gateway。
-- `mount-project.sh`：在远端 Agent 主机通过 SSHFS 挂载本机项目。sshfs 支持时使用 `max_conns=4` 个并行 SFTP
-  连接（`RH_SSHFS_MAX_CONNS` 可调，设为 `1` 关闭），避免一次长扫描让其它文件请求都排队。挂载解除后如果 sshfs 进程没有退出，
+- `mount-project.sh`：在远端 Agent 主机通过 SSHFS 挂载本机项目，默认只用一条 SFTP 连接（`RH_SSHFS_MAX_CONNS`
+  设为大于 1 时，在 sshfs 支持的情况下启用并行连接；在约 360ms 的线路上实测，它会让并发查询慢约 7 倍）；libfuse 版 sshfs
+  还会在内核里缓存路径查找、文件属性和「文件不存在」的结果 `RH_SSHFS_CACHE_SECONDS` 秒（默认 20，设为 `0`
+  关闭），因为 Agent 会反复探测同一批 `.git` 路径；`auto_cache` 让未变化的文件内容在多次打开之间保持缓存。挂载解除后如果 sshfs 进程没有退出，
   只有在没有进程使用该挂载点，并且满足以下之一时才会结束它：正常卸载成功（内核已确认没有打开的文件，等 1 秒），
   或 sshfs 自身在 `RH_SSHFS_IDLE_SECONDS`（默认 3）秒内没有任何 I/O 进展（其 ssh 连接的 keepalive 不计入），之后其 sftp ssh 会因 EOF 自行退出；
   仍在刷写数据的 sshfs 不会被打断（等待上限由 `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc`
@@ -33,7 +36,8 @@
 - `channel-guard.py`：远端有 python3 时包装会话 Bash runner，命令运行期间一直持有 SSH 通道，
   使项目主机在取消或断线时终止命令树。
 - `project-host-tool.py`：远端会话的 `git`、`rg` PATH 垫片。挂载点内的工作区扫描在项目主机执行，
-  路径双向翻译；路径发现命令和挂载点外的调用使用远端真实工具。路由调用共享并发上限
+  只读发现命令（`rev-parse`、`config --get` 等）也在项目主机执行，路径双向翻译；会写入的 git 调用和挂载点外的
+  调用使用远端真实工具。路由调用共享并发上限
   （`RH_TOOL_CONCURRENCY`，默认 6），传输失败时不经复用 master 重试一次，否则以非零退出。
 - `session-reaper.sh`：远端每会话 watcher 加启动时 GC。Agent 进程消失（或其终端已挂断）时，
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录

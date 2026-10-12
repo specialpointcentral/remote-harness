@@ -22,8 +22,8 @@ local bootstrap
 
 remote file tools -> SSHFS -> local project files
 remote Bash       -> Claude/Codex hook or opencode plugin -> rh-run -> forced gateway -> local command
-remote git/rg     -> session PATH shim -> (work-tree scan) forced gateway tool verb -> local git/rg
-                                      -> (path discovery / outside mount) remote git/rg
+remote git/rg     -> session PATH shim -> (scan / read-only discovery) forced gateway tool verb -> local git/rg
+                                      -> (writes / outside mount) remote git/rg
 remote Agent tool -> remote subagent process (never routed locally)
 ```
 
@@ -75,7 +75,14 @@ project host:
 
 - routed: `git status|diff|diff-files|diff-index|diff-tree|log|show|shortlog|whatchanged|ls-files|
   ls-tree|grep|blame|rev-list` and `rg`, when the effective cwd is inside the mount;
-- kept remote: path discovery (`rev-parse`, `config`, `branch`, ...), writes, calls with
+- routed with output mapping: read-only discovery (`rev-parse`, `config --get/--list`, listing
+  `branch`, `symbolic-ref`, `show-ref`, `for-each-ref`, `describe`, `merge-base`, `cat-file`,
+  `remote -v`, `worktree list`, ...). Over SSHFS each reads a dozen `.git` files one round trip at a
+  time (5-20 s per call on a slow link, and agents run several before their first prompt); the
+  project-host root is mapped back to the mount wherever it appears on a path boundary in the output
+  (`<path>  <sha> [branch]`, `worktree <path>`, ...), while rg output is rewritten only at the start
+  of each record because the rest may be file text;
+- kept remote: discovery forms that write (`config key value`, `branch -d`, ...), other writes, calls with
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`, `--stdin`/`--batch`, and arguments naming existing
   remote paths outside the mount. Remote git on the mount gets `-c core.checkStat=minimal
   -c core.trustctime=false` so an index written on the project host does not force content reads;
@@ -92,8 +99,8 @@ project host:
   ripgrep) is recorded once per session, and that tool then runs on the remote host over the mount.
   This keeps Claude's Grep/Glob working; it is not a transport fallback;
 - routed calls read the project host's Git configuration (global excludes, `core.autocrlf`, ...),
-  while path discovery kept remote reads the remote user's global configuration plus the shared
-  repository `.git/config`. Repository-level settings therefore agree; user-level ones may differ.
+  while git kept remote reads the remote user's global configuration plus the shared repository
+  `.git/config`. Repository-level settings therefore agree; user-level ones may differ.
 
 ## Connections
 

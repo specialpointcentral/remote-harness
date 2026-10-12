@@ -344,16 +344,28 @@ assert_grep <(printf '%s\n' "$hardened_status") "?? src/new.txt" "shim routes gi
 : > "$shim_log"
 (cd "$tool_mount" && GIT_CONFIG_PARAMETERS="'unbalanced" run_shim git "$(command -v git)" "" status) >/dev/null 2>&1 || true
 [ ! -s "$shim_log" ] || fail "shim routed git with an unparsable GIT_CONFIG_PARAMETERS"
-if (cd "$tool_mount" && run_shim git "$(command -v git)" "" rev-parse --show-toplevel) >/dev/null 2>&1; then
-  fail "shim routed path discovery (rev-parse) instead of keeping agent-host semantics"
-fi
-[ ! -s "$shim_log" ] || fail "shim contacted the project host for git rev-parse"
+# Read-only discovery runs on the project host, and its absolute paths name the mount again.
+shim_top=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" rev-parse --show-toplevel)
+assert_eq "shim maps rev-parse --show-toplevel back to the mount" "$shim_top" "$tool_mount"
+for shim_wt in "worktree list" "worktree list --porcelain"; do
+  # shellcheck disable=SC2086
+  shim_wt_out=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" $shim_wt)
+  case "$shim_wt_out" in *"$tool_proj"*|"") fail "git $shim_wt leaked the project-host path: $shim_wt_out";; esac
+  assert_grep <(printf '%s\n' "$shim_wt_out") "$tool_mount" "git $shim_wt names the mount"
+done
+assert_grep "$shim_log" "remote-harness-tool" "shim routes read-only git discovery"
+: > "$shim_log"
+for shim_write in "config user.name tester" "branch -D no-such-branch" "symbolic-ref HEAD refs/heads/x"; do
+  # shellcheck disable=SC2086
+  (cd "$tool_mount" && run_shim git "$(command -v git)" "" $shim_write) >/dev/null 2>&1 || true
+done
+[ ! -s "$shim_log" ] || fail "shim routed a git command that writes"
 outside_version=$(cd "$router_tmp" && run_shim git "$(command -v git)" "" --version)
 assert_eq "shim leaves git outside the mount alone" "$outside_version" "$(git --version)"
 [ ! -s "$shim_log" ] || fail "shim contacted the project host for a call outside the mount"
-local_cfg=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" config --get core.checkStat || true)
+local_cfg=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" config core.checkStat || true)
 assert_eq "local git on the mount gets process-level checkStat" "$local_cfg" "minimal"
-outside_cfg=$(cd "$router_tmp" && run_shim git "$(command -v git)" "" config --get core.checkStat || true)
+outside_cfg=$(cd "$router_tmp" && run_shim git "$(command -v git)" "" config core.checkStat || true)
 assert_eq "git outside the mount keeps its own config" "$outside_cfg" ""
 
 # Transport failure: retry once without multiplexing, then fail loudly (never clean / no-match).
@@ -437,7 +449,7 @@ chmod +x "$mux_bin/ssh"
 PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
   --alias project-host --project-root "$router_tmp/project" --control-path /tmp/rh-mux-test \
   --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
-for mux_opt in ControlMaster=auto ControlPath=/tmp/rh-mux-test ControlPersist=300 \
+for mux_opt in ControlMaster=auto ControlPath=/tmp/rh-mux-test ControlPersist=3600 \
     ServerAliveInterval=10 ServerAliveCountMax=3 ConnectTimeout=10 BatchMode=yes; do
   assert_grep "$router_tmp/mux-ssh.args" "-o $mux_opt" "client ssh option $mux_opt"
 done
@@ -1191,6 +1203,15 @@ case " $* " in  # a multiplexing master request leaves a real socket behind, as 
     mux=$(printf '%s\n' "$@" | sed -n 's/^ControlPath=//p' | head -1)
     python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$mux"; exit 0;;
 esac
+# Run the interactive launch command in a fake project; SHELL=/bin/echo prints the agent command
+# instead of starting it.
+case " $* " in
+  *" -tt "*)
+    if [ -n "${LAUNCH_DIR:-}" ]; then
+      eval "rcmd=\${$#}"
+      SHELL=/bin/echo sh -c "${rcmd//\/tmp\/rh-remote/$LAUNCH_DIR}" > "$LAUNCH_DIR.out" 2>&1
+    fi;;
+esac
 for arg in "$@"; do
   case "$arg" in
     *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*)
@@ -1232,8 +1253,12 @@ file_project="$tmp/not-a-dir"
 auth_keys_snapshot="$tmp/authorized_keys.snapshot"
 mkdir -p "$proj_home" "$valid_project"
 printf 'x\n' > "$file_project"
+launch_dir="$tmp/launch-project"
+mkdir -p "$launch_dir/.git/refs/heads"
+printf 'ref: refs/heads/main\n' > "$launch_dir/.git/HEAD"
+printf '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n' > "$launch_dir/.git/config"
 HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
-  AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" \
+  AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" LAUNCH_DIR="$launch_dir" \
   bash "$ROOT/scripts/laptop-setup.sh" \
     --host example.com --port 32023 --via "ssh user@example.com" \
     --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
@@ -1245,9 +1270,15 @@ assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse auth
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
 assert_grep "$tmp/project-valid.out" "project host: git found" "launch preflight reports the project-host git"
 assert_grep "$tmp/project-valid.out" "[2/6] ✓ Establishing the reverse tunnel" "connection steps report progress"
+assert_grep "$tmp/project-valid.out" "Connecting the remote session" "launch announces the remote connection"
+assert_grep "$launch_dir.out" "Remote session connected" "remote prelude reports the connected session"
+assert_grep "$launch_dir.out" "Prewarmed project metadata" "remote prelude prewarms project metadata"
+assert_grep "$launch_dir.out" "-lic codex" "remote prelude still execs the agent"
+assert_grep "$ssh_log" "/bin/rh-run' Lg== dHJ1ZQ==" "remote prelude opens the routed-command master before the agent starts"
 assert_grep "$tmp/project-valid.out" "[2/3] ✓ Waiting for sshfs to flush and exit" "exit cleanup reports progress steps"
 assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
-assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -tt " "setup calls reuse the multiplexing master"
+assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -n " "setup calls reuse the multiplexing master"
+refute_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -tt " "the interactive agent session must keep its own connection"
 assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
 ! sh "$ROOT/scripts/run-on-project-host.sh" --find-tool rh-no-such-tool >/dev/null 2>&1 || fail "--find-tool reported a missing tool"
@@ -1538,7 +1569,7 @@ RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$t
 
 bash "$ROOT/tests/resources.sh"
 
-# --- mount-project.sh: parallel SFTP connections only where sshfs supports them ---------------
+# --- mount-project.sh: opt-in parallel SFTP connections, kernel lookup caching ----------------
 mc_bin="$tmp/mc-bin"; mc_log="$tmp/mc-sshfs.log"; mkdir -p "$mc_bin" "$tmp/mc-mount"; : > "$tmp/mc-ssh_config"
 printf '#!/bin/sh\nif [ "$1" = --help ]; then [ -n "$MC_NO_MAX" ] || echo "-o max_conns=N"; exit 0; fi\necho "$*" > %s\nexit 1\n' \
   "'$mc_log'" > "$mc_bin/sshfs"; chmod +x "$mc_bin/sshfs"
@@ -1548,10 +1579,16 @@ mc_opts() {  # prints the arguments mount-project passed to (fake) sshfs
     --ssh-config "$tmp/mc-ssh_config" --mountpoint "$tmp/mc-mount" >/dev/null 2>&1 || true
   cat "$mc_log"
 }
-case "$(mc_opts)" in *max_conns=4*) ;; *) fail "sshfs was not mounted with max_conns=4 by default";; esac
-mc_off="$(RH_SSHFS_MAX_CONNS=1 mc_opts)"; mc_unsupported="$(MC_NO_MAX=1 mc_opts)"
-[ -n "$mc_off" ] && [ -n "$mc_unsupported" ] || fail "fake sshfs was not invoked"
-case "$mc_off$mc_unsupported" in *max_conns*) fail "max_conns passed when disabled or unsupported";; esac
+mc_default="$(mc_opts)"
+case "$mc_default" in *max_conns*) fail "sshfs used parallel SFTP connections by default";; esac
+case "$(RH_SSHFS_MAX_CONNS=4 mc_opts)" in *max_conns=4*) ;; *) fail "RH_SSHFS_MAX_CONNS=4 did not enable max_conns";; esac
+if [ "$(uname -s)" != Darwin ]; then
+  case "$mc_default" in *entry_timeout=20,attr_timeout=20,negative_timeout=20,auto_cache*) ;; *) fail "sshfs lookups and contents are not cached by default";; esac
+  case "$(RH_SSHFS_CACHE_SECONDS=0 mc_opts)" in *negative_timeout*|*auto_cache*) fail "RH_SSHFS_CACHE_SECONDS=0 still cached";; esac
+fi
+mc_unsupported="$(MC_NO_MAX=1 RH_SSHFS_MAX_CONNS=4 mc_opts)"
+[ -n "$mc_unsupported" ] || fail "fake sshfs was not invoked"
+case "$mc_unsupported" in *max_conns*) fail "max_conns passed to an sshfs that does not support it";; esac
 
 # --- mount-project.sh: a detached sshfs is stopped only when unused and idle -------------------
 if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then

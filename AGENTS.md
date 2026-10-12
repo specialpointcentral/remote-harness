@@ -56,8 +56,10 @@ it provides files over SSHFS and executes project commands through a forced gate
 ## Internal Git And Search
 
 - Agent-internal `git`/`rg` calls never pass through PreToolUse hooks. Session PATH shims route
-  only work-tree scans (`status`, `diff`, `log`, `ls-files`, `grep`, `rg`, ...) to the project host
-  and keep path discovery (`rev-parse`, `config`, ...) on the remote host.
+  work-tree scans (`status`, `diff`, `log`, `ls-files`, `grep`, `rg`, ...) and read-only repository
+  discovery (`rev-parse`, `config --get`, `branch --show-current`, `symbolic-ref`, ...) to the project
+  host, mapping absolute project-host paths in discovery output back to the mount; git calls that
+  write stay on the remote host.
 - Calls outside the mount, or naming another repository/index, run the real tool unchanged.
 - A routed call that cannot reach the project host fails non-zero; it never reports clean or
   no-match and never falls back to scanning SSHFS. Only an explicit "tool not installed" answer

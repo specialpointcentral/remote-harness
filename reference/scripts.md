@@ -6,14 +6,18 @@
   project it was chosen for; otherwise the default is auto (`~/.remote-harness/mounts/<project dir name>`).
 - `laptop-setup.sh`: creates the reverse tunnel, forced authorization, mount, remote agent, and cleanup.
   After the local checks it opens a command-line-only multiplexing master (short `/tmp/rh.*` socket,
-  `ControlPersist=300`) so later setup calls, the agent launch, and cleanup skip the per-connection
-  SSH handshake; the reverse tunnel keeps its own connection.
+  `ControlPersist=300`) so later setup calls and cleanup skip the per-connection SSH handshake; the
+  reverse tunnel and the interactive agent session keep their own connections, and the agent's remote
+  pty is given the local terminal size before launch.
 - `simple-local-setup.sh`, `local-setup.sh`: compatibility stubs that reject local-agent execution.
 - `setup-tunnel.sh`: creates remote session SSH config and a per-session key.
 - `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`.
-- `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS, with
-  `max_conns=4` parallel SFTP connections where sshfs supports it (`RH_SSHFS_MAX_CONNS`, `1` disables)
-  so a long scan does not queue every other file request. An sshfs daemon that outlives its unmount is
+- `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS over one SFTP
+  connection (`RH_SSHFS_MAX_CONNS>1` opts into parallel connections where sshfs supports them; on a
+  ~360ms link they made concurrent lookups about 7x slower), and (libfuse sshfs) caches lookups,
+  attributes and "no such file" answers in the kernel for `RH_SSHFS_CACHE_SECONDS` (default 20, `0`
+  disables), because agents repeatedly probe the same `.git` paths; `auto_cache` keeps unchanged file
+  contents across opens. An sshfs daemon that outlives its unmount is
   stopped only when nothing uses the mountpoint and either the unmount was clean (1s grace: the kernel
   already confirmed no open files) or the daemon itself has made no I/O progress for
   `RH_SSHFS_IDLE_SECONDS` (default 3; its ssh connections' keepalives do not count); its sftp ssh then
@@ -35,8 +39,8 @@
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
   open while the command runs so the project host stops the command tree on cancel or disconnect.
 - `project-host-tool.py`: remote session PATH shim for `git` and `rg`. Work-tree scans inside the
-  mount run on the project host with paths translated both ways; path discovery and calls outside the
-  mount run the real remote tool. Routed calls share a concurrency cap (`RH_TOOL_CONCURRENCY`,
+  mount and read-only discovery (`rev-parse`, `config --get`, ...) run on the project host with paths
+  translated both ways; git calls that write and calls outside the mount run the real remote tool. Routed calls share a concurrency cap (`RH_TOOL_CONCURRENCY`,
   default 6), retry once without the multiplexing master on a transport failure, and otherwise fail
   non-zero.
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is

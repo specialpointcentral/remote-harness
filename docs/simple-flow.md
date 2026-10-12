@@ -91,6 +91,13 @@ progress through `RH_PROGRESS=` markers on stderr. A running step shows a spinne
 any message or prompt during a step first freezes that line. Off a terminal, or with
 `RH_NO_PROGRESS=1`, each step prints a plain start and end line.
 
+Once the agent session owns the terminal, the remote side reports the last stretch itself: the
+session is connected, the project metadata an agent probes at startup (`.git` HEAD/config/refs and the
+tracked upstream ref, `.mcp.json`, `CLAUDE.md`, `.claude` settings, ...) is read in parallel to fill the
+SSHFS lookup cache (while a no-op routed command opens the session's multiplexing master to the project
+host in the background, so the agent's first routed call skips the SSH handshake), and the agent is
+starting. That master stays open for up to an hour of inactivity.
+
 ## Gateway Protocol
 
 The forced local gateway accepts only:

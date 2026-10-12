@@ -305,11 +305,25 @@ case "$OS" in
   *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,idmap=user";;
 esac
 SSH_BIN="$(command -v ssh 2>/dev/null || printf 'ssh')"
-# Parallel SFTP connections keep one long scan (a whole-tree lstat over a high-latency tunnel) from
-# queueing every other file request behind it. Only sshfs builds that advertise it get the option;
-# RH_SSHFS_MAX_CONNS=1 turns it off.
-MAX_CONNS="${RH_SSHFS_MAX_CONNS:-4}"
-case "$MAX_CONNS" in ''|*[!0-9]*) MAX_CONNS=4;; esac
+# Kernel-side caching of lookups, attributes and "no such file" answers. sshfs already caches
+# attributes for 20s, but libfuse defaults to 1s attribute/entry and 0s negative caching, so an agent
+# that repeatedly probes the same paths (Claude Code polls .git/HEAD, refs, commondir, .mcp.json, ...)
+# pays a full tunnel round trip per probe and its UI stalls for minutes. A file created on the project
+# host may stay invisible for up to this long after the agent last saw it missing; writes through the
+# mount invalidate normally. auto_cache also keeps file contents in the page cache across opens and
+# drops them when an open sees a new size or mtime, so re-reading an unchanged file skips the data
+# round trips. RH_SSHFS_CACHE_SECONDS=0 turns all of this off. libfuse sshfs only.
+CACHE_SECONDS="${RH_SSHFS_CACHE_SECONDS:-20}"
+case "$CACHE_SECONDS" in ''|*[!0-9]*) CACHE_SECONDS=20;; esac
+if [ "$OS" != Darwin ] && [ "$CACHE_SECONDS" -gt 0 ]; then
+  SSHFS_OPTS="$SSHFS_OPTS,entry_timeout=$CACHE_SECONDS,attr_timeout=$CACHE_SECONDS,negative_timeout=$CACHE_SECONDS,auto_cache"
+fi
+# Parallel SFTP connections (sshfs max_conns) are opt-in through RH_SSHFS_MAX_CONNS. On a ~360ms
+# link, concurrent lookups across directories took 10.7s with max_conns=4 versus 1.5s with one
+# connection (each new connection also costs a full SSH handshake), and agent startup is exactly
+# such a burst of small lookups. Only sshfs builds that advertise the option get it.
+MAX_CONNS="${RH_SSHFS_MAX_CONNS:-1}"
+case "$MAX_CONNS" in ''|*[!0-9]*) MAX_CONNS=1;; esac
 if [ "$MAX_CONNS" -gt 1 ] && "$SSHFS_BIN" --help 2>&1 | grep -q 'max_conns'; then
   [ "$MAX_CONNS" -le 16 ] || MAX_CONNS=16
   SSHFS_OPTS="$SSHFS_OPTS,max_conns=$MAX_CONNS"
@@ -335,7 +349,6 @@ if "$SSHFS_BIN" "$ALIAS:$RPATH" "$MP" -o "$SSHFS_OPTS" 2>"$err"; then
   emit MOUNTPOINT "$MP"
   emit REMOTE "$ALIAS:$RPATH"
   emit_session_policy
-  [ -d "$MP/.git" ] && emit GIT_BRANCH "$(git -C "$MP" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '-')"
   # Claude Code reads CLAUDE.md, not AGENTS.md — flag if the project ships only AGENTS.md.
   [ -f "$MP/AGENTS.md" ] && [ ! -e "$MP/CLAUDE.md" ] && emit AGENTS_MD_ONLY 1
 else
