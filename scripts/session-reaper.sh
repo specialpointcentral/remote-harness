@@ -186,14 +186,26 @@ recently_created() {  # $1=file $2=minutes
   [ -n "$_rc_found" ]
 }
 
+# Does an SSHFS transport referencing $1 (a session SSH config or its directory) still serve a
+# mounted mountpoint? A daemon that outlived its unmount, and the sftp ssh it leaves behind, do not
+# keep anything in use: counting them would retain the laptop tunnel and authorization for nothing.
+sshfs_transport_live() {
+  ps -ww -u "$(id -u)" -o args= 2>/dev/null | awk -v ref="$1" '
+    { n = split($0, f, " ")
+      if (n >= 3 && (f[1] == "sshfs" || f[1] ~ /\/sshfs$/) && index($0, ref)) print f[3] }' |
+  while IFS= read -r _stl_mp; do
+    mount 2>/dev/null | grep -qF " $_stl_mp " && { echo live; break; }
+  done | grep -q live
+}
+
 # Is any process of this user referencing the given path in its arguments?
 path_in_use() {
   _piu_list=$(ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null) || return 0
   printf '%s\n' "$_piu_list" | while read -r _piu_pid _piu_args; do
     [ "$_piu_pid" = "$$" ] && continue
-    case "$_piu_args" in *session-reaper.sh*) continue ;; esac
+    case "$_piu_args" in *session-reaper.sh*|*sshfs*|*' sftp'*) continue ;; esac  # SSHFS: see below
     case "$_piu_args" in *"$1"*) echo yes; break ;; esac
-  done | grep -q yes
+  done | grep -q yes || sshfs_transport_live "$1"
 }
 
 # Is the mountpoint still used by a different live (or about-to-launch) session?
@@ -244,15 +256,8 @@ config_used_elsewhere() {  # $1=this session dir $2=ssh config
       2) recently_created "$_cue_meta" "$UNLAUNCHED_MINUTES" && return 0 ;;
     esac
   done
-  # Legacy mounts may lack a registry record. Keep the config their live SFTP process uses.
-  _cue_processes=$(ps -ww -u "$(id -u)" -o args= 2>/dev/null) || return 0
-  if printf '%s\n' "$_cue_processes" | while IFS= read -r _cue_args; do
-    case "$_cue_args" in *session-reaper.sh*|*inject-rule.sh*) continue;; esac
-    case "$_cue_args" in
-      *sshfs*|*' sftp'*) case "$_cue_args" in *"$2"*) printf 'used\n'; break;; esac;;
-    esac
-  done | grep -q '^used$'; then return 0; fi
-  return 1
+  # Legacy mounts may lack a registry record. Keep the config a still-mounted SSHFS transport uses.
+  sshfs_transport_live "$2"
 }
 
 # Terminate leftover routed processes of this session: tool shims, multiplexing clients/master, and

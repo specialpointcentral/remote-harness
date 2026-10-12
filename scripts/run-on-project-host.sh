@@ -184,7 +184,13 @@ find_project_tool() {  # $1=tool name
   for _fpt_dir in /opt/homebrew/bin /usr/local/bin /usr/bin /bin /home/linuxbrew/.linuxbrew/bin \
       /nix/var/nix/profiles/default/bin /run/current-system/sw/bin \
       "$HOME/.nix-profile/bin" "$HOME/.local/bin" "$HOME/.cargo/bin"; do
-    [ -x "$_fpt_dir/$1" ] && [ ! -d "$_fpt_dir/$1" ] && { printf '%s' "$_fpt_dir/$1"; return 0; }
+    [ -x "$_fpt_dir/$1" ] && [ ! -d "$_fpt_dir/$1" ] || continue
+    # macOS /usr/bin/git is a stub that only works once the Command Line Tools are installed.
+    if [ "$_fpt_dir/$1" = /usr/bin/git ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then
+      continue
+    fi
+    printf '%s' "$_fpt_dir/$1"
+    return 0
   done
   return 1
 }
@@ -242,6 +248,12 @@ dispatch_tool() {
   exit "$status"
 }
 
+# Launch-time preflight on the project host: report where the tool verb would find $2.
+if [ "${1:-}" = "--find-tool" ]; then
+  [ "$#" -eq 2 ] || fail "--find-tool needs a tool name"
+  find_project_tool "$2"
+  exit
+fi
 if [ "${1:-}" = "--dispatch" ]; then
   shift
   dispatch "$@"

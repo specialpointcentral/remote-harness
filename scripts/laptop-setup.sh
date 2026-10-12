@@ -81,6 +81,9 @@ if [ -f "$RH_COMMON" ]; then
   . "$RH_COMMON"
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
 
+# Its own RH_LAPTOP_STEPS steps, after any simple-laptop-setup.sh steps (RH_STEP_BASE).
+STEP_TOTAL=$((STEP_N + RH_LAPTOP_STEPS))
+
 # ---- auto-cleanup on exit/disconnect ---------------------------------------
 TUNNEL_PID=""; TUNNEL_START=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0
 LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""; RULE_SESSION_ID=""
@@ -116,12 +119,39 @@ ssh_uses_session_config() {
   done
   [ "$_target" = "$TARGET" ]
 }
+# Every setup call to the box is a fresh SSH connection, which costs seconds on a high-latency link
+# (TCP + key exchange + authentication). Once the session config exists, a multiplexing master carries
+# those calls instead; until its socket appears they simply connect directly. It is passed on the
+# command line only (generated ssh_config files keep ControlMaster no) and lives under a short /tmp
+# path because macOS limits socket path length. The reverse tunnel (-N, it owns the RemoteForward)
+# and control commands (-O, -M) keep their own connection; callers pass those flags as separate words.
+SETUP_MUX_DIR=""
 ssh() {
   if ssh_uses_session_config "$@"; then
+    case " $* " in
+      *" -N "*|*" -O "*|*" -M "*) ;;
+      *) if [ -S "$SETUP_MUX_DIR/m" ]; then
+           command ssh -F "$LOCAL_SSH_CONFIG" -o ControlMaster=no -o "ControlPath=$SETUP_MUX_DIR/m" "$@"
+           return
+         fi ;;
+    esac
     command ssh -F "$LOCAL_SSH_CONFIG" "$@"
   else
     command ssh "$@"
   fi
+}
+start_setup_mux() {  # in the background, overlapping the local authorization work
+  SETUP_MUX_DIR=$(mktemp -d /tmp/rh.XXXXXX 2>/dev/null) || { SETUP_MUX_DIR=""; return 0; }
+  # No forwards on the master: the separate tunnel connection owns the RemoteForward port.
+  command ssh -F "$LOCAL_SSH_CONFIG" -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 \
+    -o ControlMaster=yes -o "ControlPath=$SETUP_MUX_DIR/m" -o ControlPersist=300 -fN "$TARGET" \
+    >/dev/null 2>&1 </dev/null &
+}
+stop_setup_mux() {
+  [ -n "$SETUP_MUX_DIR" ] || return 0
+  [ ! -S "$SETUP_MUX_DIR/m" ] || command ssh -o "ControlPath=$SETUP_MUX_DIR/m" -O exit rh-setup >/dev/null 2>&1 || true
+  rm -rf "$SETUP_MUX_DIR" 2>/dev/null || true
+  SETUP_MUX_DIR=""
 }
 # Legacy marker path, used only to remove a marker that matches a verified resource-record PID.
 # New tunnel ownership (PID + start time + exact config) is stored under the local session dir.
@@ -405,25 +435,60 @@ cleanup_reverse_authorized_key() {
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0
   CLEANED=1
+  [ -z "$STEP_LABEL" ] || step_end fail
   write_local_resource_record
+  local _total=0 _line _rc=""
+  [ "$MOUNTED" = 1 ] && _total=2
+  [ -z "$LOCAL_SESSION_DIR" ] || _total=$((_total + 1))
+  step_reset "$_total"
+  [ "$_total" = 0 ] && { stop_setup_mux; return 0; }
+  sep
+  say "  $(tr2 "Connection closed — releasing this session's resources" "连接已关闭，正在释放本次会话的资源")"
   if [ "$MOUNTED" = 1 ]; then
-    printf '\n'
-    say "  Connection closed — releasing this session's remote resources..."
-    ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" "
-      rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-      sd=$(sq "$REMOTE_SESSION_DIR")
-      reaper=\"\$sd/impl/session-reaper.sh\"
-      if [ ! -x \"\$reaper\" ] || [ ! -x \"\$sd/impl/mount-project.sh\" ]; then reaper=\"\$rh/scripts/session-reaper.sh\"; fi
-      if [ ! -d \"\$sd\" ]; then sd=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"; fi
-      \"\$reaper\" release \"\$sd\" || exit 1
-      ld=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"
-      if [ -d \"\$ld\" ]; then \"\$rh/scripts/session-reaper.sh\" release \"\$ld\"; fi
-    " >/dev/null 2>&1 || warn "remote release incomplete; retaining local resources until it can be verified"
+    local _wait_label
+    _wait_label="$(tr2 "Waiting for sshfs to flush and exit" "等待 sshfs 刷写完成并退出")"
+    to_wait_step() { [ "$STEP_N" != 1 ] || { step_end "${1:-ok}"; step_begin "$_wait_label"; }; }
+    step_begin "$(tr2 "Unmounting the remote project" "卸载远端挂载")"
+    # The remote release reports progress on stderr (RH_PROGRESS=...): once the mount is detached,
+    # the next step waits for sshfs to flush and exit, which can take a while on a slow link.
+    while IFS= read -r _line; do
+      case "$_line" in
+        RH_PROGRESS=unmounted) to_wait_step ;;
+        RH_PROGRESS=sshfs-wait)
+          step_label "$(tr2 "Waiting for sshfs to flush and exit (still transferring or stuck)" "等待 sshfs 刷写完成并退出（仍在传输或已卡住）")" ;;
+        RH_RC=*) _rc=${_line#RH_RC=} ;;
+      esac
+    done < <(
+      ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" "
+        rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+        sd=$(sq "$REMOTE_SESSION_DIR")
+        reaper=\"\$sd/impl/session-reaper.sh\"
+        if [ ! -x \"\$reaper\" ] || [ ! -x \"\$sd/impl/mount-project.sh\" ]; then reaper=\"\$rh/scripts/session-reaper.sh\"; fi
+        if [ ! -d \"\$sd\" ]; then sd=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"; fi
+        RH_PROGRESS_FD=3 \"\$reaper\" release \"\$sd\" 3>&2 || exit 1
+        ld=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"
+        if [ -d \"\$ld\" ]; then \"\$rh/scripts/session-reaper.sh\" release \"\$ld\"; fi
+      " 2>&1 >/dev/null
+      printf 'RH_RC=%s\n' "$?"
+    )
+    to_wait_step "$([ "$_rc" = 0 ] && echo ok || echo warn)"
+    if [ "$_rc" = 0 ]; then
+      step_end ok
+    else
+      step_end warn "$(tr2 "remote release incomplete; retaining local resources until it can be verified" "远端释放未完成；在确认之前保留本机资源")"
+    fi
   fi
   if [ -n "$LOCAL_SESSION_DIR" ]; then
+    step_begin "$(tr2 "Removing the local tunnel and temporary authorization" "移除本机隧道与临时授权")"
     sweep_local_resources
-    [ ! -d "$LOCAL_SESSION_DIR" ] || warn "shared or unverified transport retained with its config and authorization"
+    if [ -d "$LOCAL_SESSION_DIR" ]; then
+      step_end warn "$(tr2 "shared or unverified transport retained with its config and authorization" "传输仍被共享或无法确认，已保留其配置与授权")"
+    else
+      step_end ok
+    fi
   fi
+  step_reset 0
+  stop_setup_mux
 }
 
 # OS vars (OS/PLAT/IS_WSL) come from _common.sh.
@@ -465,6 +530,7 @@ parse_via "$VIA"
 case "$BOX_SSH_CONFIG" in *'
 '*) printf 'box ssh config path contains a newline\n' >&2; exit 2;; esac
 
+step_begin -s "$(tr2 "Local checks (SSH server, git, rg) and temporary authorization" "检查本机环境（SSH 服务、git、rg）与临时授权")"
 # -- SSH authentication boundary -------------------------------------------
 if [ -n "$PUBKEY" ]; then
   ok "box key visible: $(printf '%s' "$PUBKEY" | awk '{print $1, substr($2,1,14)"...", $3}')"
@@ -510,6 +576,29 @@ else
   ssh_listening && ok "SSH server: listening" \
                 || warn "still not listening on :22 — the tunnel won't work without it"
 fi
+
+# Routed git/rg calls run on THIS machine; when one is missing the agent host falls back to scanning
+# the project over SSHFS, which is very slow on a high-latency link. Look it up exactly as the
+# gateway does and say so before launch.
+check_project_host_tools() {
+  local _finder _tool _path _why _hint
+  _finder="$(dirname "$0")/run-on-project-host.sh"
+  [ -f "$_finder" ] || return 0
+  for _tool in git rg; do
+    if _path=$(sh "$_finder" --find-tool "$_tool" 2>/dev/null); then
+      ok "project host: $_tool found ($_path)"
+      continue
+    fi
+    case "$_tool" in
+      git) _why="the agent's git status/diff/log"; _hint=$(pkg_install_hint git)
+           [ "$PLAT" != macos ] || _hint="xcode-select --install" ;;
+      rg)  _why="the agent's file search and Grep"; _hint=$(pkg_install_hint ripgrep) ;;
+    esac
+    warn "project host: $_tool not found — $_why fall back to scanning over SSHFS (slow)"
+    say  "    Install: ${_B}${_hint}${_0}"
+  done
+}
+check_project_host_tools
 
 # -- write RemoteForward to a session-local ssh config --
 TARGET=""   # write_managed_alias comes from _common.sh and writes to $CFG.
@@ -582,8 +671,8 @@ if [ -z "$BOX_ALIAS" ]; then
 fi
 
 # == Phase 1 done ==
-sep
 if [ "$SETUP_ONLY" = 1 ]; then
+  step_end ok
   ok "Phase 1 done (--setup-only)."
   say "  Session config: ${_B}$LOCAL_SSH_CONFIG${_0}"
   say "  Reconnect: ${_B}ssh -F $(sq "$LOCAL_SSH_CONFIG") -O exit $TARGET 2>/dev/null; ssh -F $(sq "$LOCAL_SSH_CONFIG") $TARGET${_0}"
@@ -597,14 +686,16 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
+start_setup_mux
 prepare_reverse_authorized_key || exit 1
 write_local_resource_record
 sweep_local_resources
+step_end ok
 
 # ===========================================================================
 # Phase 2: Reconnect — establish the reverse tunnel automatically
 # ===========================================================================
-hdr "Phase 2: establishing tunnel"
+step_begin "$(tr2 "Establishing the reverse tunnel" "建立反向隧道")"
 # Kill the session-local master connection to the harness target, if any.
 ssh -O exit "$TARGET" 2>/dev/null || true
 
@@ -781,7 +872,7 @@ write_local_resource_record
 # ===========================================================================
 # Phase 3: Pick a project directory ON THIS LAPTOP
 # ===========================================================================
-hdr "Phase 3: select a laptop project directory"
+step_begin -s "$(tr2 "Selecting the local project directory" "选择本机项目目录")"
 
 pick_dir() {
   local result="" def="$PWD"
@@ -857,7 +948,7 @@ register_gateway_project || { err "could not register the project with the force
 # ===========================================================================
 # Phase 4: Mount on the remote box
 # ===========================================================================
-hdr "Phase 4: mounting on remote"
+step_begin "$(tr2 "Mounting the project on the remote (sshfs)" "在远端挂载项目（sshfs）")"
 
 # Determine the remote mountpoint:
 #  - explicit --remote-mountpoint (e.g. the dir you invoked /remote-harness from) wins;
@@ -948,6 +1039,7 @@ fi
 # The box-side session dir is keyed by mountpoint AND this launch's unique session dir name, so a
 # relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
 RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
+step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
 inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
@@ -1029,9 +1121,9 @@ if [ "$LAUNCH_BASE" = opencode ]; then
   fi
 fi
 
-hdr "Phase 5: launching ${LAUNCH}"
-say "  Remote dir: ${_B}${REMOTE_MOUNTPOINT}${_0}"
-say "  Your terminal becomes the remote ${LAUNCH} session. Exit ${LAUNCH} to return here."
+step_begin "$(tr2 "Launching ${LAUNCH} on the remote" "在远端启动 ${LAUNCH}")"
+step_end ok "${REMOTE_MOUNTPOINT}"
+say "  $(tr2 "Your terminal becomes the remote ${LAUNCH} session. Exit ${LAUNCH} to return here." "终端将切换为远端 ${LAUNCH} 会话；退出 ${LAUNCH} 即返回这里。")"
 sep
 
 # Use a LOGIN+INTERACTIVE shell so the remote PATH (e.g. ~/.local/bin from ~/.profile / ~/.zshrc)

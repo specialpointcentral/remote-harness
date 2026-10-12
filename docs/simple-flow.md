@@ -71,6 +71,26 @@ not migrated while running. See [design.md](design.md) for lifecycle details.
     retained together; final release removes the mount, implementation, key/config/runtime, gateway
     and authorization. Unverifiable local release is recorded for a later retry.
 
+## Progress Display
+
+The local terminal shows numbered steps instead of a percentage, because tunnel, mount, and IAP
+reconnect times are network-bound and unpredictable:
+
+```text
+  [1/7] ✓ Preparing remote tunnel alias  1s
+  [2/7] ✓ Local checks (SSH server, git, rg) and temporary authorization  0s
+  [3/7] ⠹ Establishing the reverse tunnel…  4s
+```
+
+Connecting has seven steps: remote tunnel alias, local checks (SSH server, `git`, `rg`, temporary
+authorization), reverse tunnel, project directory, SSHFS mount, session routing, and agent launch. A
+missing `git` or `rg` on the project host prints ⚠ with an install command, because the agent would
+otherwise scan the project over SSHFS. Exiting has three steps: unmount, wait for sshfs to flush and
+exit, and remove the local tunnel and temporary authorization; the remote release reports its
+progress through `RH_PROGRESS=` markers on stderr. A running step shows a spinner and elapsed time;
+any message or prompt during a step first freezes that line. Off a terminal, or with
+`RH_NO_PROGRESS=1`, each step prints a plain start and end line.
+
 ## Gateway Protocol
 
 The forced local gateway accepts only:

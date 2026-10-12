@@ -13,6 +13,15 @@ assert_eq() {
 assert_grep() {
   grep -F -- "$2" "$1" >/dev/null || fail "$3: missing '$2' in $1"
 }
+refute_grep() {
+  ! grep -F -- "$2" "$1" >/dev/null || fail "$3: unexpected '$2' in $1"
+}
+assert_grep_e() {  # extended-regex variants
+  grep -E -- "$2" "$1" >/dev/null || fail "$3: no match for /$2/ in $1"
+}
+refute_grep_e() {
+  ! grep -E -- "$2" "$1" >/dev/null 2>&1 || fail "$3: unexpected match for /$2/ in $1"
+}
 
 . "$ROOT/scripts/_common.sh"
 
@@ -248,9 +257,7 @@ if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='internal-sftp -h' \
     </dev/null >"$router_tmp/gateway-sftp.out" 2>"$router_tmp/gateway-sftp.err"; then
   :
 fi
-if grep -F "unsupported SSH command" "$router_tmp/gateway-sftp.err" >/dev/null; then
-  fail "forced-command gateway rejected the standard internal-sftp request"
-fi
+refute_grep "$router_tmp/gateway-sftp.err" "unsupported SSH command" "forced-command gateway rejected the standard internal-sftp request"
 
 # --- direct project-host tools: gateway verb, dispatcher, agent-host shim -----------------------
 tool_proj="$router_tmp/tool-project"
@@ -328,6 +335,15 @@ if printf '%s\n' "$shim_status" | grep -F mount-only >/dev/null; then
 fi
 assert_grep "$shim_log" "remote-harness-tool" "shim used the tool gateway verb"
 : > "$shim_log"
+# Claude Code hardens its internal git calls with GIT_CONFIG_PARAMETERS/GIT_CONFIG_COUNT; forward them
+# as -c instead of scanning the whole tree over SSHFS. An unparsable value stays local.
+hardened_status=$(cd "$tool_mount" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
+  GIT_CONFIG_PARAMETERS="'alias.remote-/.command=version' 'fetch.bundleURI=' 'core.quotepath'='off' 'user.name=it'\\''s a!b'" \
+  run_shim git "$(command -v git)" "" --no-optional-locks status --porcelain)
+assert_grep <(printf '%s\n' "$hardened_status") "?? src/new.txt" "shim routes git status despite GIT_CONFIG_PARAMETERS"
+: > "$shim_log"
+(cd "$tool_mount" && GIT_CONFIG_PARAMETERS="'unbalanced" run_shim git "$(command -v git)" "" status) >/dev/null 2>&1 || true
+[ ! -s "$shim_log" ] || fail "shim routed git with an unparsable GIT_CONFIG_PARAMETERS"
 if (cd "$tool_mount" && run_shim git "$(command -v git)" "" rev-parse --show-toplevel) >/dev/null 2>&1; then
   fail "shim routed path discovery (rev-parse) instead of keeping agent-host semantics"
 fi
@@ -550,9 +566,7 @@ if grep -F "sandbox_workspace_write.writable_roots=[\"$session_dir" "$tmp/inject
 fi
 [ -x "$session_dir/bin/rh-run" ] || fail "inject codex session runner missing"
 assert_grep "$session_dir/bin/rh-run" "run-on-project-host.sh" "session runner delegates to project host"
-if grep -F 'writable_roots=["~/.ssh"]' "$tmp/inject.out" >/dev/null; then
-  fail "inject codex made ~/.ssh writable"
-fi
+refute_grep "$tmp/inject.out" 'writable_roots=["~/.ssh"]' "inject codex made ~/.ssh writable"
 [ -f "$session_dir/rule.md" ] || fail "inject rule file missing"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off codex "$tmp/mount" > "$tmp/inject-off.out"
@@ -570,14 +584,10 @@ assert_grep "$tmp/inject-wrapped.out" "RH_LAUNCH_ENV=PATH='" "inject wrapper exp
 assert_grep "$wrapped_dir/bin/ssh" "cfg='$ssh_cfg'" "inject wrapper stores temp ssh config"
 assert_grep "$wrapped_dir/bin/ssh" '-F "$cfg"' "inject wrapper uses temp ssh config"
 assert_grep "$wrapped_dir/rule.md" 'session router sends every Bash command to `rlocal`' "inject rule documents automatic routing"
-if grep -F "ssh rlocal 'cd" "$wrapped_dir/rule.md" >/dev/null; then
-  fail "strict inject rule still tells Codex to wrap commands in ssh"
-fi
+refute_grep "$wrapped_dir/rule.md" "ssh rlocal 'cd" "strict inject rule still tells Codex to wrap commands in ssh"
 assert_grep "$tmp/inject-wrapped.out" "sandbox_workspace_write.writable_roots=[" "inject wrapper writable roots present"
 assert_grep "$tmp/inject-wrapped.out" "$(dirname "$ssh_cfg")" "inject wrapper writable roots include session config dir"
-if grep -q -- "-F " "$wrapped_dir/rule.md"; then
-  fail "inject rule exposed temp ssh config path"
-fi
+refute_grep "$wrapped_dir/rule.md" "-F " "inject rule exposed temp ssh config path"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off codex "$tmp/mount-wrapped" >/dev/null
 
@@ -872,29 +882,19 @@ assert_grep "$alias_cfg" "    HostName 203.0.113.7" "dedicated alias resolved ho
 assert_grep "$alias_cfg" "    RemoteForward 22022 127.0.0.1:22" "dedicated alias remote forward"
 assert_grep "$alias_cfg" "Include $alias_home/.ssh/config" "dedicated alias reads user config without editing it"
 assert_grep "$alias_cfg" "/runtime/known_hosts" "dedicated alias separates mutable SSH runtime from config"
-if grep -q "mybox-remote-harness" "$alias_home/.ssh/config"; then
-  fail "laptop-setup wrote dedicated alias to user ~/.ssh/config"
-fi
+refute_grep "$alias_home/.ssh/config" "mybox-remote-harness" "laptop-setup wrote dedicated alias to user ~/.ssh/config"
 [ -z "$(find "$alias_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "alias setup created config.rh-bak"
 
-iap_home="$tmp/iap-home"
-mkdir -p "$iap_home/.ssh"
-: > "$iap_home/.ssh/google_compute_engine"
+iap_home="$tmp/iap-home"; mkdir -p "$iap_home/.ssh"; : > "$iap_home/.ssh/google_compute_engine"
 printf 'Host iapbox\n    HostName iapbox\n' > "$iap_home/.ssh/config"
-HOME="$iap_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host iapbox --port 22023 --via "iapbox" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --setup-only --yes > "$tmp/setup-iap.out" 2>&1
-iap_cfg="$(find "$iap_home/.remote-harness/.sessions" -name ssh_config -print -quit 2>/dev/null)"
-[ -n "$iap_cfg" ] || fail "ProxyCommand alias session ssh config missing"
-assert_grep "$iap_cfg" "Host iapbox-remote-harness" "ProxyCommand alias dedicated host"
+HOME="$iap_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" bash "$ROOT/scripts/laptop-setup.sh" \
+  --host iapbox --port 22023 --via iapbox --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
+  --box-alias laptop --setup-only --yes > "$tmp/setup-iap.out" 2>&1
+iap_cfg="$(find "$iap_home/.remote-harness/.sessions" -name ssh_config -print -quit)"
 assert_grep "$iap_cfg" "    ProxyCommand gcloud compute start-iap-tunnel iapbox %p --listen-on-stdin --zone=zone-a --project=demo" "session alias keeps the user's ProxyCommand"
 assert_grep "$iap_cfg" "    IdentitiesOnly yes" "session alias keeps IdentitiesOnly"
 assert_grep "$iap_cfg" "    IdentityFile $iap_home/.ssh/google_compute_engine" "session alias expands ~/ identity paths"
-if grep -q "could not resolve Host" "$tmp/setup-iap.out"; then
-  fail "ssh -G alias resolution reported a spurious failure"
-fi
+refute_grep "$tmp/setup-iap.out" "could not resolve Host" "ssh -G alias resolution reported a spurious failure"
 
 if HOME="$tmp/unsafe-rh" RH_HOME=/ bash "$ROOT/manage.sh" --uninstall >/dev/null 2>"$tmp/manage-rh-root.err"; then
   fail "manage accepted RH_HOME=/"
@@ -982,6 +982,7 @@ HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh"
     --launch codex \
     --yes > "$tmp/simple-laptop.out"
 assert_grep "$tmp/simple-laptop.out" "Remote alias 'tester' prepared on port 24002" "simple setup remote alias"
+assert_grep "$tmp/simple-laptop.out" "[1/7] ✓ Preparing remote tunnel alias" "simple setup opens the seven-step sequence"
 assert_grep "$tmp/simple-remote.cmd" "--config" "simple remote setup uses temp ssh config"
 assert_grep "$tmp/simple-remote.cmd" "--alias 'tester'" "simple remote setup uses short alias"
 assert_grep "$tmp/simple-remote.cmd" "--gen-key" "simple remote setup generates remote-harness key"
@@ -1005,6 +1006,20 @@ assert_grep "$tmp/simple-cache.env" "LAST_PROJECT_DIR=$simple_project_real" "sim
 assert_grep "$tmp/simple-cache.env" "LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remote" "simple cache mountpoint"
 assert_grep "$tmp/simple-cache.env" "LAST_LAUNCH=codex" "simple cache launch"
 assert_grep "$tmp/simple-cache.env" "LAST_YOLO=1" "simple cache yolo"
+# A remembered mountpoint is the default only for the project it was chosen for.
+simple_rerun() {  # $1 = project dir; prints the handed-off arguments
+  : > "$tmp/simple-laptop.args"
+  HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh" RH_SIMPLE_CACHE="$tmp/simple-cache.env" \
+    SIMPLE_LAPTOP_ARGS="$tmp/simple-laptop.args" bash "$simple_dir/simple-laptop-setup.sh" \
+    --via "ssh -p 2222 bytepilot@42.121.2.119" --namespace tester --project-dir "$1" --launch codex --yes \
+    </dev/null >/dev/null 2>&1 || true
+  cat "$tmp/simple-laptop.args"
+}
+assert_grep <(simple_rerun "$simple_project") "=/tmp/rh-simple-remote" "same project reuses its remembered mountpoint"
+mkdir -p "$tmp/simple-other-project"
+case "$(simple_rerun "$tmp/simple-other-project")" in *rh-simple-remote*) fail "another project inherited the remembered mountpoint";; esac
+sed -i.bak '/^LAST_MOUNT_PROJECT=/d; s#^LAST_REMOTE_MOUNTPOINT=.*#LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remote#' "$tmp/simple-cache.env"
+case "$(simple_rerun "$simple_project")" in *rh-simple-remote*) fail "a cache without the mount's project still forced its mountpoint";; esac
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_project_dir "$cached_project" 1)"' "simple cached project prompts for confirmation"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ "$YOLO_REQUESTED" = 1 ]; then' "explicit yolo has a no-reprompt branch"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'YOLO=1' "explicit yolo locks yolo on"
@@ -1047,18 +1062,14 @@ HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   bash "$dispatch_dir/simple-dispatch.sh" --mode "远程开发本地" --launch codex --source-via sourcebox
 assert_grep "$tmp/dispatch-reverse.out" "REVERSE_ARGS=--launch codex --via sourcebox" "dispatch passes source via only to reverse"
 assert_grep "$tmp/simple-mode-cache.env" "LAST_MODE=reverse" "dispatch caches reverse mode"
-if grep -F 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "$ROOT/scripts/simple-dispatch.sh" >/dev/null; then
-  fail "remote-only dispatcher still contains a local-agent launch path"
-fi
+refute_grep "$ROOT/scripts/simple-dispatch.sh" 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "remote-only dispatcher still contains a local-agent launch path"
 
 bash "$ROOT/tests/bootstrap.sh"
 assert_grep "$ROOT/scripts/simple-dispatch.sh" "--source-via" "simple dispatcher accepts bootstrap source"
 assert_grep "$ROOT/SKILL.md" "simple-bootstrap.sh" "skill uses unified simple bootstrap"
 assert_grep "$ROOT/SKILL.md" "docs/claude-multi-agent.md" "skill routes Claude multi-agent questions"
 assert_grep "$ROOT/README.md" "git clone https://github.com/specialpointcentral/remote-harness.git" "README installs maintained fork"
-if grep -F "git clone https://github.com/chenjh16/remote-harness.git" "$ROOT/README.md" >/dev/null; then
-  fail "README manual install still clones upstream instead of the maintained fork"
-fi
+refute_grep "$ROOT/README.md" "git clone https://github.com/chenjh16/remote-harness.git" "README manual install still clones upstream instead of the maintained fork"
 assert_grep "$ROOT/SKILL.md" "remote-only" "skill declares remote-only topology"
 assert_grep "$ROOT/SKILL.md" "printf '%s' \"\$p\${d:+ [\$d]}: \" >/dev/tty" "skill fetch prompt is zsh-compatible"
 assert_grep "$ROOT/SKILL.md" "IFS= read -r h </dev/tty || exit 2" "skill aborts when tty prompt cannot read"
@@ -1112,9 +1123,7 @@ SSH_CONNECTION='198.51.100.10 55555 203.0.113.7 2222' \
 assert_grep "$tmp/suggest-via.out" "STATUS=ok" "suggest-via ok from SSH_CONNECTION"
 assert_grep "$tmp/suggest-via.out" "VIA=-p 2222 $suggest_user@203.0.113.7" "suggest-via uses server address and port"
 assert_grep "$tmp/suggest-via.out" "SOURCE=ssh_connection" "suggest-via records source"
-if grep -F "198.51.100.10" "$tmp/suggest-via.out" >/dev/null; then
-  fail "suggest-via leaked client/local SSH_CONNECTION field"
-fi
+refute_grep "$tmp/suggest-via.out" "198.51.100.10" "suggest-via leaked client/local SSH_CONNECTION field"
 SSH_CONNECTION='198.51.100.10 55555 203.0.113.7 22' \
   bash "$ROOT/scripts/suggest-via.sh" > "$tmp/suggest-via-22.out"
 assert_grep "$tmp/suggest-via-22.out" "VIA=$suggest_user@203.0.113.7" "suggest-via omits default port 22"
@@ -1177,6 +1186,11 @@ ssh_log="$tmp/ssh-project.log"
 cat > "$tmp/bin/ssh" <<'EOS'
 #!/usr/bin/env bash
 [ -n "${SSH_LOG:-}" ] && printf '%s\n' "$*" >> "$SSH_LOG"
+case " $* " in  # a multiplexing master request leaves a real socket behind, as OpenSSH would
+  *" ControlMaster=yes "*)
+    mux=$(printf '%s\n' "$@" | sed -n 's/^ControlPath=//p' | head -1)
+    python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$mux"; exit 0;;
+esac
 for arg in "$@"; do
   case "$arg" in
     *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*)
@@ -1229,6 +1243,14 @@ HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH
 assert_grep "$tmp/project-valid.out" "authorized_keys: temporarily authorized" "reverse authkey added"
 assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse authkey uses forced command gateway"
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
+assert_grep "$tmp/project-valid.out" "project host: git found" "launch preflight reports the project-host git"
+assert_grep "$tmp/project-valid.out" "[2/6] ✓ Establishing the reverse tunnel" "connection steps report progress"
+assert_grep "$tmp/project-valid.out" "[2/3] ✓ Waiting for sshfs to flush and exit" "exit cleanup reports progress steps"
+assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
+assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -tt " "setup calls reuse the multiplexing master"
+assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
+assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
+! sh "$ROOT/scripts/run-on-project-host.sh" --find-tool rh-no-such-tool >/dev/null 2>&1 || fail "--find-tool reported a missing tool"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"
 assert_grep "$ROOT/scripts/laptop-setup.sh" "exec 3</dev/tty" "phase5 attaches stdin to controlling tty"
@@ -1238,9 +1260,7 @@ assert_grep "$auth_keys_snapshot" '/project-host-gateway.sh' "authorized key inv
 assert_grep "$auth_keys_snapshot" ',no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty ssh-ed25519 ' "authorized key disables interactive SSH capabilities"
 forced_health=$(cat "$auth_keys_snapshot.health")
 case "$forced_health" in RH_OK*) ;; *) fail "generated forced command could not execute from a quoted HOME path";; esac
-if grep -Eq -- '(^| )-N( |$)' "$ssh_log" 2>/dev/null; then
-  fail "laptop-setup opened a new ssh -N despite reusable tunnel"
-fi
+refute_grep_e "$ssh_log" '(^| )-N( |$)' "laptop-setup opened a new ssh -N despite reusable tunnel"
 if [ -f "$proj_home/.ssh/authorized_keys" ] && grep -F "remote-harness:reverse-auth:" "$proj_home/.ssh/authorized_keys" >/dev/null; then
   fail "temporary authorized_keys block was not cleaned"
 fi
@@ -1290,9 +1310,7 @@ if HOME="$preauth_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.s
 fi
 assert_grep "$tmp/project-preauth.out" "refusing unsafe reuse" "existing unrestricted key is rejected"
 assert_eq "existing authorized key not duplicated" "$(grep -F "AAAAC3NzaC1lZDI1NTE5AAAAITest" "$preauth_home/.ssh/authorized_keys" | wc -l | tr -d ' ')" "1"
-if grep -F "remote-harness:reverse-auth:" "$preauth_home/.ssh/authorized_keys" >/dev/null; then
-  fail "managed authorized_keys block added despite existing user key"
-fi
+refute_grep "$preauth_home/.ssh/authorized_keys" "remote-harness:reverse-auth:" "managed authorized_keys block added despite existing user key"
 
 HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
   bash "$ROOT/scripts/laptop-setup.sh" \
@@ -1416,23 +1434,20 @@ RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude ".." 
 
 # --- inject-rule.sh: two launches for one mountpoint keep separate runners ----------------------
 ir_mp="$tmp/ir-shared-mount"
-ir_key="$(printf '%s' "$ir_mp" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-for ir_sid in rev.first rev.second; do
-  RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_sid" > "$tmp/ir-$ir_sid.out"
-  assert_grep "$tmp/ir-$ir_sid.out" "RH_STATUS=INJECTED" "inject-rule on with session id $ir_sid"
-  assert_grep "$tmp/ir-$ir_sid.out" "$ir_rh/.sessions/$ir_key.$ir_sid/claude-settings.json" "inject-rule uses session-id dir for $ir_sid"
-done
-[ -x "$ir_rh/.sessions/$ir_key.rev.first/bin/rh-run" ] || fail "inject-rule: second launch deleted the first session runner"
-RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude "$ir_mp" rev.first >/dev/null
-[ ! -d "$ir_rh/.sessions/$ir_key.rev.first" ] || fail "inject-rule: off did not remove its own session dir"
-[ -x "$ir_rh/.sessions/$ir_key.rev.second/bin/rh-run" ] || fail "inject-rule: off removed another live session runner"
-RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" off claude "$ir_mp" rev.second >/dev/null
-[ ! -d "$ir_rh/.sessions/$ir_key.rev.second" ] || fail "inject-rule: second session dir not cleaned"
+ir_sd="$ir_rh/.sessions/$(printf '%s' "$ir_mp" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+ir() { RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" "$@"; }
+ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.a >/dev/null
+ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.b > "$tmp/ir-b.out"
+assert_grep "$tmp/ir-b.out" "$ir_sd.rev.b/claude-settings.json" "inject-rule keys the session dir by session id"
+[ -x "$ir_sd.rev.a/bin/rh-run" ] || fail "inject-rule: a second launch deleted the first session runner"
+ir off claude "$ir_mp" rev.a >/dev/null
+[ ! -d "$ir_sd.rev.a" ] && [ -x "$ir_sd.rev.b/bin/rh-run" ] || fail "inject-rule: off did not remove exactly its own session"
+ir off claude "$ir_mp" rev.b >/dev/null
 for ir_bad in .. 'a/b' 'a b'; do
-  ir_bad_out=$(RH_HOME="$ir_rh" HOME="$ir_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_bad" || true)
-  assert_grep <(printf '%s\n' "$ir_bad_out") "RH_STATUS=ERROR" "inject-rule rejects unsafe session id '$ir_bad'"
+  { ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_bad" || true; } | grep -qx RH_STATUS=ERROR \
+    || fail "inject-rule accepted unsafe session id '$ir_bad'"
 done
-[ -z "$(find "$ir_rh/.sessions" -mindepth 1 -maxdepth 1 -name "$ir_key*" -print -quit)" ] || fail "inject-rule: unsafe session id created a session dir"
+[ -z "$(find "$ir_rh/.sessions" -maxdepth 1 -name "${ir_sd##*/}*" -print -quit)" ] || fail "inject-rule left or created a session dir"
 
 # --- tool shims, session launcher, and server-side reaping ---------------------------------------
 rp_rh="$tmp/rp-rh"
@@ -1456,9 +1471,7 @@ if [ -x "$rp_sd/bin/rg" ]; then
   assert_grep "$tmp/rp-inject.out" "USE_BUILTIN_RIPGREP=0" "claude uses the rg shim when one is installed"
 fi
 assert_grep "$rp_sd/rule.md" "Git commands you run through the Bash tool are routed" "rule describes Bash git routing"
-if grep -F "All Git commands are routed too" "$rp_sd/rule.md" >/dev/null; then
-  fail "rule still claims every Git command is routed"
-fi
+refute_grep "$rp_sd/rule.md" "All Git commands are routed too" "rule still claims every Git command is routed"
 
 # Agent exits without any local cleanup: the watcher removes leftovers server-side.
 python3 -c 'import sys, time; time.sleep(300)' "$rp_sd/bin/rh-run" &
@@ -1518,14 +1531,68 @@ PATH="$nopy_bin" RH_HOME="$wr_rh" HOME="$rp_home" \
   "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/rp-code" laptop "$tmp/wr-mount-nopy" 0 "$basic_ssh_cfg" > "$tmp/wr-nopy.out"
 assert_grep "$tmp/wr-nopy.out" "RH_STATUS=INJECTED" "opencode inject works without python3"
 wr_nopy_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-nopy" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-if grep -E 'channel-guard|--watch' "$wr_nopy_sd/bin/rh-run" >/dev/null; then
-  fail "runner requires python3 that is not installed"
-fi
+refute_grep_e "$wr_nopy_sd/bin/rh-run" 'channel-guard|--watch' "runner requires python3 that is not installed"
 [ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount" >/dev/null
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/wr-mount-nopy" >/dev/null
 
 bash "$ROOT/tests/resources.sh"
+
+# --- mount-project.sh: parallel SFTP connections only where sshfs supports them ---------------
+mc_bin="$tmp/mc-bin"; mc_log="$tmp/mc-sshfs.log"; mkdir -p "$mc_bin" "$tmp/mc-mount"; : > "$tmp/mc-ssh_config"
+printf '#!/bin/sh\nif [ "$1" = --help ]; then [ -n "$MC_NO_MAX" ] || echo "-o max_conns=N"; exit 0; fi\necho "$*" > %s\nexit 1\n' \
+  "'$mc_log'" > "$mc_bin/sshfs"; chmod +x "$mc_bin/sshfs"
+mc_opts() {  # prints the arguments mount-project passed to (fake) sshfs
+  : > "$mc_log"
+  PATH="$mc_bin:$PATH" "$ROOT/scripts/mount-project.sh" --alias box --remote-path /p \
+    --ssh-config "$tmp/mc-ssh_config" --mountpoint "$tmp/mc-mount" >/dev/null 2>&1 || true
+  cat "$mc_log"
+}
+case "$(mc_opts)" in *max_conns=4*) ;; *) fail "sshfs was not mounted with max_conns=4 by default";; esac
+mc_off="$(RH_SSHFS_MAX_CONNS=1 mc_opts)"; mc_unsupported="$(MC_NO_MAX=1 mc_opts)"
+[ -n "$mc_off" ] && [ -n "$mc_unsupported" ] || fail "fake sshfs was not invoked"
+case "$mc_off$mc_unsupported" in *max_conns*) fail "max_conns passed when disabled or unsupported";; esac
+
+# --- mount-project.sh: a detached sshfs is stopped only when unused and idle -------------------
+if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then
+  ds_mp="$tmp/detached-mount"; ds_cfg="$tmp/detached-ssh_config"; mkdir -p "$ds_mp"; : > "$ds_cfg"
+  ds_title="sshfs box:/p $ds_mp -o reconnect,ssh_command=/usr/bin/ssh -F $ds_cfg"
+  ds_fake() {  # $1 = process title, $2 = 1 to keep doing I/O; prints the pid
+    perl -e '$0 = $ARGV[0]; open(my $n, ">", "/dev/null");
+             while (1) { syswrite($n, "x" x 65536) if $ARGV[1]; select(undef, undef, undef, 0.2) }' \
+      "$1" "$2" >/dev/null 2>&1 &
+    printf '%s' "$!"
+  }
+  ds_unmount() { "$ROOT/scripts/mount-project.sh" --alias box --unmount --mountpoint "$ds_mp" 2>/dev/null; }
+  ds_idle=$(ds_fake "$ds_title" 0); ds_sftp=$(ds_fake "/usr/bin/ssh -F $ds_cfg -x box -s sftp" 0); sleep 0.5
+  # Neither the unmounted daemon nor its sftp ssh keeps the session SSH config in use.
+  RH_HOME="$tmp/ds-rh" sh "$ROOT/scripts/session-reaper.sh" config-used "$ds_cfg" | grep -qx USED=0 \
+    || fail "an sshfs whose mount is gone kept its SSH config in use"
+  kill "$ds_sftp" 2>/dev/null || true
+  RH_PROGRESS_FD=3 RH_SSHFS_IDLE_SECONDS=2 ds_unmount 3>"$tmp/ds-progress" | grep -qx STATUS=unmounted || fail "detached sshfs unmount status"
+  assert_grep "$tmp/ds-progress" "RH_PROGRESS=unmounted" "unmount reports detach progress"
+  assert_grep "$tmp/ds-progress" "RH_PROGRESS=sshfs-wait" "unmount reports waiting for a lingering sshfs"
+  sleep 0.5
+  ! kill -0 "$ds_idle" 2>/dev/null || fail "idle detached sshfs kept running"
+  ds_used=$(ds_fake "$ds_title" 0); (cd "$ds_mp" && exec sleep 30) & ds_holder=$!; sleep 0.5
+  RH_SSHFS_IDLE_SECONDS=2 ds_unmount >/dev/null
+  kill -0 "$ds_used" 2>/dev/null || fail "detached sshfs was stopped while its mount path was in use"
+  kill "$ds_holder" "$ds_used" 2>/dev/null || true; wait "$ds_holder" 2>/dev/null || true
+  ds_busy=$(ds_fake "$ds_title" 1); sleep 0.5
+  RH_SSHFS_IDLE_SECONDS=2 RH_SSHFS_SYNC_MAX_SECONDS=4 ds_unmount >/dev/null
+  kill -0 "$ds_busy" 2>/dev/null || fail "detached sshfs was stopped while it was still syncing"
+  kill "$ds_busy" 2>/dev/null || true
+fi
+
+# macOS bash 3.2 reads non-ASCII bytes right after "$name" as part of the variable name (e.g. a
+# full-width bracket in a Chinese prompt), which fails under set -u. Such variables must be braced.
+python3 - "$ROOT"/scripts/*.sh <<'PY'
+import re, sys
+bad = [f"{path}:{n}" for path in sys.argv[1:]
+       for n, line in enumerate(open(path, encoding="utf-8"), 1)
+       if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line)]
+assert not bad, "unbraced $var before a non-ASCII character: " + ", ".join(bad)
+PY
 
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   doc_list() { git -C "$ROOT" ls-files --cached --others --exclude-standard '*.md'; }

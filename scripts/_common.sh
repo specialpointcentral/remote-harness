@@ -23,15 +23,93 @@ else
 fi
 
 # ---- output helpers --------------------------------------------------------
-say()  { printf '%s\n' "$*"; }
-ok()   { printf "  ${_G}✓${_0} %s\n" "$*"; }
-warn() { printf "  ${_Y}⚠${_0} %s\n" "$*"; }
-err()  { printf "  ${_R}✗${_0} %s\n" "$*" >&2; }
-hdr()  { printf "\n${_B}${_D}── %s${_0}\n" "$*"; }
-sep()  { printf '\n'; }
+say()  { step_freeze; printf '%s\n' "$*"; }
+ok()   { step_freeze; printf "  ${_G}✓${_0} %s\n" "$*"; }
+warn() { step_freeze; printf "  ${_Y}⚠${_0} %s\n" "$*"; }
+err()  { step_freeze; printf "  ${_R}✗${_0} %s\n" "$*" >&2; }
+hdr()  { step_freeze; printf "\n${_B}${_D}── %s${_0}\n" "$*"; }
+sep()  { step_freeze; printf '\n'; }
+is_zh() { case "${RH_LANG:-en}" in zh|zh_*|zh-*|cn|CN|中文) return 0;; *) return 1;; esac; }
+tr2()   { if is_zh; then printf '%s' "$2"; else printf '%s' "$1"; fi; }  # $1 English, $2 Chinese
+# Package install hint for this machine (macOS: Homebrew; Linux: the detected package manager).
+pkg_install_hint() {  # $1 = package name
+  case "$(uname -s 2>/dev/null)" in Darwin) printf 'brew install %s' "$1"; return;; esac
+  if   command -v apt-get >/dev/null 2>&1; then printf 'sudo apt-get install -y %s' "$1"
+  elif command -v dnf     >/dev/null 2>&1; then printf 'sudo dnf install -y %s' "$1"
+  elif command -v pacman  >/dev/null 2>&1; then printf 'sudo pacman -S --noconfirm %s' "$1"
+  elif command -v zypper  >/dev/null 2>&1; then printf 'sudo zypper install -y %s' "$1"
+  elif command -v apk     >/dev/null 2>&1; then printf 'sudo apk add %s' "$1"
+  else printf "install '%s' with your package manager" "$1"; fi
+}
+
+# ---- step progress -----------------------------------------------------------
+# One line per step: "[n/T] ⠹ label…  12s" with a live spinner on a terminal, then
+# "[n/T] ✓ label  3s" (⚠ / ✗ on warn / fail). Elapsed time, not a percentage: network-bound steps
+# have no predictable duration. Off a terminal (pipes, tests, RH_NO_PROGRESS=1) every step prints a
+# plain start line and a plain end line. Any other output or prompt during a step first freezes the
+# spinner line, so nothing it prints, and no prompt, is ever overwritten. The counter continues
+# across exec through RH_STEP_BASE; laptop-setup.sh contributes RH_LAPTOP_STEPS steps.
+RH_LAPTOP_STEPS=6
+STEP_N="${RH_STEP_BASE:-0}" STEP_TOTAL=0 STEP_LABEL="" STEP_T0=0 STEP_SPIN_PID=""
+step_tty() { [ -t 1 ] && [ -z "${RH_NO_PROGRESS:-}" ] && [ "${TERM:-dumb}" != dumb ]; }
+step_stop_spinner() {
+  [ -n "$STEP_SPIN_PID" ] || return 0
+  kill "$STEP_SPIN_PID" 2>/dev/null || true
+  wait "$STEP_SPIN_PID" 2>/dev/null || true
+  STEP_SPIN_PID=""
+  printf '\r\033[K'
+}
+step_spin() {  # draw the current step until stopped; exits on its own if the main shell dies
+  local _prefix="[$STEP_N/$STEP_TOTAL]"
+  (
+    trap 'exit 0' TERM
+    _owner=$$ _i=0 _frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+    while kill -0 "$_owner" 2>/dev/null; do
+      printf "\r\033[K  %s ${_C}%s${_0} %s…  ${_D}%ss${_0}" "$_prefix" "${_frames[$_i]}" "$STEP_LABEL" "$((SECONDS - STEP_T0))"
+      _i=$(( (_i + 1) % 10 )); sleep 0.15
+    done
+  ) &
+  STEP_SPIN_PID=$!
+}
+# Freeze a running spinner into a static line. Only the main shell owns the spinner; output from a
+# command substitution must not touch it.
+step_freeze() {
+  [ -n "$STEP_SPIN_PID" ] && [ "${BASH_SUBSHELL:-0}" = 0 ] || return 0
+  step_stop_spinner
+  printf "  [%s/%s] ${_C}⋯${_0} %s…\n" "$STEP_N" "$STEP_TOTAL" "$STEP_LABEL"
+}
+step_begin() {  # [-s] LABEL   (-s: no spinner, for steps that may prompt or run sudo)
+  local _spin=1
+  [ "${1:-}" = -s ] && { _spin=0; shift; }
+  [ -z "$STEP_LABEL" ] || step_end ok
+  STEP_N=$((STEP_N + 1)) STEP_LABEL="$1" STEP_T0=$SECONDS
+  [ "$STEP_TOTAL" -ge "$STEP_N" ] || STEP_TOTAL=$STEP_N
+  if [ "$_spin" = 1 ] && step_tty; then step_spin
+  else printf "  [%s/%s] %s…\n" "$STEP_N" "$STEP_TOTAL" "$STEP_LABEL"; fi
+}
+step_label() {  # rename the running step (e.g. while waiting on something specific); keeps its timer
+  [ -n "$STEP_LABEL" ] || return 0
+  STEP_LABEL="$1"
+  if [ -n "$STEP_SPIN_PID" ]; then step_stop_spinner; step_spin
+  else printf "  [%s/%s] %s…\n" "$STEP_N" "$STEP_TOTAL" "$1"; fi
+}
+step_end() {  # ok|warn|fail [detail]
+  [ -n "$STEP_LABEL" ] || return 0
+  local _mark
+  case "${1:-ok}" in warn) _mark="${_Y}⚠${_0}";; fail) _mark="${_R}✗${_0}";; *) _mark="${_G}✓${_0}";; esac
+  step_stop_spinner
+  printf "  [%s/%s] %s %s%s  ${_D}%ss${_0}\n" "$STEP_N" "$STEP_TOTAL" "$_mark" "$STEP_LABEL" "${2:+ — $2}" "$((SECONDS - STEP_T0))"
+  STEP_LABEL=""
+}
+step_reset() {  # $1 = total steps of a new sequence (e.g. the exit cleanup)
+  step_stop_spinner
+  STEP_LABEL="" STEP_N=0 STEP_TOTAL="$1"
+}
+
 # Yes/no prompt on the tty. Honors a caller-set ASSUME_YES=1 (non-interactive).
 ask() {
   [ "${ASSUME_YES:-0}" = 1 ] && return 0
+  step_freeze
   printf "${_Y}?${_0} %s [y/N] " "$1" >/dev/tty
   local a=""; read -r a </dev/tty || true
   case "$a" in y|Y|yes|YES) return 0;; *) return 1;; esac

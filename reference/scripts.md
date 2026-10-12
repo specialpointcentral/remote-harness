@@ -2,12 +2,23 @@
 
 - `simple-bootstrap.sh`: public local entry; fetches reverse helpers when the skill exists only remotely.
 - `simple-dispatch.sh`: reverse-only dispatcher; rejects forward.
-- `simple-laptop-setup.sh`: local reverse wizard.
+- `simple-laptop-setup.sh`: local reverse wizard. A remembered remote mountpoint is offered only for the
+  project it was chosen for; otherwise the default is auto (`~/.remote-harness/mounts/<project dir name>`).
 - `laptop-setup.sh`: creates the reverse tunnel, forced authorization, mount, remote agent, and cleanup.
+  After the local checks it opens a command-line-only multiplexing master (short `/tmp/rh.*` socket,
+  `ControlPersist=300`) so later setup calls, the agent launch, and cleanup skip the per-connection
+  SSH handshake; the reverse tunnel keeps its own connection.
 - `simple-local-setup.sh`, `local-setup.sh`: compatibility stubs that reject local-agent execution.
 - `setup-tunnel.sh`: creates remote session SSH config and a per-session key.
 - `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`.
-- `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS.
+- `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS, with
+  `max_conns=4` parallel SFTP connections where sshfs supports it (`RH_SSHFS_MAX_CONNS`, `1` disables)
+  so a long scan does not queue every other file request. An sshfs daemon that outlives its unmount is
+  stopped only when nothing uses the mountpoint and either the unmount was clean (1s grace: the kernel
+  already confirmed no open files) or the daemon itself has made no I/O progress for
+  `RH_SSHFS_IDLE_SECONDS` (default 3; its ssh connections' keepalives do not count); its sftp ssh then
+  exits on EOF. A daemon still flushing writes is left running once `RH_SSHFS_SYNC_MAX_SECONDS`
+  (default 120) passes. Without `/proc` nothing is stopped.
 - `inject-rule.sh`: installs session instructions, Claude/Codex hooks or the opencode plugin, and the
   remote runner. opencode emits a readiness marker path that must be observed before launch.
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
@@ -16,7 +27,9 @@
 - `run-on-project-host.sh`: validates and executes the local project command (in `watch` mode with
   `/dev/null` stdin, its own process group, and a channel-EOF watchdog), or runs an allowlisted
   `git`/`rg` directly (no shell, fixed PATH) and stops it when the SSH channel closes. Its client
-  side sets per-connection keepalives and the optional multiplexing master.
+  side sets per-connection keepalives and the optional multiplexing master. `--find-tool <git|rg>`
+  reports where the tool verb finds a tool; `laptop-setup.sh` uses it before launch to print ✓ or a ⚠
+  with an install hint, because a missing tool makes the agent scan the project over SSHFS.
 - `project-host-gateway.sh`: forced SSH command accepting only SFTP, health, the fixed exec protocol,
   and the `git`/`rg` tool verb.
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
@@ -32,7 +45,8 @@
   session SSH config with its private key.
   Mount registration, launcher release and GC share a lock and track command versus actual SSHFS
   configs separately. Failed unmounts retain reconnect config and implementation. `release-config`
-  reports `USED=0` only when the specific transport can be reclaimed; failure keeps local tunnel,
+  reports `USED=0` only when the specific transport can be reclaimed; an sshfs daemon (or its sftp ssh)
+  counts as using a config only while its mountpoint is still mounted. Failure keeps local tunnel,
   config and authorization records for retry. Runtime entries use per-session `impl` copies; local
   gateway implementations use per-key copies.
 

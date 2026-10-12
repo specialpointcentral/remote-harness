@@ -26,10 +26,6 @@ else
   exit 2
 fi
 
-LANG_MODE="${RH_LANG:-en}"
-is_zh() {
-  case "$LANG_MODE" in zh|zh_*|zh-*|cn|CN|中文) return 0;; *) return 1;; esac
-}
 
 prompt_line() {
   _label="$1"
@@ -149,12 +145,13 @@ cache_save() {
   mkdir -p "$(dirname "$_cache")" 2>/dev/null || true
   _tmp="$(mktemp "${_cache}.XXXXXX" 2>/dev/null)" || return 0
   if [ -f "$_cache" ]; then
-    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_LAUNCH|LAST_YOLO)=' "$_cache" 2>/dev/null > "$_tmp" || true
+    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_MOUNT_PROJECT|LAST_LAUNCH|LAST_YOLO)=' "$_cache" 2>/dev/null > "$_tmp" || true
   fi
   for _kv in \
     "LAST_VIA=$VIA" \
     "LAST_PROJECT_DIR=$PROJECT_DIR" \
     "LAST_REMOTE_MOUNTPOINT=$REMOTE_MP" \
+    "LAST_MOUNT_PROJECT=$PROJECT_DIR" \
     "LAST_LAUNCH=$LAUNCH" \
     "LAST_YOLO=$YOLO"; do
     case "$_kv" in *'
@@ -235,20 +232,13 @@ else
 fi
 
 if [ -z "$REMOTE_MP" ]; then
-  cached_mp="$(cache_get LAST_REMOTE_MOUNTPOINT)"
-  if [ -n "$cached_mp" ]; then
-    if is_zh; then
-      REMOTE_MP="$(prompt_line '远端挂载点（auto = 远端 ~/.remote-harness/mounts/<project>）' "$cached_mp" 0)"
-    else
-      REMOTE_MP="$(prompt_line 'Remote mountpoint (auto = remote ~/.remote-harness/mounts/<project>)' "$cached_mp" 0)"
-    fi
-  else
-    if is_zh; then
-      REMOTE_MP="$(prompt_line '远端挂载点（留空 = 远端 ~/.remote-harness/mounts/<project>）' '' 0)"
-    else
-      REMOTE_MP="$(prompt_line 'Remote mountpoint (blank = remote ~/.remote-harness/mounts/<project>)' '' 0)"
-    fi
-  fi
+  # A remembered mountpoint belongs to the project it was chosen for; any other project (or a cache
+  # written before that was recorded) defaults to auto, shown with the name it will actually use.
+  cached_mp=""
+  if [ "$(cache_get LAST_MOUNT_PROJECT)" = "$PROJECT_DIR" ]; then cached_mp="$(cache_get LAST_REMOTE_MOUNTPOINT)"; fi
+  auto_mp="~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"
+  if [ -n "$cached_mp" ]; then mp_hint="$(tr2 auto auto)"; else mp_hint="$(tr2 blank 留空)"; fi
+  REMOTE_MP="$(prompt_line "$(tr2 "Remote mountpoint ($mp_hint = remote $auto_mp)" "远端挂载点（${mp_hint} = 远端 ${auto_mp}）")" "$cached_mp" 0)"
 fi
 REMOTE_MP="${REMOTE_MP%/}"
 case "$REMOTE_MP" in auto|AUTO|-) REMOTE_MP="";; esac
@@ -301,7 +291,11 @@ if [ "$?" -ne 0 ]; then
 fi
 cache_save
 
-if is_zh; then hdr "准备远端临时隧道别名"; else hdr "Preparing remote tunnel alias"; fi
+# This step, then laptop-setup.sh's RH_LAPTOP_STEPS (the counter continues across exec).
+step_reset $((RH_LAPTOP_STEPS + 1))
+trap '[ -z "$STEP_LABEL" ] || step_end fail' EXIT
+sep
+step_begin "$(tr2 "Preparing remote tunnel alias" "准备远端临时隧道别名")"
 LAPTOP_USER="$(id -un 2>/dev/null || echo user)"
 setup_out="$(
   # shellcheck disable=SC2086 # intentional ssh-arg word splitting; never evaluated.
@@ -320,6 +314,7 @@ setup_out="$(
 )"
 setup_rc=$?
 if [ "$setup_rc" -ne 0 ]; then
+  step_end fail
   err "Remote setup-tunnel.sh failed."
   printf '%s\n' "$setup_out" >&2
   exit "$setup_rc"
@@ -332,11 +327,7 @@ BOX_SSH_CONFIG="$(printf '%s\n' "$setup_out" | kv_value CONFIG)"
 [ -n "$PORT" ] || { err "Remote setup did not return PORT."; printf '%s\n' "$setup_out" >&2; exit 1; }
 [ -n "$BOX_SSH_CONFIG" ] || { err "Remote setup did not return CONFIG."; printf '%s\n' "$setup_out" >&2; exit 1; }
 [ -n "$ALIAS" ] || ALIAS="$BOX_ALIAS"
-if is_zh; then
-  ok "远端临时别名 '$ALIAS' 已准备好，端口 $PORT"
-else
-  ok "Remote alias '$ALIAS' prepared on port $PORT"
-fi
+step_end ok "$(tr2 "Remote alias '$ALIAS' prepared on port $PORT" "远端临时别名 '$ALIAS' 已准备好，端口 $PORT")"
 
 cmd=(bash "$SCRIPT_DIR/laptop-setup.sh"
   --host "$V_HOST"
@@ -350,10 +341,7 @@ cmd=(bash "$SCRIPT_DIR/laptop-setup.sh"
 [ -n "$REMOTE_MP" ] && cmd+=(--remote-mountpoint "$REMOTE_MP")
 [ "$YOLO" = 1 ] && cmd+=(--yolo)
 
-sep
-if is_zh; then
-  say "交给 laptop-setup.sh 继续处理 SSH server、隧道、挂载、规则注入和启动。"
-else
-  say "Handing off to laptop-setup.sh for SSH server, tunnel, mount, rule injection, and launch."
-fi
+export RH_STEP_BASE="$STEP_N"
+step_reset 0
+trap - EXIT
 exec "${cmd[@]}"

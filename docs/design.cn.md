@@ -70,6 +70,9 @@ PATH 垫片（`project-host-tool.py`）。在 SSHFS 上，这类扫描的每次 
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` 的调用、`--stdin`/`--batch`，以及参数里出现挂载点外
   已存在的远端路径。在挂载点上远端执行的 git 会带上 `-c core.checkStat=minimal
   -c core.trustctime=false`，避免项目主机写入的 index 迫使逐个读取文件内容；
+- 通过环境变量传入的 git 配置（Claude Code 内部调用会设置的 `GIT_CONFIG_PARAMETERS`，以及
+  `GIT_CONFIG_COUNT`/`KEY`/`VALUE`）会转成 `-c` 一起转发；只有无法解析时才留在远端执行，因此会话启动时的
+  git 快照不会在 SSHFS 上扫描整个工作区；
 - 参数里的挂载路径映射为项目根，rg 输出记录再映射回挂载路径；
 - 在项目主机上，工具从固定 PATH 直接 exec、不经 shell；SSH 通道关闭时终止该工具，所以调用方被
   取消或链路断开时不会留下仍在扫描的进程；

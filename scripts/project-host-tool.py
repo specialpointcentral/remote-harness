@@ -19,6 +19,7 @@ import fcntl
 import os
 import random
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -63,7 +64,6 @@ GIT_PASSTHROUGH_GLOBALS = {
 GIT_LOCAL_ENV = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
-    "GIT_CONFIG_PARAMETERS",
     "GIT_DIR",
     "GIT_INDEX_FILE",
     "GIT_NAMESPACE",
@@ -75,6 +75,7 @@ GIT_PATHSPEC_ENV = {
     "GIT_ICASE_PATHSPECS": "--icase-pathspecs",
     "GIT_LITERAL_PATHSPECS": "--literal-pathspecs",
     "GIT_NOGLOB_PATHSPECS": "--noglob-pathspecs",
+    "GIT_NO_REPLACE_OBJECTS": "--no-replace-objects",
 }
 GIT_LOCAL_ARGS = ("--batch", "--open-files-in-pager", "--output", "--pathspec-from-file", "--stdin")
 # Process-level settings for git that still runs on the SSHFS mount: compare whole-second mtime and
@@ -158,6 +159,19 @@ def git_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
         if os.environ.get(name):
             raise StayLocal()
     routed: list[str] = []
+    # Claude Code hardens every internal git call with GIT_CONFIG_PARAMETERS (git's own sq-quoted
+    # `-c` list). Forward those entries as `-c` instead of staying local: a local `git status` at
+    # session start would otherwise scan the whole work tree over SSHFS and stall the agent.
+    params = os.environ.get("GIT_CONFIG_PARAMETERS", "")
+    if params.strip():
+        try:
+            entries = shlex.split(params)
+        except ValueError:
+            raise StayLocal()
+        for entry in entries:
+            if not entry or entry.startswith("="):
+                raise StayLocal()
+            routed += ["-c", ctx.translate_arg(entry, cwd)]
     try:
         count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or "0")
     except ValueError:

@@ -79,6 +79,9 @@ project host:
   `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`, `--stdin`/`--batch`, and arguments naming existing
   remote paths outside the mount. Remote git on the mount gets `-c core.checkStat=minimal
   -c core.trustctime=false` so an index written on the project host does not force content reads;
+- git config passed through the environment (`GIT_CONFIG_PARAMETERS`, which Claude Code sets on its
+  internal calls, and `GIT_CONFIG_COUNT`/`KEY`/`VALUE`) is forwarded as `-c`; only an unparsable value
+  keeps the call remote, so the session-start git snapshot never scans the whole tree over SSHFS;
 - mount paths in arguments are mapped to the project root, and rg output records are mapped back;
 - on the project host, the tool is exec'd without a shell from a fixed PATH and terminated when the
   SSH channel closes, so a cancelled caller or dropped link does not leave a scan running;

@@ -107,18 +107,94 @@ emit_session_policy() {
   kill_user_processes_enabled && emit KILL_USER_PROCESSES 1
   return 0
 }
+# Progress markers for an interactive caller (the laptop's exit steps). Written only to the fd named
+# by RH_PROGRESS_FD, never to stdout, which stays KEY=VALUE.
+progress() {
+  [ -n "${RH_PROGRESS_FD:-}" ] || return 0
+  case "$RH_PROGRESS_FD" in *[!0-9]*) return 0;; esac
+  { printf 'RH_PROGRESS=%s\n' "$1" >&"$RH_PROGRESS_FD"; } 2>/dev/null || true
+}
+# This user's sshfs daemons whose mountpoint argument is $1 or $2 (two spellings of one mountpoint).
+sshfs_pids_for() {
+  ps -ww -u "$(id -u)" -o pid= -o args= 2>/dev/null | awk -v a="$1" -v b="${2:-}" '
+    { n = split($0, f, " ")
+      if (n >= 4 && (f[2] == "sshfs" || f[2] ~ /\/sshfs$/) && (f[4] == a || (b != "" && f[4] == b))) print f[1] }'
+}
+mount_path_in_use() {  # any process of this user with its cwd or an open file under $1
+  find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -user "$(id -u)" \
+    \( -lname "$1" -o -lname "$1/*" \) -print -quit 2>/dev/null | grep -q .
+}
+io_signature() {  # cumulative read/write byte counters of the given pids
+  for _ios_p in "$@"; do
+    awk '/^(rchar|wchar):/ {printf "%s ", $2}' "/proc/$_ios_p/io" 2>/dev/null || printf 'gone '
+  done
+}
+# A detached mount's sshfs should exit by itself, but one whose worker threads are still blocked on
+# its SFTP connections (more likely with max_conns, or a dropped tunnel) can linger indefinitely.
+# Stop it only when that is safe. After a clean unmount the kernel already guaranteed no open files
+# (sshfs completes writes on close), so a 1s grace suffices. After a lazy (or earlier, unknown) detach
+# nothing may still use the mountpoint, and the daemon itself must show no read/write progress for
+# RH_SSHFS_IDLE_SECONDS (default 3); keepalives of its ssh connections are not its own I/O. A daemon
+# still making progress is left running once RH_SSHFS_SYNC_MAX_SECONDS (default 120) passes. Its sftp
+# ssh exits on EOF once sshfs is gone. Without /proc there is no reliable progress signal: no-op.
+stop_detached_sshfs() {  # $1 = clean|lazy, $2/$3 = mountpoint spellings no longer in the mount table
+  [ -d /proc/self ] || return 0
+  _sds_mode="$1"; shift
+  _sds_pids="$(sshfs_pids_for "$@")"
+  [ -n "$_sds_pids" ] || return 0
+  progress sshfs-wait
+  _sds_limit="${RH_SSHFS_IDLE_SECONDS:-3}"
+  if [ "$_sds_mode" = clean ]; then _sds_limit=1
+  elif mount_path_in_use "$1"; then return 0; fi
+  _sds_idle=0 _sds_waited=0 _sds_last=""
+  while [ "$_sds_idle" -lt "$_sds_limit" ]; do
+    [ "$_sds_waited" -lt "${RH_SSHFS_SYNC_MAX_SECONDS:-120}" ] || return 0  # still progressing: leave it
+    _sds_waited=$((_sds_waited + 1))
+    _sds_alive=""
+    for _sds_p in $_sds_pids; do kill -0 "$_sds_p" 2>/dev/null && _sds_alive="$_sds_alive $_sds_p"; done
+    _sds_pids="$_sds_alive"
+    [ -n "$_sds_pids" ] || return 0                                         # exited by itself
+    # shellcheck disable=SC2086
+    _sds_now="$(io_signature $_sds_pids)"
+    if [ "$_sds_now" = "$_sds_last" ]; then _sds_idle=$((_sds_idle + 1)); else _sds_idle=0 _sds_last="$_sds_now"; fi
+    sleep 1
+  done
+  [ "$_sds_mode" = clean ] || ! mount_path_in_use "$1" || return 0
+  note "remote-harness: stopping sshfs for detached $1 (no I/O progress)"
+  for _sds_sig in TERM KILL; do
+    # shellcheck disable=SC2086
+    kill "-$_sds_sig" $_sds_pids 2>/dev/null || true
+    _sds_i=0
+    # shellcheck disable=SC2086
+    while [ "$_sds_i" -lt 10 ] && kill -0 $_sds_pids 2>/dev/null; do sleep 0.5; _sds_i=$((_sds_i + 1)); done
+    # shellcheck disable=SC2086
+    kill -0 $_sds_pids 2>/dev/null || break
+  done
+  return 0
+}
 do_unmount() {
   _du_canon="$(canon_mountpoint "$1")"
-  for _du_target in "$1" "$_du_canon"; do
+  detach_mount "$1" "$_du_canon"
+  _du_status=$?
+  is_mounted "$1" && return 1
+  progress unmounted
+  # Also covers a mount an earlier lazy unmount already detached while its daemon stayed wedged.
+  if [ "$_du_status" = 0 ]; then stop_detached_sshfs clean "$1" "$_du_canon"
+  else stop_detached_sshfs lazy "$1" "$_du_canon"; fi
+  [ "$_du_status" != 1 ]
+}
+detach_mount() {  # $1 = mountpoint, $2 = canonical spelling -> 0 clean, 2 lazy, 1 nothing detached
+  for _du_target in "$1" "$2"; do
     [ -n "$_du_target" ] || continue
     fusermount -u "$_du_target" 2>/dev/null && return 0
     fusermount3 -u "$_du_target" 2>/dev/null && return 0
     umount "$_du_target" 2>/dev/null && return 0
     # A dead tunnel can leave the FUSE endpoint busy; lazily detach it as the unprivileged owner.
-    fusermount -uz "$_du_target" 2>/dev/null && return 0
-    fusermount3 -uz "$_du_target" 2>/dev/null && return 0
-    umount -l "$_du_target" 2>/dev/null && return 0
-    [ "$_du_target" = "$_du_canon" ] && break
+    # Files may still be open on a lazily detached mount.
+    fusermount -uz "$_du_target" 2>/dev/null && return 2
+    fusermount3 -uz "$_du_target" 2>/dev/null && return 2
+    umount -l "$_du_target" 2>/dev/null && return 2
+    [ "$_du_target" = "$2" ] && break
   done
   return 1
 }
@@ -229,6 +305,15 @@ case "$OS" in
   *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,idmap=user";;
 esac
 SSH_BIN="$(command -v ssh 2>/dev/null || printf 'ssh')"
+# Parallel SFTP connections keep one long scan (a whole-tree lstat over a high-latency tunnel) from
+# queueing every other file request behind it. Only sshfs builds that advertise it get the option;
+# RH_SSHFS_MAX_CONNS=1 turns it off.
+MAX_CONNS="${RH_SSHFS_MAX_CONNS:-4}"
+case "$MAX_CONNS" in ''|*[!0-9]*) MAX_CONNS=4;; esac
+if [ "$MAX_CONNS" -gt 1 ] && "$SSHFS_BIN" --help 2>&1 | grep -q 'max_conns'; then
+  [ "$MAX_CONNS" -le 16 ] || MAX_CONNS=16
+  SSHFS_OPTS="$SSHFS_OPTS,max_conns=$MAX_CONNS"
+fi
 SSHFS_OPTS="$SSHFS_OPTS,ssh_command=$SSH_BIN -F $SSH_CONFIG"
 if "$SSHFS_BIN" "$ALIAS:$RPATH" "$MP" -o "$SSHFS_OPTS" 2>"$err"; then
   _ready=0
