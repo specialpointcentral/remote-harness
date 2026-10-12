@@ -11,10 +11,14 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/simple-dispatch.sh`: accepts reverse only; forward is rejected.
 - `scripts/simple-laptop-setup.sh` / `laptop-setup.sh`: local reverse orchestration.
 - `scripts/simple-local-setup.sh` / `local-setup.sh`: permanent local-agent rejection stubs.
-- `scripts/project-host-gateway.sh`: forced SSH command accepting only SFTP, health, and exec.
+- `scripts/project-host-gateway.sh`: forced SSH command accepting only SFTP, health, exec, and the
+  allowlisted `git`/`rg` tool verb.
 - `scripts/route-command.py`: Claude/Codex hook policy and cwd mapping.
 - `scripts/inject-rule.sh`: also generates the session opencode `tool.execute.before` plugin.
-- `scripts/run-on-project-host.sh`: validated local project command dispatcher.
+- `scripts/run-on-project-host.sh`: validated local project command and tool dispatcher.
+- `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
+- `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
+- `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
 - `reference/` and `docs/`: English Markdown has matching `.cn.md` documentation.
 
 ## Simple Reverse Rules
@@ -38,13 +42,27 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Local authorization includes `command="...project-host-gateway..."`, loopback source limits,
   no PTY, no port forwarding, no X11, and no agent forwarding.
 - Refuse a session key already present in an unrestricted user authorization line.
-- The gateway accepts only standard SFTP, `remote-harness-health`, and
-  `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`.
+- The gateway accepts only standard SFTP, `remote-harness-health`,
+  `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`, and
+  `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`; the tool verb execs the binary
+  directly (no shell, fixed PATH). Watched exec and the tool verb give the command `/dev/null`
+  stdin and stop its process group and tree when the SSH channel closes.
 - The registered physical project root must match every exec request.
 - Reject direct local launches of `claude`, `codex`, and `opencode` in both hook and dispatcher;
   scrub common AI credentials and shadow those binaries in the local command PATH.
 - Arbitrary project shell is Turing-complete. Absolute isolation requires a dedicated local OS
   account without AI credentials or agent installations.
+
+## Internal Git And Search
+
+- Agent-internal `git`/`rg` calls never pass through PreToolUse hooks. Session PATH shims route
+  only work-tree scans (`status`, `diff`, `log`, `ls-files`, `grep`, `rg`, ...) to the project host
+  and keep path discovery (`rev-parse`, `config`, ...) on the remote host.
+- Calls outside the mount, or naming another repository/index, run the real tool unchanged.
+- A routed call that cannot reach the project host fails non-zero; it never reports clean or
+  no-match and never falls back to scanning SSHFS.
+- Routed calls share a per-session concurrency cap and a short-lived OpenSSH multiplexing master
+  passed on the command line only; generated `ssh_config` files keep `ControlMaster no`.
 
 ## Claude Multi-Agent
 
@@ -59,7 +77,9 @@ it provides files over SSHFS and executes project commands through a forced gate
 2. Session SSH config and mutable host-key state stay under `~/.remote-harness/.sessions`.
 3. Only the tagged forced-gateway `authorized_keys` block may change under `~/.ssh`.
 4. Cleanup removes mounts, per-session remote keys, gateway registration, authorization, hooks,
-   and temporary SSH state.
+   and temporary SSH state. When local cleanup cannot run, the remote session watcher and the next
+   launch's GC reap dead sessions; they only touch `$RH_HOME/.sessions` children and never unmount a
+   mount another live session uses.
 5. Programmatically consumed scripts retain `KEY=VALUE` stdout.
 6. Keep bilingual Markdown pairs synchronized.
 
@@ -67,7 +87,7 @@ it provides files over SSHFS and executes project commands through a forced gate
 
 ```bash
 bash -n manage.sh tests/regression.sh scripts/*.sh
-python3 -m py_compile scripts/route-command.py tests/codex_tui_e2e.py
+python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py tests/codex_tui_e2e.py
 bash tests/regression.sh
 git diff --check
 ```

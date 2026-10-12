@@ -303,17 +303,10 @@ cache_save
 
 if is_zh; then hdr "准备远端临时隧道别名"; else hdr "Preparing remote tunnel alias"; fi
 LAPTOP_USER="$(id -un 2>/dev/null || echo user)"
-session_label="$(printf '%s' "$BOX_ALIAS" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/^[._-]*//; s/[._-]*$//')"
-[ -n "$session_label" ] || session_label="rlocal"
-mkdir -p "$HOME/.remote-harness/.sessions" 2>/dev/null || true
-source_session="$(mktemp -d "$HOME/.remote-harness/.sessions/source-${session_label}.XXXXXX")" || exit 2
-source_kh="$source_session/known_hosts"
 setup_out="$(
   # shellcheck disable=SC2086 # intentional ssh-arg word splitting; never evaluated.
   ssh -n -o ClearAllForwardings=yes \
-    -o UserKnownHostsFile="$source_kh" \
-    -o GlobalKnownHostsFile=/dev/null \
-    -o StrictHostKeyChecking=accept-new \
+    -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
     -o ControlMaster=no -o ControlPath=none \
     -o BatchMode=yes -o ConnectTimeout=10 $VIA "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
@@ -326,7 +319,6 @@ setup_out="$(
   " 2>&1
 )"
 setup_rc=$?
-rm -rf "$source_session" 2>/dev/null || true
 if [ "$setup_rc" -ne 0 ]; then
   err "Remote setup-tunnel.sh failed."
   printf '%s\n' "$setup_out" >&2

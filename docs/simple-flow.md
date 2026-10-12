@@ -20,10 +20,26 @@ also selects reverse; there is no mode picker.
 The public entry is `scripts/simple-bootstrap.sh`. It runs on the local machine. When the local
 machine does not already have the helper bundle, the bootstrap fetches these scripts from the remote
 remote-harness installation into a temporary directory under `~/.remote-harness/.sessions/...`.
+The outer command downloads the bootstrap to a file, checks SSH success, non-empty output and Bash
+syntax, then executes it. One further SSH connection transfers the eight helpers plus a bootstrap
+copy and SHA-256 manifest in a staged archive. Fixed filenames and regular-file types are checked
+before extraction; hashes, bootstrap identity and Bash syntax are checked before dispatch. The
+remote staging directory is removed after transfer, and the local bundle is removed on exit.
+Downloads and initial tunnel setup preserve the source SSH alias's verified host identity, use
+strict checking, and disable known-hosts updates. Establish host trust outside the harness before
+first use; no fresh empty known-hosts file overrides the source alias.
 
 The coding agent returns the bootstrap command immediately. Concrete SSH targets, local paths,
 remote mountpoints, ports, and namespaces are collected by the local terminal rather than in the
 agent conversation. A remote `scripts/suggest-via.sh` result may be used only as an editable default.
+
+Mount registration and release use a shared resource lock. Leases record each command transport
+and the actual mount transport; another session can keep a mount, key, runtime and mux alive. Local
+tunnel/config/authorization records remain until the specific remote transport is confirmed unused;
+later launches retry deferred cleanup. Failed unmounts retain their reconnect config. An unregistered
+live mount is not replaced. New sessions copy remote implementations into `impl`; hooks, shims,
+runners and watchers use that snapshot. Local gateway code is copied per key. Legacy sessions are
+not migrated while running. See [design.md](design.md) for lifecycle details.
 
 ## Sequence
 
@@ -32,8 +48,8 @@ agent conversation. A remote `scripts/suggest-via.sh` result may be used only as
    mountpoint, agent CLI, and approval mode.
 3. The remote `setup-tunnel.sh` creates a session directory, session-local SSH config, known-hosts
    file, and a new per-session Ed25519 key.
-4. `laptop-setup.sh` installs stable copies of `project-host-gateway.sh` and
-   `run-on-project-host.sh` under local `~/.remote-harness/bin`.
+4. `laptop-setup.sh` installs per-key snapshots of `project-host-gateway.sh` and
+   `run-on-project-host.sh` under local `~/.remote-harness/.sessions/gateways/<session-tag>/bin`.
 5. The local project root is registered under
    `~/.remote-harness/.sessions/gateways/<session-tag>/project-root.b64`.
 6. The per-session public key is added to local `~/.ssh/authorized_keys` inside a tagged managed
@@ -51,8 +67,9 @@ agent conversation. A remote `scripts/suggest-via.sh` result may be used only as
 12. The local dispatcher verifies the project root and physical cwd, removes common AI credential
     variables, shadows `claude`, `codex`, and `opencode` in `PATH`, then executes the project command
     with the local login shell.
-13. Exit cleanup removes the mount, injected rules, remote session key/config/runtime directory,
-    local gateway registration, temporary authorization, and local session config.
+13. Exit cleanup releases this session's lease. Resources still referenced by another session are
+    retained together; final release removes the mount, implementation, key/config/runtime, gateway
+    and authorization. Unverifiable local release is recorded for a later retry.
 
 ## Gateway Protocol
 

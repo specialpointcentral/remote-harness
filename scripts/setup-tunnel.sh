@@ -70,7 +70,8 @@ done
 if [ -z "$PORT" ]; then
   [ -n "$NAMESPACE" ] || die "need --port PORT or --namespace RU"
   _ns="$(printf '%s' "$NAMESPACE" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/^[._-]*//; s/[._-]*$//')"
-  _inuse="$(listening_ports)"
+  # No listeners (or unavailable platform probing) is an empty list, not a setup failure.
+  _inuse="$(listening_ports || true)"
   _low=$(awk '{print $1}' /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || true)
   [ -z "$_low" ] && _low=$(sysctl -n net.inet.ip.portrange.first 2>/dev/null || true)
   _low=${_low:-32768}

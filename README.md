@@ -153,8 +153,11 @@ simple reverse 使用 `~/.remote-harness/.sessions/...` 下的会话级 SSH 配�
 OpenSSH multiplexing。唯一的 `~/.ssh` 写入例外是在笔记本
 `~/.ssh/authorized_keys` 中追加带标签的临时授权块，并在退出时清理。
 
-远端 key 在本机 `authorized_keys` 中绑定 forced command，只允许标准 SFTP、health 和
-`remote-harness-exec`。任意本机 SSH shell 命令会被 gateway 拒绝。
+远端 key 在本机 `authorized_keys` 中绑定 forced command，只允许标准 SFTP、health、
+`remote-harness-exec`，以及只针对 `git`/`rg` 的 `remote-harness-tool`。任意本机 SSH shell 命令会被
+gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PATH 垫片在本机执行，不再在 SSHFS 上
+逐个 lstat 和读文件；生成的 SSH config 仍关闭 multiplexing，只有路由命令在命令行上使用会话级复用
+连接。连接被强制断开、本机来不及清理时，远端会话 watcher 会自行回收挂载、会话目录和临时 key。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -402,8 +405,13 @@ Simple reverse uses session-local SSH config files and `known_hosts` under
 exception is that the laptop may get a tagged temporary `authorized_keys` block that is
 removed on exit.
 
-The per-session reverse key is bound to a forced SSH command. Only standard SFTP, health checks, and
-`remote-harness-exec` are accepted; arbitrary local SSH shell commands are rejected.
+The per-session reverse key is bound to a forced SSH command. Only standard SFTP, health checks,
+`remote-harness-exec`, and the `git`/`rg`-only `remote-harness-tool` verb are accepted; arbitrary
+local SSH shell commands are rejected. Agent-internal Git status scans and file search run on the
+laptop through session PATH shims instead of lstat-ing and reading files over SSHFS; generated SSH
+configs still disable multiplexing, and only routed commands use a session-scoped master passed on
+the command line. If the connection is force-closed before the laptop can clean up, a remote session
+watcher reclaims the mount, session dir, and temporary key itself.
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 

@@ -26,5 +26,18 @@ Because this adapter is for Codex, the emitted command must use:
 
 If the user asks for yolo / bypass approvals, append `--yolo`.
 
+The session prepends its `git`/`rg` shims to the agent PATH and pins that PATH for Codex shell
+subprocesses with `shell_environment_policy.set.PATH`. Login shells and shell-profile loading are
+disabled for those subprocesses so they cannot reorder the shims. Project commands still use the
+project host's shell through the gateway. These settings apply in both normal and YOLO sessions.
+Before launch, the injector discovers tools in the same remote login+interactive shell environment
+as the agent launcher, including CLI installations under `~/.local/bin`.
+
+The `rg` shim uses the remote PATH's ripgrep, or the standalone Codex bundle's `codex-path/rg`
+beside its resolved `bin/codex`. Other installation layouts should install ripgrep on the remote
+PATH. PATH shims cover external tool calls that resolve `git`/`rg` by name; they do not intercept
+absolute executable paths, in-process searches, or direct file reads. Internal calls do not depend
+on the Bash hook. Real Codex internal-call coverage still needs a manual integration check.
+
 > Tip: `./manage.sh --dev codex` symlinks `$CODEX_HOME/skills/remote-harness` to this repo. Restart
 > Codex after changing installed skills; a running TUI may keep the previous skill inventory.

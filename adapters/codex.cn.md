@@ -23,5 +23,16 @@ setup 脚本使用 `~/.remote-harness` 下的会话级 SSH config 和 wrapper。
 
 如果用户要求 yolo / bypass approvals，则追加 `--yolo`。
 
+会话把 `git`/`rg` 垫片目录放在 Agent PATH 最前面，并通过 `shell_environment_policy.set.PATH`
+固定 Codex shell 子进程的 PATH。这些子进程禁用 login shell 和 shell profile 加载，避免垫片
+被重新排序。项目命令仍通过 gateway 使用本机项目主机的 shell。普通和 YOLO 会话均使用这些设置。
+启动前，注入器在与 Agent 启动器相同的远端登录交互 shell 环境中发现工具，包括 `~/.local/bin`
+下安装的 CLI。
+
+`rg` 垫片优先使用远端 PATH 中的 ripgrep，也支持独立 Codex 安装包里、解析后的 `bin/codex`
+旁的 `codex-path/rg`。其他安装布局应在远端 PATH 中安装 ripgrep。PATH 垫片覆盖按名称查找
+`git`/`rg` 的外部调用，无法拦截绝对可执行路径、进程内搜索或直接文件读取。内部调用不依赖
+Bash hook；真实 Codex 内部调用的覆盖范围仍需手动集成验证。
+
 > 提示：`./manage.sh --dev codex` 会把 `$CODEX_HOME/skills/remote-harness` 软链到本仓库。
 > 修改已安装技能后请重启 Codex；已运行的 TUI 可能保留旧的 skill 列表缓存。

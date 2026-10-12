@@ -22,6 +22,7 @@
 #   inject-rule.sh off <agent> <mountpoint> [session_id]
 #
 # 'on'  prints: RH_STATUS=INJECTED  RH_LAUNCH_ENV=<env prefix>  RH_LAUNCH_FLAGS=<trailing flags>
+#               RH_READY_FILE=<opencode marker>  RH_LAUNCH_PREFIX=<session launcher for the final launch>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
 # Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
 # from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
@@ -152,16 +153,111 @@ write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
   return 0
 }
 
-write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config
+write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config $5=control path $6=python3
   _wsr_runner="$1/bin/rh-run"
+  _wsr_mux=""
+  [ -z "${5:-}" ] || _wsr_mux=" --control-path $(sq "$5")"
+  # With python3, channel-guard.py holds the SSH channel open for the command's lifetime so the
+  # project host stops the command tree when this call is cancelled or the connection drops.
+  _wsr_guard=""
+  if [ -n "${6:-}" ] && [ -f "$SCRIPT_DIR/channel-guard.py" ]; then
+    _wsr_guard="$(sq "$6") -I $(sq "$SCRIPT_DIR/channel-guard.py") -- "
+    _wsr_mux="$_wsr_mux --watch"
+  fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
-    printf 'exec %s --ssh-config %s --alias %s --project-root %s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
-      "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")"
+    printf 'exec %s%s --ssh-config %s --alias %s --project-root %s%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$_wsr_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" "$_wsr_mux"
   } > "$_wsr_runner" || return 1
   chmod +x "$_wsr_runner" 2>/dev/null || return 1
   printf '%s' "$_wsr_runner"
+}
+
+b64_value() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# Short, token-free multiplexing socket beside the session SSH runtime (already the Codex writable
+# root). Empty when the path would exceed the Unix socket limit; callers then connect directly.
+session_control_path() {  # $1=ssh config
+  _scp_runtime="$(dirname "$1" 2>/dev/null)/runtime"
+  mkdir -p "$_scp_runtime" 2>/dev/null || return 0
+  chmod 700 "$_scp_runtime" 2>/dev/null || true
+  _scp_path="$_scp_runtime/mux"
+  case "$_scp_path" in /*) ;; *) return 0;; esac
+  case "$_scp_path" in *[!A-Za-z0-9._/-]*) return 0;; esac
+  [ "${#_scp_path}" -le 86 ] || return 0
+  printf '%s' "$_scp_path"
+}
+
+# Session metadata for session-reaper.sh (values base64-encoded; never sourced or evaluated).
+write_session_meta() {  # $1=session dir $2=agent $3=mountpoint $4=alias $5=ssh config $6=control path
+  {
+    printf 'AGENT=%s\n' "$(b64_value "$2")"
+    if [ -n "${SESSION_LEASE:-}" ]; then
+      printf 'MOUNTPOINT=%s\n' "$(sed -n 's/^MOUNTPOINT=//p' "$SESSION_LEASE/lease.env")"
+    else
+      printf 'MOUNTPOINT=%s\n' "$(b64_value "$3")"
+    fi
+    printf 'ALIAS=%s\n' "$(b64_value "$4")"
+    printf 'SSH_CONFIG=%s\n' "$(b64_value "$5")"
+    printf 'CONTROL_PATH=%s\n' "$(b64_value "$6")"
+    if [ -n "${SESSION_LEASE:-}" ]; then
+      printf 'LEASE_DIR=%s\n' "$(b64_value "$SESSION_LEASE")"
+      printf 'MOUNT_SSH_CONFIG=%s\n' "$(sed -n 's/^MOUNT_SSH_CONFIG=//p' "$SESSION_LEASE/lease.env")"
+    fi
+  } > "$1/session.env" || return 1
+  chmod 600 "$1/session.env" 2>/dev/null || true
+}
+
+# Session launcher: records the agent's pid/start time/terminal, starts the detached server-side
+# watcher, then execs the agent (same pid). Used only for the final interactive launch.
+write_session_launcher() {  # $1=session dir
+  _wsl_launcher="$1/bin/rh-session"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'sd=%s\n' "$(sq "$1")"
+    printf 'reaper=%s\n' "$(sq "$SCRIPT_DIR/session-reaper.sh")"
+    printf 'rh_home=%s\n' "$(sq "${RH_HOME:-$HOME/.remote-harness}")"
+    printf 'lease=%s\n' "$(sq "${SESSION_LEASE:-}")"
+    cat <<'EOS'
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+term=$(tty 2>/dev/null) || term=""
+if [ -d "$sd" ]; then
+  printf 'OWNER_PID=%s\nOWNER_START=%s\nOWNER_TTY=%s\n' "$$" "$(b64 "$start")" "$(b64 "$term")" \
+    > "$sd/owner.env.tmp" && mv "$sd/owner.env.tmp" "$sd/owner.env"
+  if [ -n "$lease" ] && [ -d "$lease" ]; then
+    cp "$sd/owner.env" "$lease/owner.env.tmp" && mv "$lease/owner.env.tmp" "$lease/owner.env"
+  fi
+  if [ -x "$reaper" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+      RH_HOME="$rh_home" setsid "$reaper" watch "$sd" </dev/null >/dev/null 2>&1 &
+    else
+      RH_HOME="$rh_home" nohup "$reaper" watch "$sd" </dev/null >/dev/null 2>&1 &
+    fi
+  fi
+fi
+exec "$@"
+EOS
+  } > "$_wsl_launcher" || return 1
+  chmod +x "$_wsl_launcher" 2>/dev/null || return 1
+  printf '%s' "$_wsl_launcher"
+}
+
+# PATH shims that send IO-heavy git/rg work-tree scans to the project host (project-host-tool.py).
+write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project root $6=mountpoint $7=ssh config $8=control path [$9=real argv0]
+  _wts_shim="$1/bin/$2"
+  _wts_slots="$(dirname "$7" 2>/dev/null)/runtime/tool-slots"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'exec %s -I %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s -- "$@"\n' \
+      "$(sq "$PYTHON3")" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
+      "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$7")" "$(sq "$4")" "$(sq "$5")" \
+      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")"
+  } > "$_wts_shim" || return 1
+  chmod +x "$_wts_shim" 2>/dev/null || return 1
 }
 
 write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker
@@ -284,9 +380,15 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
       [ -n "$c" ] && printf '    %s\n' "$c"
     done
     printf '\n'
-    printf 'All Git commands are routed too, with `GIT_OPTIONAL_LOCKS=0` to avoid SSHFS index refreshes.\n'
+    printf 'Git commands you run through the Bash tool are routed with the rest of the command. Git\n'
+    printf 'and ripgrep calls that the agent makes internally (status snapshots, file search) go through\n'
+    printf 'session shims: work-tree scans run on `%s`; path discovery such as `git rev-parse` stays on\n' "$3"
+    printf 'this host. If such a call reports that the project host is unreachable, do not retry it\n'
+    printf 'against the mount with another tool; report the connection problem instead.\n'
     printf 'Use relative project paths in Bash commands; absolute mount paths name the agent host and\n'
-    printf 'are not portable to `%s`. Interactive PTY commands are not supported by strict routing.\n\n' "$3"
+    printf 'are not portable to `%s`. Interactive PTY commands are not supported by strict routing.\n' "$3"
+    printf 'Commands read stdin from /dev/null. Stopping a command, its timeout, or the end of this\n'
+    printf 'session stops its whole process tree on `%s`, including background tasks.\n\n' "$3"
     printf 'Safe local work is file-oriented: use the agent read/edit/write/patch tools on the mount.\n'
     printf 'If routing is unavailable or the cwd is outside the mount, the Bash call is denied. Never\n'
     printf 'work around that failure by executing the project command on this machine.\n'
@@ -306,12 +408,50 @@ case "${1:-}" in
     [ -n "$lp" ] && [ -n "$ba" ] || { echo "RH_STATUS=ERROR"; exit 2; }
     [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
     SD="$(session_dir "$mp" "$sid")"
-    rm -rf "$SD" 2>/dev/null || true
+    # Reap sessions whose launcher died without cleanup (detached; never delays this launch).
+    if [ -x "$SCRIPT_DIR/session-reaper.sh" ]; then
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "$SCRIPT_DIR/session-reaper.sh" gc </dev/null >/dev/null 2>&1 &
+      else
+        nohup "$SCRIPT_DIR/session-reaper.sh" gc </dev/null >/dev/null 2>&1 &
+      fi
+    fi
+    if [ -f "$SD/session.env" ]; then
+      echo 'RH_STATUS=ERROR'
+      printf 'remote-harness: refusing to overwrite an existing session\n' >&2
+      exit 1
+    fi
     mkdir -p "$SD" 2>/dev/null || { echo "RH_STATUS=ERROR"; exit 1; }
+    SESSION_LEASE=""
+    if [ -n "$sid" ] && [ -f "${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid/lease.env" ]; then
+      SESSION_LEASE="${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid"
+    fi
+    # Generated entry points only reference this per-session implementation snapshot. Mutable
+    # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
+    source_scripts="$SCRIPT_DIR"
+    mkdir "$SD/impl" || { echo RH_STATUS=ERROR; exit 1; }
+    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
+      cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || { rm -rf "$SD"; echo RH_STATUS=ERROR; exit 1; }
+      chmod 500 "$SD/impl/$impl_file" || { echo RH_STATUS=ERROR; exit 1; }
+    done
+    SCRIPT_DIR="$SD/impl"
+    if [ -n "$SESSION_LEASE" ]; then
+      RH_REAPER_LIBRARY=1 . "$SCRIPT_DIR/session-reaper.sh" || { echo RH_STATUS=ERROR; exit 1; }
+      unset RH_REAPER_LIBRARY
+      resource_lock || { echo RH_STATUS=ERROR; exit 1; }
+      mount_meta=$(mount_record "$(kv_b64 "$SESSION_LEASE/lease.env" MOUNTPOINT)")
+      if [ -f "$mount_meta" ] && [ -z "$(kv_b64 "$mount_meta" IMPLEMENTATION)" ]; then
+        printf 'IMPLEMENTATION=%s\n' "$(b64_value "$SD/impl")" >> "$mount_meta"
+      fi
+      resource_unlock
+    fi
     RULE="$SD/rule.md"
-    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || { echo "RH_STATUS=ERROR"; exit 1; }
 
-    env_out=""; flags_out=""; ready_file=""
+    env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""
+    [ -z "$ssh_config" ] || control_path="$(session_control_path "$ssh_config")"
+    write_session_meta "$SD" "$agent" "$mp" "$ba" "$ssh_config" "$control_path" \
+      || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || { echo "RH_STATUS=ERROR"; exit 1; }
     if [ -n "$ssh_config" ]; then
       if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
@@ -322,8 +462,54 @@ case "${1:-}" in
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
       [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config") \
+      # Command guard and tool shims need python3 on this host; without it, routed commands are not
+      # watched and git/rg simply keep their SSHFS behavior.
+      PYTHON3=$(command -v python3 2>/dev/null || true)
+      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3") \
         || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      launcher=$(write_session_launcher "$SD") \
+        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+      prefix_out="$(sq "$launcher")"
+      rg_shim=0
+      if [ -n "$PYTHON3" ] && [ -f "$SCRIPT_DIR/project-host-tool.py" ]; then
+        real_git=$(command -v git 2>/dev/null || true)
+        write_tool_shim "$SD" git "$real_git" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" \
+          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        # Only shim rg when a real one exists here, so calls outside the project keep working. A
+        # native Claude install embeds ripgrep and serves it when invoked with argv0 `rg`.
+        real_rg=$(command -v rg 2>/dev/null || true)
+        rg_argv0=""
+        case "$real_rg" in /*) ;; *) real_rg="";; esac
+        # Standalone Codex ships rg beside bin/ in codex-path/, but that directory need not be in
+        # the SSH login shell's PATH yet. Resolve the CLI symlink without changing its installation.
+        if [ -z "$real_rg" ] && [ "$agent" = codex ]; then
+          codex_bin=$(command -v codex 2>/dev/null || true)
+          case "$codex_bin" in
+            /*)
+              codex_real=$("$PYTHON3" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$codex_bin")
+              codex_rg="$(dirname "$(dirname "$codex_real")")/codex-path/rg"
+              if [ -x "$codex_rg" ] && "$codex_rg" --version </dev/null 2>/dev/null | grep -q '^ripgrep '; then
+                real_rg="$codex_rg"
+              fi
+              ;;
+          esac
+        fi
+        if [ -z "$real_rg" ] && [ "$agent" = claude ]; then
+          claude_bin=$(command -v claude 2>/dev/null || true)
+          case "$claude_bin" in
+            /*)
+              if (exec -a rg "$claude_bin" --version </dev/null 2>/dev/null) | grep -q '^ripgrep '; then
+                real_rg="$claude_bin"; rg_argv0=rg
+              fi
+              ;;
+          esac
+        fi
+        if [ -n "$real_rg" ]; then
+          write_tool_shim "$SD" rg "$real_rg" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" "$rg_argv0" \
+            || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+          rg_shim=1
+        fi
+      fi
     fi
     if [ "$agent" = claude ] || [ "$agent" = codex ]; then
       PYTHON3=$(command -v python3 2>/dev/null || true)
@@ -341,6 +527,8 @@ case "${1:-}" in
         write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" \
           || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
+        # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
+        [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
         ;;
       opencode)
@@ -365,6 +553,10 @@ case "${1:-}" in
         dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
         hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=5,statusMessage=\"Routing command to project host\"}]}]"
         flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") --dangerously-bypass-hook-trust"
+        # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile
+        # initialization could otherwise move a bundled rg or system git ahead of the shims.
+        tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
+        flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
         # codex's default sandbox gates network, which blocks the rule's `ssh <host> ...`. The
         # `[sandbox_workspace_write]` sub-table only merges when workspace-write is EXPLICITLY
         # selected, so `-s workspace-write` is required — `network_access` alone at the implicit
@@ -384,6 +576,8 @@ case "${1:-}" in
     printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
+    printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
+    printf 'RH_SESSION_DIR=%s\n' "$SD"
     ;;
   off)
     mp="${3:-}"; sid="${4:-}"
@@ -392,7 +586,14 @@ case "${1:-}" in
     # All agents' artifacts (the rule file, and for opencode its session config) live in the session
     # dir; none of them touched the mounted repo — so cleanup is just removing that dir.
     if [ -d "$SD" ]; then
-      rm -rf "$SD" 2>/dev/null && echo "RH_STATUS=RESTORED" || echo "RH_STATUS=ERROR"
+      # Stop the session's multiplexing master and leftover routed processes, then drop the dir.
+      reaper="$SD/impl/session-reaper.sh"
+      [ -x "$reaper" ] || reaper="$SCRIPT_DIR/session-reaper.sh"
+      if [ -x "$reaper" ]; then
+        RH_HOME="${RH_HOME:-$HOME/.remote-harness}" "$reaper" reap "$SD" --session-only \
+          >/dev/null 2>&1 || { echo RH_STATUS=ERROR; exit 1; }
+      fi
+      [ ! -d "$SD" ] && echo "RH_STATUS=RESTORED" || echo "RH_STATUS=ERROR"
     else
       echo "RH_STATUS=NOOP"
     fi

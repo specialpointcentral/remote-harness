@@ -82,8 +82,9 @@ if [ -f "$RH_COMMON" ]; then
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
 
 # ---- auto-cleanup on exit/disconnect ---------------------------------------
-TUNNEL_PID=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0
+TUNNEL_PID=""; TUNNEL_START=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0
 LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""; RULE_SESSION_ID=""
+REMOTE_SESSION_DIR=""
 # The box logs into THIS laptop as the box alias's `User`, so the login user must be US. The laptop's
 # own `id -un` is the single source of truth (whatever the box-side setup guessed, e.g. from a
 # project path); we force the box alias to it in Phase 2. In the simple reverse flow remote-harness
@@ -122,23 +123,82 @@ ssh() {
     command ssh "$@"
   fi
 }
-# Path to the per-(box,port) pid file recording WHO owns the reverse tunnel (the live `ssh -N` pid),
-# so the LAST session out can drop it even if it didn't create it — same-user multi-project, where a
-# second session reuses the tunnel. Keyed by TARGET+PORT (evaluated at call time, after they're set).
+# Legacy marker path, used only to remove a marker that matches a verified resource-record PID.
+# New tunnel ownership (PID + start time + exact config) is stored under the local session dir.
 tunnel_state_path() {
   printf '%s/.remote-harness/.tunnel-%s.pid' "$HOME" \
     "$(printf '%s-%s' "${TARGET:-}" "${PORT:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 }
-# True if the box STILL has another sshfs mount riding this reverse tunnel (a different session's
-# '<BOX_ALIAS>:…' mount remains after we've unmounted ours). Best-effort: false on error, and on a
-# macOS/FUSE-T box (its mount source isn't '<alias>:path', so it can't be detected — the tunnel is
-# then dropped as before).
-tunnel_still_needed() {
-  [ -n "${BOX_ALIAS:-}" ] && [ -n "${TARGET:-}" ] || return 1
-  _cnt="$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
-    "mount 2>/dev/null | grep -F -- $(sq "$BOX_ALIAS:") 2>/dev/null | grep -c -i fuse" 2>/dev/null)"
-  case "${_cnt:-0}" in *[!0-9]*) _cnt=0;; esac
-  [ "${_cnt:-0}" -gt 0 ]
+# Release a specific transport under the remote resource lock; an uncertain response retains it.
+remote_config_usage() {
+  local _usage
+  _usage=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
+    "rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"; \"\$rh/scripts/session-reaper.sh\" release-config $(sq "$BOX_SSH_CONFIG")" 2>/dev/null) || return 2
+  case "$_usage" in USED=0) return 1;; USED=1) return 0;; *) return 2;; esac
+}
+
+resource_value() { # records are base64 values, never executable shell configuration
+  local _raw
+  _raw=$(sed -n "s/^$2=//p" "$1" | head -1)
+  if [ "$OS" = Darwin ]; then printf '%s' "$_raw" | base64 -D
+  else printf '%s' "$_raw" | base64 --decode; fi
+}
+
+write_local_resource_record() {
+  [ -n "$LOCAL_SESSION_DIR" ] || return 0
+  local _name _value
+  {
+    for _name in TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID TUNNEL_START AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR; do
+      _value="${!_name}"
+      printf '%s=%s\n' "$_name" "$(printf '%s' "$_value" | base64 | tr -d '\n')"
+    done
+    printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" "$(printf '%s' "$(ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" | base64 | tr -d '\n')"
+  } > "$LOCAL_SESSION_DIR/resources.env.tmp" && mv "$LOCAL_SESSION_DIR/resources.env.tmp" "$LOCAL_SESSION_DIR/resources.env"
+}
+
+release_local_resources() { # only release records whose exact remote config is confirmed unused
+  local _dir="$1" _file="$1/resources.env" _usage _start _actual _args _name _state_file
+  local TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR
+  [ -f "$_file" ] && [ ! -L "$_dir" ] || return 1
+  for _name in TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR; do
+    printf -v "$_name" '%s' "$(resource_value "$_file" "$_name")"
+  done
+  [ -n "$TARGET" ] && [ -n "$BOX_SSH_CONFIG" ] || return 1
+  remote_config_usage
+  _usage=$?
+  if [ "$_usage" != 1 ]; then
+    return 1 # both a shared config and an unreachable server retain the tunnel and authorization
+  fi
+  case "$TUNNEL_PID" in
+    ''|*[!0-9]*) ;;
+    *)
+      _start=$(resource_value "$_file" TUNNEL_START)
+      _actual=$(ps -p "$TUNNEL_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      _args=$(ps -ww -p "$TUNNEL_PID" -o args= 2>/dev/null)
+      if [ -n "$_start" ] && [ "$_actual" = "$_start" ]; then
+        case "$_args" in *"$LOCAL_SSH_CONFIG"*) kill "$TUNNEL_PID" 2>/dev/null || return 1;; *) return 1;; esac
+      fi
+      ;;
+  esac
+  cleanup_reverse_authorized_key || return 1
+  _state_file=$(tunnel_state_path)
+  if [ -n "$TUNNEL_PID" ] && [ "$(cat "$_state_file" 2>/dev/null)" = "$TUNNEL_PID" ]; then rm -f "$_state_file"; fi
+  rm -rf "$_dir"
+}
+
+sweep_local_resources() {
+  local _dir _file _pid _start _actual
+  for _dir in "$HOME/.remote-harness/.sessions"/rev.*; do
+    [ -f "$_dir/resources.env" ] && [ ! -L "$_dir" ] || continue
+    if [ "$_dir" = "$LOCAL_SESSION_DIR" ] && [ "$CLEANED" != 1 ]; then continue; fi
+    _file="$_dir/resources.env"
+    _pid=$(sed -n 's/^OWNER_PID=//p' "$_file" | head -1)
+    _start=$(resource_value "$_file" OWNER_START)
+    case "$_pid" in ''|*[!0-9]*) continue;; esac
+    _actual=$(ps -p "$_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if [ "$_dir" != "$LOCAL_SESSION_DIR" ] && [ -n "$_start" ] && [ "$_start" = "$_actual" ]; then continue; fi
+    release_local_resources "$_dir" || true
+  done
 }
 
 # -- temporary authorized_keys management -----------------------------------
@@ -236,19 +296,27 @@ install_project_host_gateway() {
   _ipg_scripts="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)" || return 1
   [ -f "$_ipg_scripts/project-host-gateway.sh" ] && [ -f "$_ipg_scripts/run-on-project-host.sh" ] \
     || { warn "missing project-host gateway scripts beside laptop-setup.sh"; return 1; }
-  GATEWAY_DIR="$HOME/.remote-harness/bin"
-  GATEWAY_PATH="$GATEWAY_DIR/project-host-gateway.sh"
   GATEWAY_SESSION_DIR="$HOME/.remote-harness/.sessions/gateways/$AUTHKEY_TAG"
+  GATEWAY_DIR="$GATEWAY_SESSION_DIR/bin"
+  GATEWAY_PATH="$GATEWAY_DIR/project-host-gateway.sh"
   mkdir -p "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || return 1
   chmod 700 "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || true
-  cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" || return 1
-  cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh" || return 1
+  # A reused session key keeps the same implementation; a new key gets its own snapshot.
+  if [ ! -f "$GATEWAY_PATH" ]; then
+    cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" || return 1
+    cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh" || return 1
+  fi
   chmod 700 "$GATEWAY_PATH" "$GATEWAY_DIR/run-on-project-host.sh" 2>/dev/null || return 1
 }
 
 register_gateway_project() {
   [ -n "$GATEWAY_SESSION_DIR" ] || return 1
-  printf '%s' "$PROJ_DIR" | base64 | tr -d '\n' > "$GATEWAY_SESSION_DIR/project-root.b64" \
+  _rgp_root=$(printf '%s' "$PROJ_DIR" | base64 | tr -d '\n')
+  if [ -f "$GATEWAY_SESSION_DIR/project-root.b64" ] && [ "$(cat "$GATEWAY_SESSION_DIR/project-root.b64")" != "$_rgp_root" ]; then
+    warn "session key is already registered for another project; refusing to change its gateway"
+    return 1
+  fi
+  printf '%s' "$_rgp_root" > "$GATEWAY_SESSION_DIR/project-root.b64" \
     || return 1
   chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" 2>/dev/null || true
 }
@@ -314,7 +382,7 @@ prepare_reverse_authorized_key() {
 
 cleanup_reverse_authorized_key() {
   [ -n "${AUTHKEY_TOKEN:-}" ] || return 0
-  authkey_lock || { warn "could not lock authorized_keys for cleanup; temporary authorization may remain"; return 0; }
+  authkey_lock || { warn "could not lock authorized_keys for cleanup; temporary authorization may remain"; return 1; }
   rm -f "$AUTHKEY_TOKEN" 2>/dev/null || true
   if [ -d "$AUTHKEY_REF_DIR" ] && find "$AUTHKEY_REF_DIR" -type f -print -quit 2>/dev/null | grep -q .; then
     authkey_unlock
@@ -326,6 +394,8 @@ cleanup_reverse_authorized_key() {
       ok "authorized_keys: temporary remote-harness authorization removed"
     else
       warn "could not remove temporary remote-harness authorized_keys block"
+      authkey_unlock
+      return 1
     fi
   fi
   [ -z "$GATEWAY_SESSION_DIR" ] || rm -rf "$GATEWAY_SESSION_DIR" 2>/dev/null || true
@@ -335,52 +405,24 @@ cleanup_reverse_authorized_key() {
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0
   CLEANED=1
+  write_local_resource_record
   if [ "$MOUNTED" = 1 ]; then
     printf '\n'
-    say "  Connection closed — auto-unmounting ${REMOTE_MOUNTPOINT:-} on the remote box..."
+    say "  Connection closed — releasing this session's remote resources..."
     ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" "
       rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-      \"\$rh/scripts/mount-project.sh\" --alias $(sq "${BOX_ALIAS:-}") --unmount --mountpoint $(sq "${REMOTE_MOUNTPOINT:-}")
-      mp=$(sq "${REMOTE_MOUNTPOINT:-}")
-      case \"\$mp\" in \"\$rh/mounts/\"*) rmdir \"\$mp\" 2>/dev/null || true;; esac
-    " >/dev/null 2>&1 && ok "Unmounted" || warn "auto-unmount failed — mount may be stale on the box (next run re-validates it)"
+      sd=$(sq "$REMOTE_SESSION_DIR")
+      reaper=\"\$sd/impl/session-reaper.sh\"
+      if [ ! -x \"\$reaper\" ] || [ ! -x \"\$sd/impl/mount-project.sh\" ]; then reaper=\"\$rh/scripts/session-reaper.sh\"; fi
+      if [ ! -d \"\$sd\" ]; then sd=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"; fi
+      \"\$reaper\" release \"\$sd\" || exit 1
+      ld=\"\$rh/.sessions/lease.$RULE_SESSION_ID\"
+      if [ -d \"\$ld\" ]; then \"\$rh/scripts/session-reaper.sh\" release \"\$ld\"; fi
+    " >/dev/null 2>&1 || warn "remote release incomplete; retaining local resources until it can be verified"
   fi
-  if [ "${RULE_INJECTED:-0}" = 1 ]; then
-    ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" \
-      "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" off $(sq "${LAUNCH_BASE:-claude}") $(sq "${REMOTE_MOUNTPOINT:-}") $(sq "${RULE_SESSION_ID:-}")" >/dev/null 2>&1 \
-      && ok "session-scoped rule removed" || true
-  fi
-  if [ -n "${BOX_SSH_CONFIG:-}" ] && [ -n "${TARGET:-}" ]; then
-    ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "${TARGET:-}" "
-      cfg=$(sq "$BOX_SSH_CONFIG")
-      case \"\$cfg\" in
-        */.remote-harness/.sessions/*/ssh_config)
-          dir=\$(dirname \"\$cfg\")
-          rm -f \"\$cfg\" \"\$dir/id_ed25519\" \"\$dir/id_ed25519.pub\" 2>/dev/null || true
-          rm -rf \"\$dir/runtime\" 2>/dev/null || true
-          rmdir \"\$dir\" 2>/dev/null || true
-          ;;
-      esac
-    " >/dev/null 2>&1 && ok "box temp ssh config removed" || true
-  fi
-  # Drop the reverse tunnel ONLY when no other session still rides it. Whoever exits LAST tears it
-  # down — via the creator's pid file (the live `ssh -N` pid persists as an orphan after an early
-  # creator exit, so killing that pid still closes the tunnel) — so an early exit by the creator no
-  # longer strands another project's mount. Runs for reusers too (their own TUNNEL_PID is empty).
-  if [ "$MOUNTED" = 1 ] || [ -n "$TUNNEL_PID" ]; then
-    if tunnel_still_needed; then
-      warn "another session's mount still uses this reverse tunnel — leaving it up"
-    else
-      _sp="$(tunnel_state_path)"; _pid="${TUNNEL_PID:-}"
-      [ -z "$_pid" ] && [ -f "$_sp" ] && _pid="$(cat "$_sp" 2>/dev/null)"
-      [ -n "$_pid" ] && kill "$_pid" 2>/dev/null || true
-      rm -f "$_sp" 2>/dev/null || true
-    fi
-  fi
-  cleanup_reverse_authorized_key
-  if [ -n "${LOCAL_SESSION_DIR:-}" ]; then
-    rm -rf "$LOCAL_SESSION_DIR" 2>/dev/null || true
-    ok "local temp ssh config removed"
+  if [ -n "$LOCAL_SESSION_DIR" ]; then
+    sweep_local_resources
+    [ ! -d "$LOCAL_SESSION_DIR" ] || warn "shared or unverified transport retained with its config and authorization"
   fi
 }
 
@@ -507,6 +549,7 @@ safe_target="$(printf '%s' "$TARGET" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed '
 [ -n "$safe_target" ] || safe_target=box
 mkdir -p "$HOME/.remote-harness/.sessions" 2>/dev/null || true
 LOCAL_SESSION_DIR="$(mktemp -d "$HOME/.remote-harness/.sessions/rev.XXXXXX")" || exit 2
+RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 LOCAL_SSH_CONFIG="$LOCAL_SESSION_DIR/ssh_config"
 CFG="$LOCAL_SSH_CONFIG"; touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
 write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
@@ -550,8 +593,13 @@ fi
   err "need --box-ssh-config for a full reverse session; run through simple-laptop-setup.sh"
   exit 2
 }
-trap cleanup EXIT INT TERM HUP   # auto-cleanup for authorization, mount, rule, config, tunnel
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 prepare_reverse_authorized_key || exit 1
+write_local_resource_record
+sweep_local_resources
 
 # ===========================================================================
 # Phase 2: Reconnect — establish the reverse tunnel automatically
@@ -691,8 +739,11 @@ while :; do
   fi
 
   say "  Opening connection as '${_B}$TARGET${_0}' (carries RemoteForward $PORT)..."
-  ssh -N "$TARGET" >/dev/null 2>&1 &
+  # Bypass the shell wrapper so $! owns the actual SSH process rather than a function subshell.
+  command ssh -F "$LOCAL_SSH_CONFIG" -N "$TARGET" >/dev/null 2>&1 &
   TUNNEL_PID=$!
+  TUNNEL_START=$(ps -p "$TUNNEL_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  write_local_resource_record
 
   # Poll until the remote port is listening (up to 20s)
   READY=0
@@ -724,13 +775,8 @@ while :; do
   fi
 done
 
-# Record who owns the tunnel (the live `ssh -N` pid) so the LAST session out — which may be a
-# different, reusing session — can drop it cleanly. Only the creator writes it; reusers (which broke
-# out via tunnel_alias_up) have an empty TUNNEL_PID and rely on the creator's file.
-if [ -n "$TUNNEL_PID" ]; then
-  mkdir -p "$HOME/.remote-harness" 2>/dev/null || true
-  printf '%s\n' "$TUNNEL_PID" > "$(tunnel_state_path)" 2>/dev/null || true
-fi
+# Creator records remain available to later launchers when another lease still uses the tunnel.
+write_local_resource_record
 
 # ===========================================================================
 # Phase 3: Pick a project directory ON THIS LAPTOP
@@ -834,11 +880,16 @@ while :; do
     \"\$rh/scripts/mount-project.sh\" \
       --alias $(sq "$BOX_ALIAS") \
       --remote-path $(sq "$PROJ_DIR") \
-      --mountpoint $(sq "$REMOTE_MOUNTPOINT")$(box_check_config_arg)
+      --mountpoint $(sq "$REMOTE_MOUNTPOINT")$(box_check_config_arg) \
+      --session-id $(sq "$RULE_SESSION_ID")
   " 2>/dev/null || true)
   STATUS=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^STATUS=/{print $2; exit}')
   case "$STATUS" in
     mounted|already-mounted)
+      _mounted_path=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^MOUNTPOINT=/{print $2; exit}')
+      [ -z "$_mounted_path" ] || REMOTE_MOUNTPOINT="$_mounted_path"
+      _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+      REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
       ok "Mounted ${PROJ_DIR} → remote:${REMOTE_MOUNTPOINT}"
       MOUNTED=1   # arm auto-unmount in cleanup()
       break
@@ -872,6 +923,12 @@ while :; do
   esac
 done
 
+if [ "$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^KILL_USER_PROCESSES=/{print $2; exit}')" = 1 ]; then
+  warn "the remote box has systemd-logind KillUserProcesses=yes: ending an SSH login kills the mount,"
+  say  "    the agent, and remote-harness's cleanup watcher. Ask the server admin to set"
+  say  "    KillUserProcesses=no (see docs/ssh-sshfs-long-lived-connections.md)."
+fi
+
 # AGENTS.md-only project: only matters for Claude Code (reads CLAUDE.md, not AGENTS.md); codex and
 # opencode read AGENTS.md natively. remote-harness does not create repo guidance files implicitly.
 AGENTS_ONLY=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^AGENTS_MD_ONLY=/{print $2; exit}')
@@ -891,8 +948,11 @@ fi
 # The box-side session dir is keyed by mountpoint AND this launch's unique session dir name, so a
 # relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
 RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
+# Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
+# A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
+inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
 rh_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
-     "\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")" \
+     "exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")" \
      2>/dev/null || printf 'RH_STATUS=ERROR\n')
 rh_status=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_STATUS=//p' | head -1)
 if [ "$rh_status" = INJECTED ]; then
@@ -900,7 +960,16 @@ if [ "$rh_status" = INJECTED ]; then
   rh_env=$(printf  '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_ENV=//p'   | head -1)
   rh_flags=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_FLAGS=//p' | head -1)
   rh_ready=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_READY_FILE=//p' | head -1)
-  EFF_LAUNCH="${rh_env:+$rh_env }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
+  # The session launcher records the agent pid for the box-side watcher that cleans up after a
+  # dropped connection; it wraps only this final launch, never the opencode readiness probe below.
+  rh_prefix=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_PREFIX=//p' | head -1)
+  REMOTE_SESSION_DIR=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_SESSION_DIR=//p' | head -1)
+  if [ -z "$REMOTE_SESSION_DIR" ]; then
+    # Compatibility with older injectors: the directory still has the same mount/session key.
+    _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+    REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
+  fi
+  EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
   err "could not install strict run-on-laptop routing ($rh_status); refusing to launch the agent"

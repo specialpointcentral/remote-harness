@@ -25,7 +25,8 @@ Simple reverse 表示：编程 Agent 运行在远端盒子，项目位于用户�
 ```
 
 simple reverse 将会话 config 和 `known_hosts` 放在 `~/.remote-harness/.sessions/...`，关闭
-OpenSSH multiplexing，并在退出时尽量清理临时状态。它不写 `~/.ssh/config`、`known_hosts` 或 SSH key。
+OpenSSH multiplexing（生成的 config 保持 `ControlMaster no`；路由命令和工具垫片只在命令行上使用
+会话级、短路径的复用 master），并在退出时尽量清理临时状态。它不写 `~/.ssh/config`、`known_hosts` 或 SSH key。
 唯一的 `~/.ssh` 修改是笔记本侧用于临时反向认证的 `authorized_keys` 托管块。
 
 ## Bootstrap 形态
@@ -35,6 +36,7 @@ OpenSSH multiplexing，并在退出时尽量清理临时状态。它不写 `~/.s
 ```bash
 (
 set -f
+umask 077
 p='remote-harness 来源 SSH 目标/参数'
 d='<default_via>'
 printf '%s' "$p${d:+ [$d]}: " >/dev/tty
@@ -44,20 +46,24 @@ mkdir -p "$HOME/.remote-harness/.sessions"
 s=$(mktemp -d "$HOME/.remote-harness/.sessions/fetch.XXXXXX") || exit 1
 trap 'rm -rf "$s"' EXIT
 ssh -n -o ClearAllForwardings=yes \
-  -o UserKnownHostsFile="$s/known_hosts" \
-  -o GlobalKnownHostsFile=/dev/null \
-  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
   -o ControlMaster=no -o ControlPath=none \
   $h \
-  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' |
-  RH_VIA="$h" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>
+  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' \
+  > "$s/simple-bootstrap.sh" || exit 1
+[ -s "$s/simple-bootstrap.sh" ] || exit 1
+bash -n "$s/simple-bootstrap.sh" || exit 1
+RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
 
 ## 运行流程
 
-1. `simple-bootstrap.sh` 在本地运行。若它是从远端读取的，会把 `_common.sh`、`simple-dispatch.sh`、
-   `simple-laptop-setup.sh`、`laptop-setup.sh` 及必要 helper 拉到本地临时目录。
+1. 外层完整下载 `simple-bootstrap.sh` 并检查语法后才在本地执行。来源 alias 的已验证主机身份
+   保留，采用严格校验，不更新 known-hosts。随后一次 SSH 下载全部八个 helper、bootstrap 副本
+   和 SHA-256 清单；文件名、类型、摘要、bootstrap 一致性和 Bash 语法均通过后才启动本地向导。
+   包校验详见 `docs/simple-flow.cn.md`。
 2. `simple-dispatch.sh --mode reverse` 移交给 `simple-laptop-setup.sh`。
 3. `simple-laptop-setup.sh` 在本地提示远端 SSH target、本地项目目录、可选远端挂载点，以及调用中未明确指定时的 YOLO 偏好。
 4. 它准备远端会话 config 路径，并调用远端
@@ -68,6 +74,8 @@ ssh -n -o ClearAllForwardings=yes \
    然后在远端启动选定 Agent。
 7. 退出时自动卸载 sshfs、删除会话规则、在没有其它挂载需要时断开反向隧道、删除临时 ssh config，
    并清理默认空挂载目录。
+8. 如果连接被强制关闭、本机没来得及执行上述清理，远端会话 watcher 会发现 Agent 已退出（或终端
+   已挂断），自行完成远端清理；重启等原因遗留的状态由下次启动时的 GC 处理。
 
 ## 前置条件
 

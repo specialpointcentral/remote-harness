@@ -21,7 +21,10 @@ remote-harness 的脚本已经内置以下行为：
 - `mount-project.sh` 使用 `sshfs` 的 `reconnect`、`ServerAliveInterval` 和 `ServerAliveCountMax`。
 - `mount-project.sh` 不只相信 `sshfs` 退出码，还会确认挂载点真的 live；这能规避部分 FUSE-T
   “返回成功但实际未挂载”的场景。
-- reverse 模式会在退出时清理远端挂载、会话规则、临时 SSH config 和本地托管授权引用。
+- reverse 模式会在退出时清理远端挂载、会话规则、临时 SSH config 和本地托管授权引用；本地一侧先
+  消失时，远端会话 watcher 和启动时 GC 会完成其中远端部分的清理。
+- 仅对路由命令和 git/rg 工具调用，在命令行上传入短期复用 master 和 keepalive（见
+  `docs/design.cn.md`），不改动生成的 config。
 
 这些处理解决的是会话级可靠性。服务器端仍需要能承受大量新连接、长期连接和文件描述符消耗。
 
@@ -209,6 +212,21 @@ sysctl net.core.somaxconn \
   net.ipv4.tcp_keepalive_intvl \
   net.ipv4.tcp_keepalive_probes
 ```
+
+## systemd-logind KillUserProcesses
+
+remote-harness 会从 SSH 登录启动长期运行的进程：`sshfs` 挂载来自一次短暂的挂载命令，Agent 和清理
+watcher 来自交互式启动。`logind.conf` 中设置 `KillUserProcesses=yes` 时，systemd 会在登录结束时杀掉该
+登录 session scope 内的所有进程，导致项目被卸载，Agent 和 watcher 被杀。`mount-project.sh` 会报告这个
+设置，本地启动器会给出警告。请保持默认值：
+
+```ini
+# /etc/systemd/logind.conf
+[Login]
+KillUserProcesses=no
+```
+
+然后在维护窗口执行 `systemctl restart systemd-logind`。只开启 linger 并不能豁免 session scope 内的进程。
 
 ## ssh.socket 处理原则
 

@@ -16,9 +16,21 @@
 
 公开入口是 `scripts/simple-bootstrap.sh`，并在本机运行。如果本机没有 helper bundle，bootstrap 会从
 远端 remote-harness 安装目录读取所需脚本，临时放到本机 `~/.remote-harness/.sessions/...`。
+外层命令先将 bootstrap 下载到文件，确认 SSH 成功、文件非空和 Bash 语法有效后才执行。随后一次
+SSH 传输从暂存目录打包的八个 helper、bootstrap 副本和 SHA-256 清单。解包前验证固定文件名和
+普通文件类型；启动 dispatcher 前验证摘要、bootstrap 一致性和 Bash 语法。传输后清理远端暂存
+目录，退出时清理本地包。下载和首次隧道准备保留来源 SSH alias 已验证的主机身份，采用严格
+校验并禁止更新 known-hosts。首次使用前需在 harness 外建立主机信任，不再用空文件覆盖 alias
+原有的 known-hosts 配置。
 
 编码 Agent 应立即返回 bootstrap 命令。SSH target、本机路径、远端挂载点、端口和 namespace 都由
 本地终端收集，不进入 Agent 对话。远端 `scripts/suggest-via.sh` 的结果只能作为可编辑默认值。
+
+挂载登记和释放共用资源锁，lease 分别记录命令通道和实际挂载通道；其他会话仍在使用时保留
+挂载、密钥、runtime 和 mux。远端确认具体通道无人使用后才回收本地隧道、配置和授权，后续启动
+重试延期清理。卸载失败保留重连配置，无法追踪来源的活跃挂载不被替换。新会话把远端实现复制到
+`impl`，hook、垫片、runner 和 watcher 均使用快照；本机 gateway 按密钥保存副本。旧会话不在
+运行中迁移。生命周期细节见 [design.cn.md](design.cn.md)。
 
 ## 执行顺序
 
@@ -26,8 +38,8 @@
 2. `simple-laptop-setup.sh` 在本地收集远端 SSH target、本机项目目录、可选远端挂载点、Agent CLI
    和审批模式。
 3. 远端 `setup-tunnel.sh` 创建会话目录、会话级 SSH config、known-hosts 文件和新的每会话 Ed25519 key。
-4. `laptop-setup.sh` 把 `project-host-gateway.sh` 和 `run-on-project-host.sh` 的稳定副本安装到本机
-   `~/.remote-harness/bin`。
+4. `laptop-setup.sh` 把 `project-host-gateway.sh` 和 `run-on-project-host.sh` 的每密钥快照安装到本机
+   `~/.remote-harness/.sessions/gateways/<session-tag>/bin`。
 5. 本机项目根登记到
    `~/.remote-harness/.sessions/gateways/<session-tag>/project-root.b64`。
 6. 每会话公钥以带标签托管块加入本机 `~/.ssh/authorized_keys`。授权行只允许来自回环隧道的连接，
@@ -41,8 +53,8 @@
     `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`。
 12. 本机 dispatcher 验证项目根和物理 cwd，清除常见 AI 凭据环境变量，在 `PATH` 中屏蔽
     `claude`、`codex`、`opencode`，再用本机登录 shell 执行项目命令。
-13. 退出清理会删除挂载、注入规则、远端会话 key/config/runtime、本机 gateway 登记、临时授权和
-    本机会话 config。
+13. 退出清理释放本会话 lease。其他会话仍引用的资源一起保留；最后释放挂载、实现、密钥、
+    config/runtime、gateway 和授权。本地释放无法验证时保存记录，供后续重试。
 
 ## Gateway 协议
 

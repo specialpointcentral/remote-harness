@@ -55,6 +55,7 @@ If the skill is installed only on the remote server, return this fetch form. Fil
 ```bash
 (
 set -f
+umask 077
 p='<source_prompt>'
 d='<default_via>'
 printf '%s' "$p${d:+ [$d]}: " >/dev/tty
@@ -64,18 +65,25 @@ mkdir -p "$HOME/.remote-harness/.sessions"
 s=$(mktemp -d "$HOME/.remote-harness/.sessions/fetch.XXXXXX") || exit 1
 trap 'rm -rf "$s"' EXIT
 ssh -n -o ClearAllForwardings=yes \
-  -o UserKnownHostsFile="$s/known_hosts" \
-  -o GlobalKnownHostsFile=/dev/null \
-  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
   -o ControlMaster=no -o ControlPath=none \
   $h \
-  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' |
-  RH_VIA="$h" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>
+  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' \
+  > "$s/simple-bootstrap.sh" || exit 1
+[ -s "$s/simple-bootstrap.sh" ] || exit 1
+bash -n "$s/simple-bootstrap.sh" || exit 1
+RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
 
 Tell the user to run the command in a fresh local terminal. All concrete SSH targets, project paths,
 mountpoints, and approvals are collected there rather than in agent chat.
+The source SSH target must already have a verified host identity in the user's SSH configuration.
+Fetches preserve that configuration and never accept a new host key or update its known-hosts files.
+The outer download completes and passes `bash -n` before execution. The bootstrap then downloads
+all eight helpers in one SSH archive, validates the fixed file list and SHA-256 manifest, and checks
+that its bundled bootstrap copy matches the outer download before starting the wizard.
 
 ## Strict Execution Boundary
 
@@ -87,7 +95,12 @@ The local bootstrap:
 4. SSHFS-mounts the selected local project on the remote server.
 5. Launches the selected agent on the remote server.
 6. Routes Bash through `remote-harness-exec`; arbitrary local SSH shell commands are rejected.
-7. Removes the mount, per-session key, authorization, gateway registration, and temporary configs.
+7. Releases this session's resource lease; shared mounts/transports retain their keys, runtime and
+   authorization until the last user exits. Unverifiable local cleanup is retried on later launches.
+
+New sessions use per-session `impl` snapshots for remote hooks, runners, shims and the watcher;
+the local gateway implementation is snapshotted per reverse key. Existing sessions without snapshots are not
+migrated while running. Never unmount a shared live mount or close a tunnel based only on its alias.
 
 The command router or opencode plugin rewrites Bash before execution. The local dispatcher rejects
 direct `claude`, `codex`, and `opencode` launches, scrubs common AI credential variables, and shadows

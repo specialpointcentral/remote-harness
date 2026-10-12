@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Session PATH shim that runs IO-heavy git/rg calls on the project host.
+
+The agent host sees the project through SSHFS, where every lstat, readdir, and file read crosses the
+reverse tunnel. Work-tree scans (`git status`, `git diff`, `rg`) are therefore routed to the project
+host through the forced gateway's `remote-harness-tool` verb, while lightweight and path-discovery
+commands (`git rev-parse`, `git config`, ...) keep their agent-host semantics so the project root and
+memory paths seen by the agent never change.
+
+Calls outside the mount run the real tool unchanged. A routed call that cannot reach the project host
+fails with a non-zero status; it never falls back to a silent success, a clean status, or "no match".
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import os
+import random
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import Optional
+
+TRANSPORT_FAILURE = 255
+
+GIT_ROUTED_SUBCOMMANDS = {
+    "blame",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-tree",
+    "grep",
+    "log",
+    "ls-files",
+    "ls-tree",
+    "rev-list",
+    "shortlog",
+    "show",
+    "status",
+    "whatchanged",
+}
+GIT_PASSTHROUGH_GLOBALS = {
+    "--glob-pathspecs",
+    "--icase-pathspecs",
+    "--literal-pathspecs",
+    "--no-advice",
+    "--no-lazy-fetch",
+    "--no-optional-locks",
+    "--no-pager",
+    "--no-replace-objects",
+    "--noglob-pathspecs",
+    "--paginate",
+    "-P",
+    "-p",
+}
+# These change which repository, index, or object store git uses; the project host cannot see the
+# agent-host paths they name, so such calls stay local.
+GIT_LOCAL_ENV = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_WORK_TREE",
+)
+GIT_PATHSPEC_ENV = {
+    "GIT_GLOB_PATHSPECS": "--glob-pathspecs",
+    "GIT_ICASE_PATHSPECS": "--icase-pathspecs",
+    "GIT_LITERAL_PATHSPECS": "--literal-pathspecs",
+    "GIT_NOGLOB_PATHSPECS": "--noglob-pathspecs",
+}
+GIT_LOCAL_ARGS = ("--batch", "--open-files-in-pager", "--output", "--pathspec-from-file", "--stdin")
+# Process-level settings for git that still runs on the SSHFS mount: compare whole-second mtime and
+# size instead of inode/device/ctime/nanoseconds, which never match an index written on the project
+# host and would otherwise force a content re-read of every tracked file.
+GIT_SSHFS_CONFIG = ["-c", "core.checkStat=minimal", "-c", "core.trustctime=false"]
+
+current_proc: Optional[subprocess.Popen] = None
+
+
+class StayLocal(Exception):
+    """The call must run with the agent host's real tool."""
+
+
+class Context:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.mount_real = os.path.realpath(args.mount_root)
+        variants = {self.mount_real, os.path.normpath(os.path.abspath(args.mount_root))}
+        self.mounts = sorted(variants, key=len, reverse=True)
+        self.root = args.project_root.rstrip("/") or "/"
+        self.used_mount = self.mount_real
+        self.touches_mount = False
+
+    def inside(self, path: str) -> bool:
+        real = os.path.realpath(path)
+        try:
+            return os.path.commonpath([self.mount_real, real]) == self.mount_real
+        except ValueError:
+            return False
+
+    def mount_prefix(self, path: str) -> Optional[str]:
+        for mount in self.mounts:
+            if path == mount or path.startswith(mount.rstrip("/") + "/"):
+                return mount
+        return None
+
+    def translate_path(self, value: str, cwd: str) -> str:
+        """Map an agent-host path argument to the project host, or raise StayLocal."""
+        if value.startswith("/"):
+            mount = self.mount_prefix(value)
+            if mount is not None:
+                self.used_mount = mount
+                self.touches_mount = True
+                return self.root + value[len(mount):]
+            # An absolute path that exists outside the mount names agent-host data. Anything else is
+            # a pattern or a path that would not exist on the agent host either; pass it through.
+            if os.path.lexists(value):
+                raise StayLocal()
+            return value
+        if value == ".." or value.startswith("../"):
+            target = os.path.normpath(os.path.join(cwd, value))
+            if os.path.lexists(target) and not self.inside(target):
+                raise StayLocal()
+        return value
+
+    def translate_arg(self, arg: str, cwd: str) -> str:
+        if arg.startswith("/") or arg == ".." or arg.startswith("../"):
+            return self.translate_path(arg, cwd)
+        if arg.startswith("-") and "=" in arg:
+            name, value = arg.split("=", 1)
+            if value.startswith("/") or value == ".." or value.startswith("../"):
+                return name + "=" + self.translate_path(value, cwd)
+        return arg
+
+
+def encode_args(argv: list[str]) -> str:
+    if not argv:
+        return "-"
+    return ",".join(
+        base64.b64encode(b"x" + os.fsencode(arg)).decode("ascii") for arg in argv
+    )
+
+
+def git_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
+    for name in GIT_LOCAL_ENV:
+        if os.environ.get(name):
+            raise StayLocal()
+    routed: list[str] = []
+    try:
+        count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or "0")
+    except ValueError:
+        raise StayLocal()
+    for index in range(count):
+        key = os.environ.get(f"GIT_CONFIG_KEY_{index}")
+        if not key:
+            raise StayLocal()
+        value = os.environ.get(f"GIT_CONFIG_VALUE_{index}", "")
+        routed += ["-c", ctx.translate_arg(f"{key}={value}", cwd)]
+    for name, flag in GIT_PATHSPEC_ENV.items():
+        if os.environ.get(name) not in (None, "", "0", "false"):
+            routed.append(flag)
+
+    effective = cwd
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-C" or (arg.startswith("-C") and len(arg) > 2):
+            if arg == "-C":
+                if i + 1 >= len(argv):
+                    raise StayLocal()
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = arg[2:]
+                i += 1
+            if value:
+                effective = os.path.join(effective, value)
+            continue
+        if arg == "-c":
+            if i + 1 >= len(argv):
+                raise StayLocal()
+            routed += ["-c", ctx.translate_arg(argv[i + 1], effective)]
+            i += 2
+            continue
+        if arg in GIT_PASSTHROUGH_GLOBALS:
+            routed.append(arg)
+            i += 1
+            continue
+        if arg.startswith("-"):
+            raise StayLocal()
+        break
+    if i >= len(argv) or argv[i] not in GIT_ROUTED_SUBCOMMANDS:
+        if ctx.inside(effective):
+            ctx.touches_mount = True
+        raise StayLocal()
+    if not ctx.inside(effective):
+        raise StayLocal()
+    ctx.touches_mount = True
+    subcommand = argv[i]
+    rest = argv[i + 1:]
+    for arg in rest:
+        if arg.startswith(GIT_LOCAL_ARGS) or arg == "--no-index":
+            raise StayLocal()
+        if subcommand == "grep" and arg == "-O":
+            raise StayLocal()
+    routed.append(subcommand)
+    routed += [ctx.translate_arg(arg, effective) for arg in rest]
+    return effective, routed
+
+
+def rg_config_args() -> list[str]:
+    path = os.environ.get("RIPGREP_CONFIG_PATH")
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as handle:
+            lines = [line.rstrip("\r\n") for line in handle]
+    except OSError:
+        return []
+    return [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+
+
+def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
+    if not ctx.inside(cwd):
+        raise StayLocal()
+    ctx.touches_mount = True
+    args = argv if "--no-config" in argv else rg_config_args() + argv
+    if "-" in args:
+        raise StayLocal()  # stdin search needs the agent-side stdin
+    return cwd, [ctx.translate_arg(arg, cwd) for arg in args]
+
+
+class OutputRewriter:
+    """Rewrite project-host path prefixes back to the mount at the start of each output record."""
+
+    def __init__(self, old: str, new: str, json_mode: bool) -> None:
+        self.enabled = old != new
+        self.old = os.fsencode(old)
+        self.new = os.fsencode(new)
+        self.json_mode = json_mode
+        if json_mode:
+            import json
+
+            self.old_json = os.fsencode(json.dumps(old)[1:-1])
+            self.new_json = os.fsencode(json.dumps(new)[1:-1])
+        self.pending = b""
+
+    def _record(self, record: bytes) -> bytes:
+        if self.json_mode:
+            return record.replace(b'"' + self.old_json, b'"' + self.new_json)
+        if record.startswith(self.old):
+            tail = record[len(self.old):len(self.old) + 1]
+            if tail in (b"", b"/", b":"):
+                return self.new + record[len(self.old):]
+        return record
+
+    def feed(self, chunk: bytes) -> bytes:
+        if not self.enabled:
+            return chunk
+        data = self.pending + chunk
+        parts = re.split(rb"([\n\0])", data)
+        self.pending = parts.pop()
+        out = []
+        for index in range(0, len(parts), 2):
+            out.append(self._record(parts[index]))
+            out.append(parts[index + 1])
+        return b"".join(out)
+
+    def flush(self) -> bytes:
+        if not self.enabled:
+            return b""
+        data, self.pending = self.pending, b""
+        return self._record(data) if data else b""
+
+
+def acquire_slot(directory: str, limit: int, wait_seconds: float) -> Optional[int]:
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    deadline = time.monotonic() + wait_seconds
+    order = list(range(limit))
+    while True:
+        random.shuffle(order)
+        for index in order:
+            fd = os.open(os.path.join(directory, f"slot.{index}"), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                os.close(fd)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def runner_command(args: argparse.Namespace, relative: str, spec: str, mux: bool) -> list[str]:
+    command = [
+        args.runner,
+        "--ssh-config", args.ssh_config,
+        "--alias", args.alias,
+        "--project-root", args.project_root,
+        "--cwd-relative-b64", base64.b64encode(os.fsencode(relative)).decode("ascii"),
+        "--tool", args.tool,
+        "--args-b64", spec,
+    ]
+    if mux and args.control_path:
+        command += ["--control-path", args.control_path]
+    else:
+        command.append("--no-mux")
+    return command
+
+
+def stop_master(args: argparse.Namespace) -> None:
+    """Ask a possibly wedged master to stop accepting sessions; running sessions finish normally."""
+    if not args.control_path or not os.path.exists(args.control_path):
+        return
+    try:
+        subprocess.run(
+            ["ssh", "-F", "/dev/null", "-o", f"ControlPath={args.control_path}", "-O", "stop", "rh-mux"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> tuple[int, bool, bytes]:
+    global current_proc
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,  # held open: closing it tells the project host to stop the tool
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    current_proc = proc
+    errors: list[bytes] = []
+
+    def drain_stderr() -> None:
+        assert proc.stderr is not None
+        for chunk in iter(lambda: proc.stderr.read1(65536), b""):
+            errors.append(chunk)
+
+    reader = threading.Thread(target=drain_stderr, daemon=True)
+    reader.start()
+    emitted = False
+    out = sys.stdout.buffer
+    assert proc.stdout is not None
+    try:
+        for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+            data = rewriter.feed(chunk)
+            if data:
+                out.write(data)
+                out.flush()
+                emitted = True
+        tail = rewriter.flush()
+        if tail:
+            out.write(tail)
+            out.flush()
+            emitted = True
+    except BrokenPipeError:
+        proc.terminate()
+        proc.wait()
+        os._exit(141)
+    status = proc.wait()
+    reader.join()
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except OSError:
+        pass
+    current_proc = None
+    stderr = b"".join(errors)
+    if ctx.root != ctx.used_mount:
+        stderr = stderr.replace(os.fsencode(ctx.root), os.fsencode(ctx.used_mount))
+    return status, emitted, stderr
+
+
+def route(ctx: Context, effective: str, routed: list[str]) -> int:
+    args = ctx.args
+    relative = os.path.relpath(os.path.realpath(effective), ctx.mount_real)
+    spec = encode_args(routed)
+    json_mode = args.tool == "rg" and "--json" in routed
+
+    def rewriter() -> OutputRewriter:
+        # git output is repository-relative; only rg echoes the (translated) absolute search paths.
+        target = ctx.used_mount if args.tool == "rg" else ctx.root
+        return OutputRewriter(ctx.root, target, json_mode)
+
+    try:
+        limit = max(1, int(os.environ.get("RH_TOOL_CONCURRENCY") or args.concurrency))
+        queue_seconds = float(os.environ.get("RH_TOOL_QUEUE_SECONDS") or "600")
+    except ValueError:
+        limit, queue_seconds = 6, 600.0
+    slot = acquire_slot(args.slots_dir, limit, queue_seconds)
+    if slot is None:
+        sys.stderr.write(f"remote-harness: too many concurrent project-host {args.tool} calls\n")
+        return TRANSPORT_FAILURE
+    try:
+        status, emitted, stderr = run_attempt(runner_command(args, relative, spec, True), rewriter(), ctx)
+        if status == TRANSPORT_FAILURE and not emitted and args.control_path:
+            # The shared master may be dead, wedged on a dropped tunnel, or out of sessions. The call
+            # is read-only, so retire the master and retry once on a fresh direct connection.
+            stop_master(args)
+            status, emitted, stderr = run_attempt(
+                runner_command(args, relative, spec, False), rewriter(), ctx
+            )
+    finally:
+        os.close(slot)
+    sys.stderr.buffer.write(stderr)
+    sys.stderr.flush()
+    if status == TRANSPORT_FAILURE and not emitted:
+        sys.stderr.write(
+            f"remote-harness: could not run {args.tool} on the project host; "
+            "not falling back to scanning the SSHFS mount\n"
+        )
+    return status
+
+
+def run_local(ctx: Context, argv: list[str]) -> int:
+    real = ctx.args.real
+    if not real:
+        sys.stderr.write(f"{ctx.args.tool}: command not found on the agent host\n")
+        return 127
+    extra: list[str] = []
+    if ctx.args.tool == "git":
+        try:
+            in_mount = ctx.touches_mount or ctx.inside(os.getcwd())
+        except OSError:
+            in_mount = ctx.touches_mount
+        if in_mount:
+            extra = GIT_SSHFS_CONFIG
+    os.execv(real, [ctx.args.real_argv0 or real] + extra + argv)
+    return 127
+
+
+def handle_signal(signum: int, _frame: object) -> None:
+    proc = current_proc
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    os._exit(128 + signum)
+
+
+def main() -> int:
+    raw = sys.argv[1:]
+    if "--" not in raw:
+        sys.stderr.write("remote-harness: project-host-tool needs '--' before tool arguments\n")
+        return 2
+    split = raw.index("--")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tool", choices=("git", "rg"), required=True)
+    parser.add_argument("--real", default="")
+    parser.add_argument("--real-argv0", default="")  # e.g. a native Claude binary serving `rg`
+    parser.add_argument("--runner", required=True)
+    parser.add_argument("--ssh-config", required=True)
+    parser.add_argument("--alias", required=True)
+    parser.add_argument("--project-root", required=True)
+    parser.add_argument("--mount-root", required=True)
+    parser.add_argument("--control-path", default="")
+    parser.add_argument("--slots-dir", required=True)
+    parser.add_argument("--concurrency", default="6")
+    args = parser.parse_args(raw[:split])
+    argv = raw[split + 1:]
+    ctx = Context(args)
+
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        return run_local(ctx, argv)
+    try:
+        if args.tool == "git":
+            effective, routed = git_plan(ctx, argv, cwd)
+        else:
+            effective, routed = rg_plan(ctx, argv, cwd)
+    except StayLocal:
+        return run_local(ctx, argv)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, handle_signal)
+    return route(ctx, effective, routed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -36,13 +36,14 @@ sshfs_install_hint(){   # the right install command for THIS machine's OS / pack
   esac
 }
 
-ALIAS="" RPATH="" MP="" SSH_CONFIG="" UNMOUNT=0 FORCE=0
+ALIAS="" RPATH="" MP="" SSH_CONFIG="" SESSION_ID="" UNMOUNT=0 FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --alias)       need_arg "$1" "${2-}"; ALIAS="$2"; shift 2;;
     --remote-path) need_arg "$1" "${2-}"; RPATH="$2"; shift 2;;
     --mountpoint)  need_arg "$1" "${2-}"; MP="$2"; shift 2;;
     --ssh-config)  need_arg "$1" "${2-}"; SSH_CONFIG="$2"; shift 2;;
+    --session-id)  need_arg "$1" "${2-}"; SESSION_ID="$2"; shift 2;;
     --unmount)     UNMOUNT=1; shift;;
     --force)       FORCE=1; shift;;
     *) shift;;
@@ -86,6 +87,26 @@ mounted_source() {
   _ms_canon="$(canon_mountpoint "$1")"
   mount 2>/dev/null | awk -v mp=" $1 " -v canon=" $_ms_canon " 'index($0,mp)||index($0,canon){print $1; exit}'
 }
+# systemd-logind KillUserProcesses=yes kills everything in an SSH login's session scope when that
+# login ends: the sshfs started by the mount command, the agent, and the session watcher. Report it
+# so the launcher can tell the user to fix the server instead of failing mysteriously later.
+kill_user_processes_enabled() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 1
+  if command -v busctl >/dev/null 2>&1; then
+    _kup=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+      org.freedesktop.login1.Manager KillUserProcesses 2>/dev/null) && {
+      [ "$_kup" = "b true" ]
+      return
+    }
+  fi
+  grep -hiEs '^[[:space:]]*KillUserProcesses[[:space:]]*=[[:space:]]*(yes|true|on|1)[[:space:]]*$' \
+    /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf /run/systemd/logind.conf.d/*.conf \
+    /usr/lib/systemd/logind.conf.d/*.conf >/dev/null 2>&1
+}
+emit_session_policy() {
+  kill_user_processes_enabled && emit KILL_USER_PROCESSES 1
+  return 0
+}
 do_unmount() {
   _du_canon="$(canon_mountpoint "$1")"
   for _du_target in "$1" "$_du_canon"; do
@@ -93,6 +114,9 @@ do_unmount() {
     fusermount -u "$_du_target" 2>/dev/null && return 0
     fusermount3 -u "$_du_target" 2>/dev/null && return 0
     umount "$_du_target" 2>/dev/null && return 0
+    # A dead tunnel can leave the FUSE endpoint busy; lazily detach it as the unprivileged owner.
+    fusermount -uz "$_du_target" 2>/dev/null && return 0
+    fusermount3 -uz "$_du_target" 2>/dev/null && return 0
     umount -l "$_du_target" 2>/dev/null && return 0
     [ "$_du_target" = "$_du_canon" ] && break
   done
@@ -109,6 +133,29 @@ fi
 
 [ -n "$RPATH" ] || { note "need --remote-path"; exit 2; }
 [ -n "$SSH_CONFIG" ] || { note "need --ssh-config (session-local config keeps SSH runtime files out of ~/.ssh)"; exit 2; }
+
+if [ -n "$SESSION_ID" ]; then
+  SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+  RH_REAPER_LIBRARY=1 . "$(dirname "$0")/session-reaper.sh" || exit 2
+  unset RH_REAPER_LIBRARY
+  lease_dir "$SESSION_ID" >/dev/null || { emit STATUS invalid-session; exit 2; }
+  resource_lock || { emit STATUS registry-busy; exit 2; }
+  trap resource_unlock EXIT
+  MP="$(canon_mountpoint "$MP")"
+  record=$(mount_record "$MP")
+  if [ -f "$record" ] && [ "$(kv_b64 "$record" MOUNTPOINT)" != "$MP" ]; then
+    emit STATUS registry-conflict
+    exit 2
+  fi
+  if ! is_mounted "$MP" && [ -f "$record" ]; then
+    if mount_used_elsewhere "" "$MP"; then
+      emit STATUS mount-in-use
+      emit ERROR 'registered users still own this missing mount; refusing to replace its transport'
+      exit 2
+    fi
+    rm -f "$record"
+  fi
+fi
 
 if [ -z "$SSHFS_BIN" ]; then
   emit STATUS need-sshfs; emit INSTALL_CMD "$(sshfs_install_hint)"
@@ -131,11 +178,28 @@ if is_mounted "$MP"; then
   # Reuse only a LIVE mount that points at the requested project; otherwise drop the stale/wrong
   # one and remount fresh (fixes the dropped-tunnel re-run that used to launch into a dead dir).
   if mount_live "$MP" && { [ -z "$have" ] || [ "$have" = "$want" ]; }; then
+    if [ -n "$SESSION_ID" ]; then
+      record=$(mount_record "$MP")
+      mount_cfg=$(kv_b64 "$record" SSH_CONFIG)
+      if [ "$(kv_b64 "$record" MOUNTPOINT)" != "$MP" ] || [ ! -f "$mount_cfg" ]; then
+        emit STATUS untracked-mount
+        emit ERROR 'live mount has no verified transport record; leave its session running or close it before retrying'
+        exit 2
+      fi
+      register_mount_lease "$SESSION_ID" "$MP" "$SSH_CONFIG" "$mount_cfg" "$ALIAS" || exit 2
+    fi
     emit STATUS already-mounted; emit MOUNTPOINT "$MP"; emit REMOTE "$want"
+    emit_session_policy
     exit 0
   fi
   note "Existing mount at $MP is stale or points elsewhere (${have:-unknown}) — remounting as $want."
+  if [ -n "$SESSION_ID" ] && mount_used_elsewhere "" "$MP"; then
+    emit STATUS mount-in-use
+    emit ERROR 'another session uses this mount; refusing to replace it'
+    exit 2
+  fi
   do_unmount "$MP" || true
+  [ -z "$SESSION_ID" ] || rm -f "$(mount_record "$MP")"
 fi
 
 mkdir -p "$MP"
@@ -179,9 +243,13 @@ if "$SSHFS_BIN" "$ALIAS:$RPATH" "$MP" -o "$SSHFS_OPTS" 2>"$err"; then
     rm -f "$err" 2>/dev/null || true
     exit 0
   fi
+  if [ -n "$SESSION_ID" ]; then
+    register_mount_lease "$SESSION_ID" "$MP" "$SSH_CONFIG" "$SSH_CONFIG" "$ALIAS" || exit 2
+  fi
   emit STATUS mounted
   emit MOUNTPOINT "$MP"
   emit REMOTE "$ALIAS:$RPATH"
+  emit_session_policy
   [ -d "$MP/.git" ] && emit GIT_BRANCH "$(git -C "$MP" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '-')"
   # Claude Code reads CLAUDE.md, not AGENTS.md — flag if the project ships only AGENTS.md.
   [ -f "$MP/AGENTS.md" ] && [ ! -e "$MP/CLAUDE.md" ] && emit AGENTS_MD_ONLY 1

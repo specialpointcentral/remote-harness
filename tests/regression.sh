@@ -252,6 +252,208 @@ if grep -F "unsupported SSH command" "$router_tmp/gateway-sftp.err" >/dev/null; 
   fail "forced-command gateway rejected the standard internal-sftp request"
 fi
 
+# --- direct project-host tools: gateway verb, dispatcher, agent-host shim -----------------------
+tool_proj="$router_tmp/tool-project"
+tool_mount="$router_tmp/tool-mount"
+mkdir -p "$tool_proj/src" "$tool_mount/src"
+git -C "$tool_proj" init -q
+printf 'hello\n' > "$tool_proj/src/a.txt"
+git -C "$tool_proj" add . && git -C "$tool_proj" -c user.email=t@example.com -c user.name=t commit -qm init
+printf 'changed\n' >> "$tool_proj/src/a.txt"
+printf 'new\n' > "$tool_proj/src/new.txt"
+printf 'mount only\n' > "$tool_mount/src/mount-only.txt"
+tool_tag="tool-test"
+mkdir -p "$gateway_home/.remote-harness/.sessions/gateways/$tool_tag"
+printf '%s' "$(b64 "$tool_proj")" > "$gateway_home/.remote-harness/.sessions/gateways/$tool_tag/project-root.b64"
+tool_gateway="$gateway_home/.remote-harness/bin/project-host-gateway.sh"
+targs() {
+  local out="" a
+  for a in "$@"; do out="${out:+$out,}$(b64 "x$a")"; done
+  printf '%s' "${out:--}"
+}
+tool_status=$(HOME="$gateway_home" \
+  SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 .) git $(targs status --porcelain)" \
+  sh "$tool_gateway" "$tool_tag")
+assert_grep <(printf '%s\n' "$tool_status") " M src/a.txt" "gateway tool git sees modified files"
+assert_grep <(printf '%s\n' "$tool_status") "?? src/new.txt" "gateway tool git sees untracked files"
+tool_quote=$(HOME="$gateway_home" \
+  SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 src) git $(targs rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")" \
+  sh "$tool_gateway" "$tool_tag")
+assert_eq "gateway tool argument fidelity" "$tool_quote" "$(git rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")"
+for tool_bad in "remote-harness-tool $(b64 "$tool_proj") $(b64 .) sh $(targs -c id)" \
+    "remote-harness-tool $(b64 "$tool_proj") $(b64 .) git a;b" \
+    "remote-harness-tool $(b64 "$router_tmp/project") $(b64 .) git -"; do
+  if HOME="$gateway_home" SSH_ORIGINAL_COMMAND="$tool_bad" sh "$tool_gateway" "$tool_tag" \
+      >/dev/null 2>"$router_tmp/tool-bad.err"; then
+    fail "gateway accepted an invalid tool request: $tool_bad"
+  fi
+done
+# Closing the SSH channel (cancelled caller / dropped link) stops the tool on the project host.
+mkfifo "$tool_proj/blocked.fifo"
+tool_started=$(date +%s)
+{ sleep 1; } | HOME="$gateway_home" \
+  SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 .) git $(targs hash-object blocked.fifo)" \
+  sh "$tool_gateway" "$tool_tag" >/dev/null 2>&1 || true
+tool_elapsed=$(( $(date +%s) - tool_started ))
+[ "$tool_elapsed" -lt 10 ] || fail "project-host tool kept running after its SSH channel closed (${tool_elapsed}s)"
+rm -f "$tool_proj/blocked.fifo"
+
+# Agent-host shim through a fake ssh that invokes the forced gateway.
+shim_bin="$router_tmp/shim-bin"
+shim_log="$router_tmp/shim-ssh.log"
+mkdir -p "$shim_bin"
+cat > "$shim_bin/ssh" <<EOS
+#!/bin/sh
+printf '%s\n' "\$*" >> '$shim_log'
+while [ "\$#" -gt 0 ]; do
+  case "\$1" in -F|-o) shift 2 ;; -T) shift ;; -O) exit 0 ;; *) break ;; esac
+done
+shift
+HOME='$gateway_home' SSH_ORIGINAL_COMMAND="\$1" exec sh '$tool_gateway' '$tool_tag'
+EOS
+chmod +x "$shim_bin/ssh"
+printf 'Host project-host\n    HostName 127.0.0.1\n' > "$router_tmp/shim_ssh_config"
+run_shim() {  # $1=tool $2=real $3=control path, rest = tool args
+  local tool=$1 real=$2 control=$3
+  shift 3
+  PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/project-host-tool.py" --tool "$tool" --real "$real" \
+    --runner "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/shim_ssh_config" \
+    --alias project-host --project-root "$tool_proj" --mount-root "$tool_mount" \
+    --control-path "$control" --slots-dir "$router_tmp/shim-slots" -- "$@"
+}
+shim_status=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" status --porcelain)
+assert_grep <(printf '%s\n' "$shim_status") "?? src/new.txt" "shim routes git status to the project host"
+if printf '%s\n' "$shim_status" | grep -F mount-only >/dev/null; then
+  fail "shim scanned the agent-side mount for git status"
+fi
+assert_grep "$shim_log" "remote-harness-tool" "shim used the tool gateway verb"
+: > "$shim_log"
+if (cd "$tool_mount" && run_shim git "$(command -v git)" "" rev-parse --show-toplevel) >/dev/null 2>&1; then
+  fail "shim routed path discovery (rev-parse) instead of keeping agent-host semantics"
+fi
+[ ! -s "$shim_log" ] || fail "shim contacted the project host for git rev-parse"
+outside_version=$(cd "$router_tmp" && run_shim git "$(command -v git)" "" --version)
+assert_eq "shim leaves git outside the mount alone" "$outside_version" "$(git --version)"
+[ ! -s "$shim_log" ] || fail "shim contacted the project host for a call outside the mount"
+local_cfg=$(cd "$tool_mount" && run_shim git "$(command -v git)" "" config --get core.checkStat || true)
+assert_eq "local git on the mount gets process-level checkStat" "$local_cfg" "minimal"
+outside_cfg=$(cd "$router_tmp" && run_shim git "$(command -v git)" "" config --get core.checkStat || true)
+assert_eq "git outside the mount keeps its own config" "$outside_cfg" ""
+
+# Transport failure: retry once without multiplexing, then fail loudly (never clean / no-match).
+fail_bin="$router_tmp/fail-bin"
+mkdir -p "$fail_bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexit 255\n' "'$router_tmp/fail-ssh.log'" > "$fail_bin/ssh"
+chmod +x "$fail_bin/ssh"
+if (cd "$tool_mount" && PATH="$fail_bin:$PATH" python3 -I "$ROOT/scripts/project-host-tool.py" --tool git \
+    --real "$(command -v git)" --runner "$ROOT/scripts/run-on-project-host.sh" \
+    --ssh-config "$router_tmp/shim_ssh_config" --alias project-host --project-root "$tool_proj" \
+    --mount-root "$tool_mount" --control-path /tmp/rh-test-mux --slots-dir "$router_tmp/shim-slots" \
+    -- status) >"$router_tmp/fail.out" 2>"$router_tmp/fail.err"; then
+  fail "shim reported success although the project host was unreachable"
+fi
+assert_grep "$router_tmp/fail.err" "not falling back" "shim transport failure is explicit"
+[ ! -s "$router_tmp/fail.out" ] || fail "shim printed output for an unreachable project host"
+assert_eq "shim retries exactly once" "$(grep -c . "$router_tmp/fail-ssh.log")" "2"
+assert_grep "$router_tmp/fail-ssh.log" "ControlMaster=auto" "first attempt uses the multiplexing master"
+assert_eq "retry bypasses the master" "$(sed -n 2p "$router_tmp/fail-ssh.log" | grep -c 'ControlMaster=no')" "1"
+
+# rg: absolute mount paths go out translated and come back as mount paths.
+rg_real=$(command -v rg 2>/dev/null || true)
+case "$rg_real" in /*) ;; *) rg_real="" ;; esac
+if [ -n "$rg_real" ]; then
+  mkdir -p "$gateway_home/.local/bin"
+  ln -sf "$rg_real" "$gateway_home/.local/bin/rg"
+  rg_out=$(cd "$tool_mount" && run_shim rg "$rg_real" "" -n hello "$tool_mount/src")
+  assert_eq "rg output paths are mapped back to the mount" "$rg_out" "$tool_mount/src/a.txt:1:hello"
+  if (cd "$tool_mount" && run_shim rg "$rg_real" "" zzzz-no-match) >/dev/null 2>&1; then
+    fail "rg no-match did not keep exit status 1"
+  fi
+fi
+
+# Concurrency cap: with one slot, routed calls never overlap.
+cap_runner="$router_tmp/cap-runner"
+printf '#!/bin/sh\nprintf "start\\n" >> %s\nsleep 1\nprintf "end\\n" >> %s\n' \
+  "'$router_tmp/cap.log'" "'$router_tmp/cap.log'" > "$cap_runner"
+chmod +x "$cap_runner"
+for cap_i in 1 2 3; do
+  (cd "$tool_mount" && RH_TOOL_CONCURRENCY=1 python3 -I "$ROOT/scripts/project-host-tool.py" --tool git \
+    --real "$(command -v git)" --runner "$cap_runner" --ssh-config "$router_tmp/shim_ssh_config" \
+    --alias project-host --project-root "$tool_proj" --mount-root "$tool_mount" \
+    --slots-dir "$router_tmp/cap-slots" -- status >/dev/null) &
+done
+wait
+assert_eq "concurrency cap serializes routed calls" "$(tr '\n' ' ' < "$router_tmp/cap.log")" "start end start end start end "
+
+# Client transport: per-connection tuning and a short multiplexing socket.
+mux_bin="$router_tmp/mux-bin"
+mkdir -p "$mux_bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" > %s\n' "'$router_tmp/mux-ssh.args'" > "$mux_bin/ssh"
+chmod +x "$mux_bin/ssh"
+PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
+  --alias project-host --project-root "$router_tmp/project" --control-path /tmp/rh-mux-test \
+  --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
+for mux_opt in ControlMaster=auto ControlPath=/tmp/rh-mux-test ControlPersist=300 \
+    ServerAliveInterval=10 ServerAliveCountMax=3 ConnectTimeout=10 BatchMode=yes; do
+  assert_grep "$router_tmp/mux-ssh.args" "-o $mux_opt" "client ssh option $mux_opt"
+done
+PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
+  --alias project-host --project-root "$router_tmp/project" \
+  --control-path "/tmp/$(printf 'x%.0s' $(seq 1 90))" \
+  --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
+assert_grep "$router_tmp/mux-ssh.args" "-o ControlMaster=no" "overlong control path disables multiplexing"
+
+# --- watched Bash commands: channel EOF stops the whole command tree on the project host ---------
+tree_alive() { ps -A -o args= 2>/dev/null | grep -Eqx "sleep ($1)"; }
+watch_started=$(date +%s)
+{ sleep 1; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+  "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'sleep 47 & sleep 48 & wait')" watch \
+  >/dev/null 2>&1 || true
+watch_elapsed=$(( $(date +%s) - watch_started ))
+[ "$watch_elapsed" -lt 15 ] || fail "watched command outlived its closed channel (${watch_elapsed}s)"
+sleep 1
+if tree_alive '47|48'; then
+  fail "watched command left child processes running after its channel closed"
+fi
+watch_rc=0
+watch_out=$({ sleep 2; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
+  "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'printf watched; exit 7')" watch) || watch_rc=$?
+assert_eq "watched command output" "$watch_out" "watched"
+assert_eq "watched command keeps its exit status" "$watch_rc" "7"
+gateway_watch=$(HOME="$gateway_home" \
+  SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 'printf gw-watch') watch" \
+  sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" </dev/null)
+assert_eq "gateway accepts the watch mode" "$gateway_watch" "gw-watch"
+if HOME="$gateway_home" \
+    SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 true) other" \
+    sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" >/dev/null 2>&1; then
+  fail "gateway accepted an unknown execution mode"
+fi
+PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
+  --alias project-host --project-root "$router_tmp/project" --watch \
+  --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
+assert_grep "$router_tmp/mux-ssh.args" "$(b64 true) watch" "client requests watch mode"
+
+# A killed guard (cancelled tool call, crashed agent) closes the channel and stops the command.
+PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- \
+  sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/shim_ssh_config" \
+  --alias project-host --project-root "$tool_proj" --watch \
+  --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 'sleep 49')" >/dev/null 2>&1 &
+guard_pid=$!
+guard_i=0
+until tree_alive 49 || [ "$guard_i" -ge 20 ]; do sleep 0.5; guard_i=$((guard_i + 1)); done
+tree_alive 49 || fail "guarded command never started"
+kill -KILL "$guard_pid" 2>/dev/null || true
+wait "$guard_pid" 2>/dev/null || true
+guard_i=0
+while tree_alive 49 && [ "$guard_i" -lt 20 ]; do sleep 0.5; guard_i=$((guard_i + 1)); done
+if tree_alive 49; then
+  fail "project-host command kept running after its guard was killed"
+fi
+guard_rc=0
+PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- sh -c 'exit 5' || guard_rc=$?
+assert_eq "channel guard returns the command status" "$guard_rc" "5"
+
 parse_via "ssh -J jump -p 2222 -i /tmp/key dev@example.com"
 assert_eq "host" "$V_HOST" "example.com"
 assert_eq "port" "$V_PORT" "2222"
@@ -350,6 +552,61 @@ if grep -q -- "-F " "$wrapped_dir/rule.md"; then
 fi
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off codex "$tmp/mount-wrapped" >/dev/null
+
+# Codex standalone bundle: rg is absent from the login PATH, and codex is a symlink.
+# Exercise the generated shims and pinned shell-tool environment through the fake gateway.
+codex_bundle="$tmp/codex bundle"
+codex_tool_bin="$tmp/codex tools 'quoted\""
+mkdir -p "$codex_bundle/bin" "$codex_bundle/codex-path" "$codex_tool_bin"
+for codex_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp git python3 grep cksum base64; do
+  ln -s "$(command -v "$codex_dep")" "$codex_tool_bin/$codex_dep"
+done
+# The simulated project host has its own PATH, just like a real SSH server does.
+printf '#!/bin/sh\nPATH=%s\nexport PATH\nexec %s "$@"\n' \
+  "$(sq "$PATH")" "$(sq "$shim_bin/ssh")" > "$codex_tool_bin/ssh"
+chmod +x "$codex_tool_bin/ssh"
+printf '#!/bin/sh\nexit 0\n' > "$codex_bundle/bin/codex"
+chmod +x "$codex_bundle/bin/codex"
+ln -s "$codex_bundle/bin/codex" "$codex_tool_bin/codex"
+if [ -n "$rg_real" ]; then
+  ln -s "$rg_real" "$codex_bundle/codex-path/rg"
+else
+  printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\n' > "$codex_bundle/codex-path/rg"
+  chmod +x "$codex_bundle/codex-path/rg"
+fi
+for codex_yolo in 0 1; do
+  PATH="$codex_tool_bin" RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" on codex "$tool_proj" project-host "$tool_mount" "$codex_yolo" \
+      "$router_tmp/shim_ssh_config" "codex.$codex_yolo" > "$tmp/codex-tools.out"
+  codex_tool_sd="$rh_home/.sessions/$(printf '%s' "$tool_mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').codex.$codex_yolo"
+  [ -x "$codex_tool_sd/bin/rg" ] || fail "Codex bundled rg did not get a shim"
+  python3 - "$tmp/codex-tools.out" "$tool_mount" "$rg_real" <<'PY'
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+lines = dict(line.rstrip("\n").split("=", 1) for line in open(sys.argv[1], encoding="utf-8"))
+assert lines["RH_STATUS"] == "INJECTED"
+flags = shlex.split(lines["RH_LAUNCH_FLAGS"])
+config = dict(flags[i + 1].split("=", 1) for i, flag in enumerate(flags) if flag == "-c")
+env = os.environ.copy()
+# Simulate applying Codex's explicit env override after its own PATH preparation.
+env["PATH"] = json.loads(config["shell_environment_policy.set.PATH"])
+status = subprocess.check_output(["git", "status", "--porcelain"], cwd=sys.argv[2], env=env, text=True)
+assert "?? src/new.txt" in status and "mount-only" not in status, status
+if sys.argv[3]:
+    found = subprocess.check_output(["rg", "-n", "hello", sys.argv[2] + "/src"],
+                                    cwd=sys.argv[2], env=env, text=True)
+    assert found == sys.argv[2] + "/src/a.txt:1:hello\n", found
+    assert subprocess.run(["rg", "zzzz-no-match"], cwd=sys.argv[2], env=env).returncode == 1
+version = subprocess.check_output(["rg", "--version"], cwd=os.path.dirname(sys.argv[2]), env=env, text=True)
+assert version.startswith("ripgrep "), version
+PY
+  RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" off codex "$tool_mount" "codex.$codex_yolo" >/dev/null
+done
 
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
@@ -618,6 +875,8 @@ cat > "$tmp/bin/ssh" <<'EOS'
 #!/usr/bin/env bash
 remote_cmd="${!#}"
 case "$remote_cmd" in
+  *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*) printf 'USED=0\n'; exit 0;;
+  *'session-reaper.sh'*'release'*) printf 'STATUS=released\n'; exit 0;;
   *'setup-tunnel.sh'*)
     [ -n "${SIMPLE_REMOTE_CMD:-}" ] && printf '%s\n' "$remote_cmd" > "$SIMPLE_REMOTE_CMD"
     printf 'STATUS=configured\nALIAS=tester\nPORT=24002\nCONFIG=/home/box/.remote-harness/.sessions/simple-tester/ssh_config\nPUBKEY=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISimple remote-harness@test\n'
@@ -708,32 +967,7 @@ if grep -F 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "$ROOT/scripts/simple
   fail "remote-only dispatcher still contains a local-agent launch path"
 fi
 
-cat > "$tmp/bin/ssh" <<'EOS'
-#!/usr/bin/env bash
-has_n=0
-for arg in "$@"; do [ "$arg" = "-n" ] && has_n=1; done
-[ "$has_n" = 1 ] || cat >/dev/null
-remote_cmd="${!#}"
-case "$remote_cmd" in
-  *'_common.sh'*) printf '#!/usr/bin/env bash\n'; exit 0;;
-  *'simple-dispatch.sh'*)
-    printf '#!/usr/bin/env bash\nprintf "STUB_ARGS=%%s\\n" "$*" > "${BOOTSTRAP_MARKER:?}"\n'
-    exit 0
-    ;;
-  *) printf '#!/usr/bin/env bash\nexit 0\n'; exit 0;;
-esac
-EOS
-chmod +x "$tmp/bin/ssh"
-bootstrap_home="$tmp/bootstrap-home"
-mkdir -p "$bootstrap_home"
-HOME="$bootstrap_home" BOOTSTRAP_MARKER="$tmp/simple-bootstrap.marker" RH_VIA=testbox RH_SIMPLE_CACHE="$tmp/bootstrap-cache.env" PATH="$tmp/bin:$PATH" \
-  bash -s -- --mode reverse --launch codex --yolo < "$ROOT/scripts/simple-bootstrap.sh" > "$tmp/simple-bootstrap.out"
-assert_grep "$tmp/simple-bootstrap.out" "Fetching remote-harness simple setup" "simple bootstrap ran"
-assert_grep "$tmp/simple-bootstrap.marker" "STUB_ARGS=--mode reverse --launch codex --yolo --source-via testbox" "simple bootstrap hands off through dispatcher after stdin-backed fetches"
-assert_grep "$tmp/bootstrap-cache.env" "LAST_VIA=testbox" "simple bootstrap caches via"
-[ -z "$(find "$bootstrap_home/.remote-harness/.sessions" -maxdepth 1 -type d -name 'bootstrap.*' -print -quit 2>/dev/null)" ] || fail "simple bootstrap temp dir was not cleaned"
-assert_grep "$ROOT/scripts/simple-bootstrap.sh" "ssh -n -o ClearAllForwardings=yes" "simple bootstrap fetch ssh must not consume stdin"
-assert_grep "$ROOT/scripts/simple-bootstrap.sh" "simple-dispatch.sh" "simple bootstrap fetches dispatcher"
+bash "$ROOT/tests/bootstrap.sh"
 assert_grep "$ROOT/scripts/simple-dispatch.sh" "--source-via" "simple dispatcher accepts bootstrap source"
 assert_grep "$ROOT/SKILL.md" "simple-bootstrap.sh" "skill uses unified simple bootstrap"
 assert_grep "$ROOT/SKILL.md" "docs/claude-multi-agent.md" "skill routes Claude multi-agent questions"
@@ -747,7 +981,6 @@ assert_grep "$ROOT/SKILL.md" "IFS= read -r h </dev/tty || exit 2" "skill aborts 
 if grep -F "read -r -p" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" "$ROOT/docs/simple-flow.cn.md" >/dev/null; then
   fail "fetch command templates must not use read -p; zsh treats -p as coprocess"
 fi
-assert_grep "$ROOT/SKILL.md" "RH_VIA=\"\$h\" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>" "skill uses reverse-only fetched bootstrap handoff"
 assert_grep "$ROOT/SKILL.md" "--mode reverse" "skill documents reverse mode arg"
 if grep -F -- "--mode forward" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" >/dev/null; then
   fail "remote-only skill still documents a forward launch command"
@@ -757,7 +990,6 @@ assert_grep "$ROOT/SKILL.md" "local project host" "skill identifies the forbidde
 assert_grep "$ROOT/SKILL.md" "forced-command project-host gateway" "skill documents forced gateway"
 assert_grep "$ROOT/SKILL.md" "absolute guarantee" "skill states the absolute isolation boundary"
 assert_grep "$ROOT/SKILL.md" "OS account" "skill requires a dedicated runner account for absolute isolation"
-assert_grep "$ROOT/SKILL.md" "UserKnownHostsFile=\"\$s/known_hosts\"" "skill fetch command isolates known_hosts"
 assert_grep "$ROOT/AGENTS.md" "Simple Reverse Rules" "agents docs carry simple reverse rules"
 assert_grep "$ROOT/AGENTS.md" "compact but copyable" "agents docs carry bootstrap command shape"
 assert_grep "$ROOT/AGENTS.md" "fields 1 and 2 are local/client data" "agents docs protect local/client ssh metadata"
@@ -809,10 +1041,11 @@ cat > "$tmp/bin/ssh" <<'EOS'
 remote_cmd="${!#}"
 for arg in "$@"; do
   case "$arg" in
+    *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*) printf 'USED=0\n'; exit 0;;
+    *'session-reaper.sh'*'release'*) printf 'STATUS=released\n'; exit 0;;
     -N)
       printf 'open\n' > "${TUNNEL_STATE:?}"
-      sleep 30
-      exit 0
+      exec -a "ssh $*" sleep 30
       ;;
   esac
 done
@@ -862,9 +1095,26 @@ cat > "$tmp/bin/ssh" <<'EOS'
 [ -n "${SSH_LOG:-}" ] && printf '%s\n' "$*" >> "$SSH_LOG"
 for arg in "$@"; do
   case "$arg" in
+    *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*)
+      [ "${RESOURCE_USED:-0}" != error ] || exit 255
+      printf 'USED=%s\n' "${RESOURCE_USED:-0}"; exit 0;;
+    *'session-reaper.sh'*'release'*) printf 'STATUS=released\n'; exit 0;;
     -tt)
       if [ -n "${AUTH_KEYS_SNAPSHOT:-}" ] && [ -f "$HOME/.ssh/authorized_keys" ]; then
         cp "$HOME/.ssh/authorized_keys" "$AUTH_KEYS_SNAPSHOT"
+        python3 - "$AUTH_KEYS_SNAPSHOT" <<'PY'
+import os
+import re
+import subprocess
+import sys
+text = open(sys.argv[1], encoding='utf-8').read()
+match = re.search(r'command="((?:\\.|[^"\\])*)"', text)
+command = match.group(1).replace('\\\\', '\\').replace('\\"', '"')
+env = os.environ.copy()
+env['SSH_ORIGINAL_COMMAND'] = 'remote-harness-health'
+result = subprocess.run(['sh', '-c', command], env=env, text=True, capture_output=True, check=True)
+open(sys.argv[1] + '.health', 'w').write(result.stdout)
+PY
       fi
       ;;
     -N) printf 'unexpected ssh -N while reusable tunnel is up\n' >&2; exit 99;;
@@ -897,26 +1147,12 @@ assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse auth
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"
-grep -E "inject-rule.sh\" on .*'/home/box/.remote-harness/.sessions/test/ssh_config' 'rev\.[A-Za-z0-9]+'" "$ssh_log" >/dev/null \
-  || fail "laptop-setup did not pass its per-launch session id to inject-rule on"
-grep -E "inject-rule.sh\" off 'codex' '/tmp/rh-remote' 'rev\.[A-Za-z0-9]+'" "$ssh_log" >/dev/null \
-  || fail "laptop-setup cleanup did not remove only its own inject-rule session"
 assert_grep "$ROOT/scripts/laptop-setup.sh" "exec 3</dev/tty" "phase5 attaches stdin to controlling tty"
 [ -f "$auth_keys_snapshot" ] || fail "did not capture the live forced-command authorized_keys entry"
 assert_grep "$auth_keys_snapshot" 'from="127.0.0.1,::1",command="' "authorized key is loopback-scoped and forced"
 assert_grep "$auth_keys_snapshot" '/project-host-gateway.sh' "authorized key invokes the project-host gateway"
 assert_grep "$auth_keys_snapshot" ',no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty ssh-ed25519 ' "authorized key disables interactive SSH capabilities"
-forced_command=$(python3 - "$auth_keys_snapshot" <<'PY'
-import re
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-match = re.search(r'command="((?:\\.|[^"\\])*)"', text)
-assert match, "forced command option missing"
-print(match.group(1).replace("\\\\", "\\").replace('\\"', '"'))
-PY
-)
-forced_health=$(HOME="$proj_home" SSH_ORIGINAL_COMMAND=remote-harness-health sh -c "$forced_command")
+forced_health=$(cat "$auth_keys_snapshot.health")
 case "$forced_health" in RH_OK*) ;; *) fail "generated forced command could not execute from a quoted HOME path";; esac
 if grep -Eq -- '(^| )-N( |$)' "$ssh_log" 2>/dev/null; then
   fail "laptop-setup opened a new ssh -N despite reusable tunnel"
@@ -926,6 +1162,32 @@ if [ -f "$proj_home/.ssh/authorized_keys" ] && grep -F "remote-harness:reverse-a
 fi
 if [ -f "$proj_home/.ssh/authorized_keys" ] && grep -F "AAAAC3NzaC1lZDI1NTE5AAAAITest" "$proj_home/.ssh/authorized_keys" >/dev/null; then
   fail "temporary authorized_keys key was not cleaned"
+fi
+
+# Local cleanup retains the whole transport when shared or unverifiable, then retries on launch.
+shared_home="$tmp/shared-project-host"
+mkdir -p "$shared_home"
+for resource_used in 1 error 0; do
+  HOME="$shared_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
+    SSH_LOG="$ssh_log" RESOURCE_USED="$resource_used" \
+    bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32023 --via 'ssh user@example.com' \
+      --pubkey 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test' \
+      --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+      --remote-mountpoint /tmp/rh-remote --project-dir "$valid_project" --launch codex --yes \
+      > "$tmp/shared-$resource_used.out"
+  if [ "$resource_used" != 0 ]; then
+    [ -n "$(find "$shared_home/.remote-harness/.sessions" -name resources.env -print -quit)" ] \
+      || fail 'shared or unreachable transport lost its local resource record'
+    [ -n "$(find "$shared_home/.remote-harness/.sessions" -name ssh_config -print -quit)" ] \
+      || fail 'shared or unreachable transport lost its local SSH config'
+    grep -q 'remote-harness:reverse-auth:' "$shared_home/.ssh/authorized_keys" \
+      || fail 'shared or unreachable transport lost its authorization'
+  fi
+done
+[ -z "$(find "$shared_home/.remote-harness/.sessions" -name resources.env -print -quit)" ] \
+  || fail 'unused deferred transport records were not reclaimed'
+if grep -q 'remote-harness:reverse-auth:' "$shared_home/.ssh/authorized_keys"; then
+  fail 'unused deferred authorization was not reclaimed'
 fi
 
 preauth_home="$tmp/preauth-home"
@@ -1015,7 +1277,11 @@ assert_grep "$ROOT/reference/reverse.md" "ssh -n -o ClearAllForwardings=yes" "re
 # --- setup-tunnel.sh: --namespace derives a stable reverse port ----------------
 st_home="$tmp/st-home"; mkdir -p "$st_home/.ssh" "$tmp/st-session-ns"
 st_cfg_ns="$tmp/st-session-ns/ssh_config"
-st_out="$(HOME="$st_home" bash "$ROOT/scripts/setup-tunnel.sh" --config "$st_cfg_ns" --alias alice-mac --user alice --namespace alice --gen-key 2>/dev/null)"
+st_probe_bin="$tmp/st-probe-bin"
+mkdir -p "$st_probe_bin"
+printf '#!/bin/sh\nexit 0\n' > "$st_probe_bin/ss"
+chmod +x "$st_probe_bin/ss"
+st_out="$(PATH="$st_probe_bin:$PATH" HOME="$st_home" bash "$ROOT/scripts/setup-tunnel.sh" --config "$st_cfg_ns" --alias alice-mac --user alice --namespace alice --gen-key 2>/dev/null)"
 st_port="$(printf '%s\n' "$st_out" | awk -F= '/^PORT=/{print $2}')"
 case "$st_port" in *2) ;; *) fail "setup-tunnel hashed port should end in 2 (got '$st_port')";; esac
 { [ "$st_port" -ge 20002 ] && [ "$st_port" -le 29992 ]; } || fail "setup-tunnel hashed port out of [20002,29992] (got '$st_port')"
@@ -1083,6 +1349,99 @@ for ir_bad in .. 'a/b' 'a b'; do
   assert_grep <(printf '%s\n' "$ir_bad_out") "RH_STATUS=ERROR" "inject-rule rejects unsafe session id '$ir_bad'"
 done
 [ -z "$(find "$ir_rh/.sessions" -mindepth 1 -maxdepth 1 -name "$ir_key*" -print -quit)" ] || fail "inject-rule: unsafe session id created a session dir"
+
+# --- tool shims, session launcher, and server-side reaping ---------------------------------------
+rp_rh="$tmp/rp-rh"
+rp_home="$tmp/rp-home"
+mkdir -p "$rp_rh/.sessions/simple.rp1" "$rp_home" "$tmp/rp-mount" "$tmp/rp-code"
+rp_cfg="$rp_rh/.sessions/simple.rp1/ssh_config"
+printf 'Host laptop\n    HostName 127.0.0.1\n' > "$rp_cfg"
+printf 'key\n' > "$rp_rh/.sessions/simple.rp1/id_ed25519"
+RH_HOME="$rp_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on claude "$tmp/rp-code" laptop "$tmp/rp-mount" 0 "$rp_cfg" rev.rp1 > "$tmp/rp-inject.out"
+rp_key="$(printf '%s' "$tmp/rp-mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+rp_sd="$rp_rh/.sessions/$rp_key.rev.rp1"
+assert_grep "$tmp/rp-inject.out" "RH_LAUNCH_PREFIX='$rp_sd/bin/rh-session'" "inject exposes the session launcher"
+[ -x "$rp_sd/bin/git" ] || fail "inject did not install the git shim"
+assert_grep "$rp_sd/bin/git" "project-host-tool.py" "git shim delegates to project-host-tool"
+assert_grep "$rp_sd/session.env" "MOUNTPOINT=$(b64 "$tmp/rp-mount")" "session metadata records the mountpoint"
+assert_grep "$rp_sd/session.env" "SSH_CONFIG=$(b64 "$rp_cfg")" "session metadata records the ssh config"
+if [ "${#rp_rh}" -lt 60 ]; then
+  assert_grep "$rp_sd/bin/rh-run" "--control-path" "short session runtime enables multiplexing"
+fi
+if [ -x "$rp_sd/bin/rg" ]; then
+  assert_grep "$tmp/rp-inject.out" "USE_BUILTIN_RIPGREP=0" "claude uses the rg shim when one is installed"
+fi
+assert_grep "$rp_sd/rule.md" "Git commands you run through the Bash tool are routed" "rule describes Bash git routing"
+if grep -F "All Git commands are routed too" "$rp_sd/rule.md" >/dev/null; then
+  fail "rule still claims every Git command is routed"
+fi
+
+# Agent exits without any local cleanup: the watcher removes leftovers server-side.
+python3 -c 'import sys, time; time.sleep(300)' "$rp_sd/bin/rh-run" &
+rp_leftover=$!
+RH_REAP_POLL=1 RH_REAP_GRACE=1 RH_HOME="$rp_rh" "$rp_sd/bin/rh-session" sleep 1
+assert_grep "$rp_sd/owner.env" "OWNER_PID=" "launcher records the agent pid"
+rp_i=0
+while [ -d "$rp_sd" ] && [ "$rp_i" -lt 30 ]; do sleep 1; rp_i=$((rp_i + 1)); done
+[ ! -d "$rp_sd" ] || fail "watcher did not reap the dead session dir"
+[ ! -e "$rp_cfg" ] || fail "watcher did not remove the session ssh config"
+[ ! -e "$rp_rh/.sessions/simple.rp1/id_ed25519" ] || fail "watcher did not remove the session private key"
+if kill -0 "$rp_leftover" 2>/dev/null; then
+  kill "$rp_leftover" 2>/dev/null || true
+  fail "watcher left a routed session process running"
+fi
+wait "$rp_leftover" 2>/dev/null || true
+
+# gc: dead, unlaunched-and-stale, live, and orphan-config cases.
+mkdir -p "$rp_rh/.sessions/dead.s" "$rp_rh/.sessions/stale.s" "$rp_rh/.sessions/live.s" \
+  "$rp_rh/.sessions/fresh.s" "$rp_rh/.sessions/simple.old" "$rp_rh/.sessions/simple.new"
+for rp_s in dead stale live fresh; do
+  printf 'MOUNTPOINT=%s\n' "$(b64 "$tmp/rp-none-$rp_s")" > "$rp_rh/.sessions/$rp_s.s/session.env"
+done
+printf 'OWNER_PID=999999999\n' > "$rp_rh/.sessions/dead.s/owner.env"
+printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" \
+  "$(b64 "$(ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')")" > "$rp_rh/.sessions/live.s/owner.env"
+touch -t 202001010000 "$rp_rh/.sessions/stale.s/session.env"
+printf 'Host x\n' > "$rp_rh/.sessions/simple.old/ssh_config"
+touch -t 202001010000 "$rp_rh/.sessions/simple.old/ssh_config"
+printf 'Host y\n' > "$rp_rh/.sessions/simple.new/ssh_config"
+RH_HOME="$rp_rh" sh "$ROOT/scripts/session-reaper.sh" gc
+[ ! -d "$rp_rh/.sessions/dead.s" ] || fail "gc kept a session whose agent is gone"
+[ ! -d "$rp_rh/.sessions/stale.s" ] || fail "gc kept a never-launched stale session"
+[ -d "$rp_rh/.sessions/live.s" ] || fail "gc removed a live session"
+[ -d "$rp_rh/.sessions/fresh.s" ] || fail "gc removed a session that is still launching"
+[ ! -e "$rp_rh/.sessions/simple.old/ssh_config" ] || fail "gc kept an orphan session ssh config"
+[ -e "$rp_rh/.sessions/simple.new/ssh_config" ] || fail "gc removed a fresh session ssh config"
+mkdir -p "$tmp/rp-outside"
+RH_HOME="$rp_rh" sh "$ROOT/scripts/session-reaper.sh" reap "$tmp/rp-outside"
+[ -d "$tmp/rp-outside" ] || fail "reaper deleted a directory outside \$RH_HOME/.sessions"
+
+# --- runner guard selection: with python3 the Bash runner is watched, without it unchanged -------
+wr_rh="$tmp/wr-rh"
+mkdir -p "$wr_rh" "$tmp/wr-mount" "$tmp/wr-mount-nopy"
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount" 0 "$basic_ssh_cfg" > /dev/null
+wr_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+assert_grep "$wr_sd/bin/rh-run" "channel-guard.py" "runner holds the channel open with python3"
+assert_grep "$wr_sd/bin/rh-run" "--watch" "runner asks for watched execution"
+nopy_bin="$tmp/nopy-bin"
+mkdir -p "$nopy_bin"
+for nopy_src in /usr/local/bin/* /usr/bin/* /bin/*; do
+  nopy_name=${nopy_src##*/}
+  case "$nopy_name" in python*) continue ;; esac
+  [ -e "$nopy_bin/$nopy_name" ] || ln -s "$nopy_src" "$nopy_bin/$nopy_name" 2>/dev/null || true
+done
+PATH="$nopy_bin" RH_HOME="$wr_rh" HOME="$rp_home" \
+  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/rp-code" laptop "$tmp/wr-mount-nopy" 0 "$basic_ssh_cfg" > "$tmp/wr-nopy.out"
+assert_grep "$tmp/wr-nopy.out" "RH_STATUS=INJECTED" "opencode inject works without python3"
+wr_nopy_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-nopy" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+if grep -E 'channel-guard|--watch' "$wr_nopy_sd/bin/rh-run" >/dev/null; then
+  fail "runner requires python3 that is not installed"
+fi
+[ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount" >/dev/null
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/wr-mount-nopy" >/dev/null
+
+bash "$ROOT/tests/resources.sh"
 
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   doc_list() { git -C "$ROOT" ls-files --cached --others --exclude-standard '*.md'; }

@@ -24,8 +24,9 @@ box session ssh_config:
 ```
 
 The simple reverse path keeps session config files and `known_hosts` under
-`~/.remote-harness/.sessions/...`, disables OpenSSH multiplexing, and removes temporary state on
-cleanup where possible. It does not write `~/.ssh/config`, `known_hosts`, or SSH keys. Its only
+`~/.remote-harness/.sessions/...`, keeps `ControlMaster no` in generated configs (routed commands
+and tool shims pass a short session-scoped multiplexing master on the command line only), and
+removes temporary state on cleanup where possible. It does not write `~/.ssh/config`, `known_hosts`, or SSH keys. Its only
 `~/.ssh` mutation is the laptop `authorized_keys` managed block used for temporary reverse
 authentication.
 
@@ -37,6 +38,7 @@ do not use `read -p`.
 ```bash
 (
 set -f
+umask 077
 p='remote-harness source SSH target/args'
 d='<default_via>'
 printf '%s' "$p${d:+ [$d]}: " >/dev/tty
@@ -46,21 +48,25 @@ mkdir -p "$HOME/.remote-harness/.sessions"
 s=$(mktemp -d "$HOME/.remote-harness/.sessions/fetch.XXXXXX") || exit 1
 trap 'rm -rf "$s"' EXIT
 ssh -n -o ClearAllForwardings=yes \
-  -o UserKnownHostsFile="$s/known_hosts" \
-  -o GlobalKnownHostsFile=/dev/null \
-  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
   -o ControlMaster=no -o ControlPath=none \
   $h \
-  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' |
-  RH_VIA="$h" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>
+  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' \
+  > "$s/simple-bootstrap.sh" || exit 1
+[ -s "$s/simple-bootstrap.sh" ] || exit 1
+bash -n "$s/simple-bootstrap.sh" || exit 1
+RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
 
 ## Runtime Flow
 
-1. `simple-bootstrap.sh` runs locally. If fetched from remote, it fetches `_common.sh`,
-   `simple-dispatch.sh`, `simple-laptop-setup.sh`, `laptop-setup.sh`, and required helpers into a
-   local temp dir.
+1. The outer command fully downloads and syntax-checks `simple-bootstrap.sh` before executing it
+   locally. The source alias's verified host identity is preserved with strict checking and no
+   known-hosts updates. One additional SSH connection downloads all eight helpers with a bootstrap
+   copy and SHA-256 manifest; filenames, entry types, hashes, bootstrap identity and Bash syntax
+   must pass before the local wizard starts. See `docs/simple-flow.md` for the bundle checks.
 2. `simple-dispatch.sh --mode reverse` hands off to `simple-laptop-setup.sh`.
 3. `simple-laptop-setup.sh` prompts locally for the remote SSH target, local project dir, optional
    remote mountpoint, and YOLO preference when not already explicit.
@@ -72,6 +78,9 @@ ssh -n -o ClearAllForwardings=yes \
    strict Claude/Codex hooks or the opencode routing plugin, and launches the selected agent.
 7. On exit, cleanup unmounts sshfs, removes the session rule, drops the reverse tunnel when no
    remaining mount needs it, removes temp ssh configs, and removes default empty mountpoint dirs.
+8. If the connection is force-closed and the laptop never runs that cleanup, the remote session
+   watcher notices the agent exit (or hung-up terminal) and performs the remote cleanup itself;
+   the next launch's GC repeats it for anything a reboot left behind.
 
 ## Preconditions
 

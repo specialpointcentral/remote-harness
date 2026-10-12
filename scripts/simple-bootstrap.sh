@@ -7,6 +7,7 @@
 # into a temp dir and then delegates to simple-dispatch.sh there.
 set -uo pipefail
 set -f
+umask 077
 
 LANG_MODE="${RH_LANG:-en}"
 is_zh() {
@@ -121,19 +122,9 @@ tmp="$(mktemp -d "$HOME/.remote-harness/.sessions/bootstrap.XXXXXX")" || exit 1
 cleanup() { rm -rf "$tmp" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM HUP
 
-fetch_script() {
-  _name="$1"
-  # $VIA is intentionally word-split into ssh args, never eval'd. For complex
-  # quoted SSH options, put them in ~/.ssh/config and enter the Host alias.
-  # shellcheck disable=SC2086
-  ssh -n -o ClearAllForwardings=yes \
-    -o UserKnownHostsFile="$tmp/known_hosts_source" \
-    -o GlobalKnownHostsFile=/dev/null \
-    -o StrictHostKeyChecking=accept-new \
-    -o ControlMaster=no -o ControlPath=none \
-    $VIA \
-    "rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"; cat \"\$rh/scripts/$_name\"" \
-    > "$tmp/$_name"
+bootstrap_fail() {
+  if is_zh; then printf '%s\n' "$1" >&2; else printf '%s\n' "$2" >&2; fi
+  exit 1
 }
 
 if is_zh; then
@@ -141,27 +132,76 @@ if is_zh; then
 else
   printf 'Fetching remote-harness simple setup from the remote source...\n'
 fi
-for script in \
-  _common.sh \
-  simple-dispatch.sh \
-  simple-laptop-setup.sh \
-  laptop-setup.sh \
-  mount-project.sh \
-  inject-rule.sh \
-  run-on-project-host.sh \
-  project-host-gateway.sh; do
-  if ! fetch_script "$script"; then
-    if is_zh; then
-      printf '无法从远端 remote-harness 读取 %s\n' "$script" >&2
-      printf '请检查 SSH 是否可用，以及远端是否安装了 ~/.remote-harness\n' >&2
-    else
-      printf 'failed to fetch %s from remote-harness on the remote source\n' "$script" >&2
-      printf 'check that SSH works and ~/.remote-harness is installed there\n' >&2
-    fi
-    exit 1
+helpers=(_common.sh simple-dispatch.sh simple-laptop-setup.sh laptop-setup.sh
+         mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh)
+bundle_files=(simple-bootstrap.sh "${helpers[@]}")
+sha256_manifest() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"
+  else return 1
   fi
-  chmod +x "$tmp/$script" 2>/dev/null || true
+}
+
+# Stage a fixed file set before streaming one archive. Neither shell chatter nor partial SSH
+# output is executable locally. The bootstrap copy detects an install change between downloads.
+remote_bundle=$(cat <<'REMOTE'
+set -eu
+umask 077
+rh="${RH_HOME:-$HOME/.remote-harness}"
+mkdir -p "$rh/.sessions"
+stage=$(mktemp -d "$rh/.sessions/helpers.XXXXXX") || exit 1
+trap 'rm -rf "$stage"' EXIT
+set -- simple-bootstrap.sh _common.sh simple-dispatch.sh simple-laptop-setup.sh laptop-setup.sh mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh
+cd "$rh/scripts"
+cp "$@" "$stage/"
+cd "$stage"
+if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@" > SHA256SUMS
+elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@" > SHA256SUMS
+else printf 'remote-harness: SHA-256 tool required\n' >&2; exit 1
+fi
+tar -cf - SHA256SUMS "$@"
+REMOTE
+)
+archive="$tmp/helpers.tar"
+# $VIA is intentionally word-split into SSH args, never evaluated. Keep the user's HostKeyAlias
+# and known-hosts configuration; strict checking plus disabled updates avoids changing ~/.ssh.
+# shellcheck disable=SC2086
+if ! ssh -n -o ClearAllForwardings=yes \
+    -o BatchMode=yes -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
+    -o ControlMaster=no -o ControlPath=none \
+    $VIA "$remote_bundle" > "$archive"; then
+  bootstrap_fail '无法下载 helper 包；请检查 SSH 和已验证的主机身份配置。' \
+    'failed to download helper bundle; check SSH and the verified host identity configuration'
+fi
+
+# Check names, duplicates and entry types before extracting anything. Only flat regular files
+# from the fixed list are allowed; the manifest is compared with locally computed hashes rather
+# than interpreted as a list of arbitrary paths to read.
+printf '%s\n' SHA256SUMS "${bundle_files[@]}" | LC_ALL=C sort > "$tmp/expected-files"
+if ! tar -tf "$archive" > "$tmp/archive-files" \
+    || ! LC_ALL=C sort "$tmp/archive-files" > "$tmp/sorted-files" \
+    || ! cmp -s "$tmp/expected-files" "$tmp/sorted-files" \
+    || ! tar -tvf "$archive" | awk 'substr($0,1,1) != "-" {bad=1} END {exit bad}'; then
+  bootstrap_fail 'helper 包文件清单或类型无效。' 'invalid helper bundle file list or entry type'
+fi
+unpack="$tmp/helpers"
+mkdir "$unpack" || exit 1
+if ! tar -xf "$archive" -C "$unpack" \
+    || ! (cd "$unpack" && sha256_manifest "${bundle_files[@]}") > "$tmp/computed-sha256" \
+    || ! cmp -s "$unpack/SHA256SUMS" "$tmp/computed-sha256"; then
+  bootstrap_fail 'helper 包解包或 SHA-256 校验失败。' 'helper bundle extraction or SHA-256 verification failed'
+fi
+if [ -f "${BASH_SOURCE[0]}" ] && ! cmp -s "${BASH_SOURCE[0]}" "$unpack/simple-bootstrap.sh"; then
+  bootstrap_fail '远端 bootstrap 在下载期间发生变化，请重新启动。' \
+    'remote bootstrap changed between downloads; restart the bootstrap'
+fi
+for script in "${bundle_files[@]}"; do
+  if ! bash -n "$unpack/$script"; then
+    bootstrap_fail 'helper 包包含无效的 Bash 脚本。' 'helper bundle contains invalid Bash syntax'
+  fi
+  chmod +x "$unpack/$script" || exit 1
 done
 
-bash "$tmp/simple-dispatch.sh" "${dispatch_args[@]}"
+bash "$unpack/simple-dispatch.sh" "${dispatch_args[@]}"
 exit $?

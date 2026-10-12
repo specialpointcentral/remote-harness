@@ -7,7 +7,7 @@
 3. The local wizard asks for the remote SSH target, local project, remote mountpoint, and approval mode.
 4. The remote server creates a per-session SSH key and session-local `rlocal` config.
 5. The local bootstrap installs `project-host-gateway.sh` and `run-on-project-host.sh` under
-   `~/.remote-harness/bin`.
+   `~/.remote-harness/.sessions/gateways/<session-tag>/bin`.
 6. The local `authorized_keys` entry binds the session key to the forced gateway. An unrestricted
    matching authorization is rejected.
 7. The local machine opens `RemoteForward <port> 127.0.0.1:22` to the remote server.
@@ -18,8 +18,12 @@
 12. The selected agent starts through `ssh -tt` on the remote server.
 13. File tools use SSHFS. Bash uses `remote-harness-exec` and runs in the mapped local project cwd.
 14. Agent/Spawn tools create remote subagents; they are not routed locally.
-15. Cleanup removes the mount, remote key, temporary authorization, gateway registration, hooks,
-    and temporary configs.
+15. Cleanup releases this session's lease under the resource lock. The final user releases the
+    mount and its transport; shared keys/configs/runtime/mux remain. Local records retain the
+    tunnel and authorization until remote release can be verified and retry on later launches.
+
+Runtime hooks, runners, shims and the watcher use the session's `impl` snapshot. Local gateway
+implementations are also per-key snapshots. Development edits affect subsequent sessions.
 
 The forward/local-agent flow is disabled and its compatibility entrypoints return an error before
 performing work.

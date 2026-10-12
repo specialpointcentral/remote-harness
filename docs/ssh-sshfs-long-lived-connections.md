@@ -21,7 +21,10 @@ remote-harness already:
 - passes `reconnect`, `ServerAliveInterval`, and `ServerAliveCountMax` to `sshfs`;
 - verifies that a mount actually becomes live instead of trusting only the `sshfs` exit code;
 - cleans up reverse mounts, session rules, temporary SSH configs, and managed auth references on
-  exit where possible.
+  exit where possible, and runs a remote session watcher plus launch-time GC that perform the remote
+  part of that cleanup when the local side disappears first;
+- for routed commands and git/rg tool calls only, passes a short-lived multiplexing master and
+  keepalives on the command line (see `docs/design.md`), without changing the generated configs.
 
 Those choices improve session-level reliability. Server-side capacity still matters when many users
 create many long-lived SSH/SFTP/SSHFS connections.
@@ -208,6 +211,23 @@ sysctl net.core.somaxconn \
   net.ipv4.tcp_keepalive_intvl \
   net.ipv4.tcp_keepalive_probes
 ```
+
+## systemd-logind KillUserProcesses
+
+remote-harness starts long-lived processes from SSH logins: the `sshfs` mount comes from a short
+mount command, the agent from the interactive launch, and the cleanup watcher from that launch. With
+`KillUserProcesses=yes` in `logind.conf`, systemd kills each login's session scope when the login
+ends, which unmounts the project and kills the agent and watcher. `mount-project.sh` reports this
+setting and the laptop launcher prints a warning. Keep the default:
+
+```ini
+# /etc/systemd/logind.conf
+[Login]
+KillUserProcesses=no
+```
+
+Then run `systemctl restart systemd-logind` during a maintenance window. Enabling linger alone does
+not exempt session-scope processes.
 
 ## ssh.socket Policy
 

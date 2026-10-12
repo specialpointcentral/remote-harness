@@ -52,6 +52,7 @@ RH_LANG=<lang> bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.
 ```bash
 (
 set -f
+umask 077
 p='<source_prompt>'
 d='<default_via>'
 printf '%s' "$p${d:+ [$d]}: " >/dev/tty
@@ -61,18 +62,24 @@ mkdir -p "$HOME/.remote-harness/.sessions"
 s=$(mktemp -d "$HOME/.remote-harness/.sessions/fetch.XXXXXX") || exit 1
 trap 'rm -rf "$s"' EXIT
 ssh -n -o ClearAllForwardings=yes \
-  -o UserKnownHostsFile="$s/known_hosts" \
-  -o GlobalKnownHostsFile=/dev/null \
-  -o StrictHostKeyChecking=accept-new \
+  -o BatchMode=yes -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=yes -o UpdateHostKeys=no -o CheckHostIP=no \
   -o ControlMaster=no -o ControlPath=none \
   $h \
-  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' |
-  RH_VIA="$h" RH_LANG=<lang> bash -s -- --mode reverse --launch <launch>
+  'cat "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh"' \
+  > "$s/simple-bootstrap.sh" || exit 1
+[ -s "$s/simple-bootstrap.sh" ] || exit 1
+bash -n "$s/simple-bootstrap.sh" || exit 1
+RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
 
 告诉用户在新的本地终端运行命令。具体 SSH target、项目路径、挂载点和审批选择都在终端收集，
 不进入 Agent 聊天。
+来源 SSH target 必须已在用户的 SSH 配置中具有经过验证的主机身份。下载保留这些配置，不接受新
+主机密钥，也不更新用户的 known-hosts 文件。外层完整下载并通过 `bash -n` 后才执行；bootstrap
+随后用一次 SSH 下载全部八个 helper 的包，校验固定文件清单、SHA-256 摘要，以及包内 bootstrap
+是否与外层下载一致，再启动向导。
 
 ## 严格执行边界
 
@@ -84,7 +91,11 @@ ssh -n -o ClearAllForwardings=yes \
 4. 在远端服务器 SSHFS 挂载本机项目；
 5. 在远端服务器启动 Agent；
 6. Bash 只走 `remote-harness-exec`，任意本机 SSH shell 命令会被拒绝；
-7. 退出时删除挂载、会话 key、授权、gateway 登记和临时 config。
+7. 退出时释放本会话资源 lease；共享挂载和通道的密钥、runtime 与授权保留到最后一个使用者退出。
+   本地清理无法验证时在后续启动重试。
+
+新会话的远端 hook、runner、垫片和 watcher 使用每会话 `impl` 快照，本机 gateway 按反向密钥保存
+实现副本。旧会话不在运行中迁移。不得卸载共享的活跃挂载，也不得仅凭 alias 关闭隧道。
 
 命令路由器或 opencode plugin 会在执行前改写 Bash。本机 dispatcher 拒绝直接启动 `claude`、`codex`
 和 `opencode`，清除常见 AI 凭据环境变量，并在 `PATH` 中屏蔽这些二进制。这些是纵深防护；任意项目
