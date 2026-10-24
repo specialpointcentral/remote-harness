@@ -145,7 +145,7 @@ cache_save() {
   mkdir -p "$(dirname "$_cache")" 2>/dev/null || true
   _tmp="$(mktemp "${_cache}.XXXXXX" 2>/dev/null)" || return 0
   if [ -f "$_cache" ]; then
-    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_MOUNT_PROJECT|LAST_LAUNCH|LAST_YOLO)=' "$_cache" 2>/dev/null > "$_tmp" || true
+    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_MOUNT_PROJECT|LAST_LAUNCH|LAST_YOLO|LAST_LOCAL_SSHD)=' "$_cache" 2>/dev/null > "$_tmp" || true
   fi
   for _kv in \
     "LAST_VIA=$VIA" \
@@ -153,9 +153,10 @@ cache_save() {
     "LAST_REMOTE_MOUNTPOINT=$REMOTE_MP" \
     "LAST_MOUNT_PROJECT=$PROJECT_DIR" \
     "LAST_LAUNCH=$LAUNCH" \
-    "LAST_YOLO=$YOLO"; do
+    "LAST_YOLO=$YOLO" \
+    "LAST_LOCAL_SSHD=$LOCAL_SSHD"; do
     case "$_kv" in *'
-'*) continue;; esac
+'*|LAST_LOCAL_SSHD=auto) continue;; esac
     printf '%s\n' "$_kv" >> "$_tmp"
   done
   mv "$_tmp" "$_cache" 2>/dev/null && chmod 600 "$_cache" 2>/dev/null || true
@@ -163,6 +164,7 @@ cache_save() {
 
 VIA="" LAUNCH="codex" YOLO=0 YOLO_REQUESTED=0
 NAMESPACE="" PROJECT_DIR="" REMOTE_MP="" ASSUME_YES=0
+LOCAL_SSHD="${RH_LOCAL_SSHD:-auto}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --via)               need_arg "$1" "${2-}"; VIA="$2"; shift 2;;
@@ -171,6 +173,7 @@ while [ $# -gt 0 ]; do
     --namespace)         need_arg "$1" "${2-}"; NAMESPACE="$2"; shift 2;;
     --project-dir)       need_arg "$1" "${2-}"; PROJECT_DIR="$2"; shift 2;;
     --remote-mountpoint) need_arg "$1" "${2-}"; REMOTE_MP="$2"; shift 2;;
+    --local-sshd)        need_arg "$1" "${2-}"; LOCAL_SSHD="$2"; shift 2;;
     --yes|-y)            ASSUME_YES=1; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
@@ -178,6 +181,11 @@ done
 case "$LAUNCH" in
   claude|codex|opencode) ;;
   *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
+esac
+case "$LOCAL_SSHD" in
+  auto|"") LOCAL_SSHD=auto;;
+  system|user) ;;
+  *) printf 'unsupported --local-sshd %s (expected auto|system|user)\n' "$LOCAL_SSHD" >&2; exit 2;;
 esac
 
 if is_zh; then
@@ -259,6 +267,29 @@ else
   fi
 fi
 
+# Which SSH server the reverse tunnel reaches here. An explicit choice (flag, RH_LOCAL_SSHD or the
+# answer below) is remembered; auto stays the system sshd unless it looks like it cannot work.
+if [ "$LOCAL_SSHD" = auto ]; then
+  cached_sshd="$(cache_get LAST_LOCAL_SSHD)"
+  case "$cached_sshd" in
+    system|user) LOCAL_SSHD="$cached_sshd";;
+    *)
+      if sshd_hint="$(local_sshd_user_mode_hint)"; then
+        case "$sshd_hint" in
+          no-sshd) warn "$(tr2 "No SSH server is listening on :22 on this machine." "本机 :22 上没有 SSH 服务在监听。")";;
+          *) warn "$(tr2 "This machine's sshd looks up keys outside ~/.ssh/authorized_keys (e.g. FreeIPA/sssd)." "本机 sshd 从 ~/.ssh/authorized_keys 之外查找公钥（例如 FreeIPA/sssd）。")";;
+        esac
+        say "  $(tr2 "A per-session sshd run as you on a free loopback port needs no root and no ~/.ssh change." "可改用以你自己身份运行、只监听回环空闲端口的会话级 sshd：不需要 root，也不修改 ~/.ssh。")"
+        if prompt_yes_no "$(tr2 "Use the per-session user-mode sshd?" "使用会话级用户态 sshd？")" y; then
+          LOCAL_SSHD=user
+        else
+          LOCAL_SSHD=system
+        fi
+      fi
+      ;;
+  esac
+fi
+
 if is_zh; then
   hdr "执行计划"
   say "远端机器：       ${VIA}"
@@ -279,6 +310,11 @@ if [ "$YOLO" = 1 ]; then
   if is_zh; then say "启动命令：       ${LAUNCH} --yolo"; else say "Launch:           ${LAUNCH} --yolo"; fi
 else
   if is_zh; then say "启动命令：       ${LAUNCH}"; else say "Launch:           ${LAUNCH}"; fi
+fi
+if [ "$LOCAL_SSHD" = user ]; then
+  say "$(tr2 "Local SSH server: per-session user-mode sshd (RH_LOCAL_SSHD=system switches back)" "本机 SSH 服务：   会话级用户态 sshd（RH_LOCAL_SSHD=system 可改回）")"
+else
+  say "$(tr2 "Local SSH server: system sshd on :22 (RH_LOCAL_SSHD=user for FreeIPA-style hosts)" "本机 SSH 服务：   系统 sshd（:22；FreeIPA 这类主机用 RH_LOCAL_SSHD=user）")"
 fi
 if is_zh; then
   prompt_yes_no "继续执行这个设置？" y
@@ -340,6 +376,7 @@ cmd=(bash "$SCRIPT_DIR/laptop-setup.sh"
 [ -n "$PUBKEY" ] && cmd+=(--pubkey "$PUBKEY")
 [ -n "$REMOTE_MP" ] && cmd+=(--remote-mountpoint "$REMOTE_MP")
 [ "$YOLO" = 1 ] && cmd+=(--yolo)
+cmd+=(--local-sshd "$LOCAL_SSHD")
 
 export RH_STEP_BASE="$STEP_N"
 step_reset 0

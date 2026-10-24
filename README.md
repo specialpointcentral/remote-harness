@@ -33,6 +33,8 @@
 - [安装 Skill](#安装-skill)
 - [Quick start](#quick-start)
 - [工作原理（remote-only）](#工作原理remote-only)
+- [用户态 sshd（FreeIPA 等主机）](#用户态-sshdfreeipa-等主机)
+- [断线与会话恢复](#断线与会话恢复)
 - [服务器 SSH/SSHFS 长连接优化提醒](#服务器-sshsshfs-长连接优化提醒)
 - [环境要求](#环境要求)
 - [仓库结构](#仓库结构)
@@ -103,7 +105,10 @@ cd remote-harness
 $remote-harness 中文，远程开发本地，yolo
 ```
 
-Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yolo`。Agent 会返回一段在**本地终端**运行的命令。
+Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yolo`。请求里没说清楚的项，Agent 会先用
+选项问你：远端用哪个 Agent（Claude Code / Codex / opencode）、是否 YOLO、本机 SSH 服务用系统 sshd 还是
+[用户态 sshd](#用户态-sshdfreeipa-等主机)（FreeIPA 等主机）。然后返回一段已填好选择、在**本地终端**运行的
+命令，并说明每项怎么改。SSH 目标、项目路径和挂载点只在本地终端里填写，不经过聊天。
 
 **Claude 多 Agent 支持**
 
@@ -151,13 +156,70 @@ Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yol
 
 simple reverse 使用 `~/.remote-harness/.sessions/...` 下的会话级 SSH 配置和 `known_hosts`，并关闭
 OpenSSH multiplexing。唯一的 `~/.ssh` 写入例外是在笔记本
-`~/.ssh/authorized_keys` 中追加带标签的临时授权块，并在退出时清理。
+`~/.ssh/authorized_keys` 中追加带标签的临时授权块，并在退出时清理；
+[用户态 sshd](#用户态-sshdfreeipa-等主机) 模式下连这一处也不写。
 
 远端 key 在本机 `authorized_keys` 中绑定 forced command，只允许标准 SFTP、health、
 `remote-harness-exec`，以及只针对 `git`/`rg` 的 `remote-harness-tool`。任意本机 SSH shell 命令会被
 gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PATH 垫片在本机执行，不再在 SSHFS 上
 逐个 lstat 和读文件；生成的 SSH config 仍关闭 multiplexing，只有路由命令在命令行上使用会话级复用
 连接。连接被强制断开、本机来不及清理时，远端会话 watcher 会自行回收挂载、会话目录和临时 key。
+
+### 用户态 sshd（FreeIPA 等主机）
+
+默认情况下，隧道连到本机 `:22` 上的系统 sshd，remote-harness 往 `~/.ssh/authorized_keys` 写一个
+临时授权块。有些本机无法使用这种方式：
+
+- 由 FreeIPA/sssd（或 LDAP）管理的主机：sshd 通过 `AuthorizedKeysCommand` 从目录服务取公钥，
+  `~/.ssh/authorized_keys` 可能不生效，而你又不能修改本机 sshd 的认证配置，也不能把临时 key 加进 IPA；
+- 设置了 `AuthorizedKeysFile none`，或 home 位于 root_squash 的 NFS 上，系统 sshd 读不到你的文件；
+- 本机没有运行 SSH 服务，你也没有 root。
+
+这时使用用户态 sshd：在本地命令前加 `RH_LOCAL_SSHD=user`，例如
+
+```bash
+RH_LOCAL_SSHD=user RH_LANG=zh bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh" \
+  --mode reverse --launch claude
+```
+
+fetch 形式的命令则把 `RH_LOCAL_SSHD=user` 加到最后一行 `RH_VIA="$h" ...` 的开头。向导检测到本机
+sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会主动询问是否改用；选择会被记住，
+`RH_LOCAL_SSHD=system` 可改回系统 sshd。
+
+用户态模式下，本机以你自己的身份为本次会话启动一个 sshd：
+
+- 只监听 `127.0.0.1` 上自动探测到的空闲端口；端口在启动瞬间被占用时自动换端口重试，
+  绑定成功后隧道才写成 `RemoteForward <远端端口> 127.0.0.1:<该端口>`；
+- 只读取会话目录里的私有 `authorized_keys`，授权行与系统模式相同（forced gateway、仅回环来源）；
+  `AuthorizedKeysCommand none`、只允许公钥认证、不走 PAM、禁用转发和 TTY；
+- 不需要 root，不修改 `~/.ssh`。主机密钥、配置、pid 和日志都放在
+  `~/.remote-harness/.sessions/rev.*/sshd/`，与反向隧道同生命周期，退出时停止并删除。
+
+注意：
+
+- 需要本机装有 sshd 程序（openssh-server），但不需要它在运行。
+- 这个 sshd 不经过 PAM，FreeIPA 的 HBAC/PAM 账号策略不作用于这条回环连接。它只能以你本人身份登录、
+  只能执行 gateway，不构成提权；但如果所在机构要求所有登录都经过 IPA 策略，请先确认是否允许。
+- 挂载失败时，错误信息会附上用户态 sshd 日志里的拒绝原因（例如目录权限不满足 `StrictModes`）。
+
+### 断线与会话恢复
+
+- **sshfs 不是同步**：远端没有项目副本，每次读写都实时经 SFTP 落到本机磁盘；`close` 会等写入完成，
+  断线时进行中的写会报错而不是悄悄丢失。为提速，远端会缓存目录项、属性和"文件不存在"结果 20 秒
+  （`RH_SSHFS_CACHE_SECONDS`），所以本机侧新建或修改的文件最多 20 秒后在远端可见。短暂断网由 sshfs
+  `reconnect` 自动恢复。
+- **远端心跳**：远端 watcher 每 30 秒经反向隧道向本机 gateway 做一次健康检查；只有连续失败超过
+  10 分钟（期间任何一次成功都会重新计时）才判定本机已断开，随后结束 Agent、清理远端会话，并留下恢复
+  标记。可在远端登录环境中用 `RH_HEARTBEAT_INTERVAL`（秒）和 `RH_HEARTBEAT_TIMEOUT`（秒，`0` 关闭）调整。
+  服务器 sshd 先因 `ClientAliveInterval` 挂断终端时同样会结束 Agent 并留下标记。
+- **本机清理重试**：退出时连不上远端，会按 10、20、30 秒退避重试（`RH_RELEASE_RETRY_DELAYS`）。仍然
+  不可达时，若隧道是本次会话创建的，就停止隧道和用户态 sshd、撤销本机授权；远端由心跳清理。远端有回应
+  但结果不明确时仍保留资源，并在提示里写明原因，下次启动再回收。
+- **会话恢复**：对话记录保存在远端（Claude `~/.claude/projects/`、Codex `~/.codex/sessions/`），按工作
+  目录区分；默认挂载点按项目名固定，所以同一项目重连后能找到上次对话。若上次会话因断线结束，下次启动
+  同一项目、同一 Agent 时会询问"继续该会话？[Y/n]"（回车即继续，只问一次），分别以
+  `claude --continue`、`codex resume --last`、`opencode --continue` 启动。`RH_RESUME=1` 总是继续上次
+  对话，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -184,7 +246,8 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
 - **反向 simple**：你已经把笔记本的 SSH 公钥配置到远端服务器账号，所以本地命令能先登录远端抓取脚本。
   远端会在本次会话 SSH config 旁生成新的 remote-harness key；本地脚本可将其公钥作为
   `remote-harness:reverse-auth:<tag>` 临时块写入笔记本 `~/.ssh/authorized_keys`，限制为回环来源并在退出时清理。
-  盒子的 sshd 需要允许 TCP 转发（默认即可）。
+  本机 sshd 不读取 `authorized_keys`（如 FreeIPA/sssd）或没有 SSH 服务时，改用
+  [用户态 sshd](#用户态-sshdfreeipa-等主机)。盒子的 sshd 需要允许 TCP 转发（默认即可）。
 - **远端 Agent 服务器需要 `sshfs` + FUSE**：
   - Linux/WSL：`sudo apt-get install -y sshfs`（FUSE 通常已就绪；脚本会按发行版给正确命令）。
   - **macOS：用 FUSE-T——无内核扩展、无需降低系统安全级**：
@@ -243,10 +306,11 @@ remote-harness/
 - 反向模式的唯一 `~/.ssh` 写入例外是本机 `authorized_keys`：脚本会先检查是否已有匹配有效 key；
   没有时才追加带 `remote-harness:reverse-auth:<tag>` 标签、`from="127.0.0.1,::1"` 限制的临时块。
   托管块通过 `~/.remote-harness/.sessions/authorized-keys/...` 引用计数，最后一个会话退出时删除。
+  用户态 sshd 模式不写 `~/.ssh`，授权行只放在会话目录的私有 `authorized_keys` 中。
 - 每次会话使用独立远端 key；授权行绑定 `command="...project-host-gateway..."`。同一 key 若已存在为
   无限制用户授权，setup 会拒绝复用。
-- 反向隧道用 `RemoteForward <端口> 127.0.0.1:22`（仅回环）；多用户盒子上同机其他用户能到达该端口，
-  但没有你的私钥无法认证。
+- 反向隧道用 `RemoteForward <端口> 127.0.0.1:22`（用户态 sshd 模式下是它的回环端口，仅回环）；
+  多用户盒子上同机其他用户能到达该端口，但没有你的私钥无法认证。
 - 多人共用同一个服务器账号时，simple reverse 默认使用会话别名 `rlocal`，别名和 known_hosts 都放在
   远端会话目录中；不会覆盖共享账号的 `~/.ssh/config`。同一台笔记本的多项目会话仍可复用活动隧道，
   最后一个会话退出时清理。
@@ -268,6 +332,9 @@ remote-harness/
 - 会话中文件突然读不了（`Transport endpoint is not connected`）→ 隧道断了，退出 Agent 后再次启动
   remote-harness，会自动检测陈旧挂载并重挂。
 - 挂载报 `not-empty` → 换一个空目录（脚本会提示）。
+- 挂载失败（如 `read: Connection reset by peer`、`Permission denied`），且本机 sshd 由 FreeIPA/sssd
+  管理、不读取 `~/.ssh/authorized_keys` → 加 `RH_LOCAL_SSHD=user` 重新运行，见
+  [用户态 sshd](#用户态-sshdfreeipa-等主机)。
 
 ---
 
@@ -279,6 +346,8 @@ remote-harness/
 - [Install the Skill](#install-the-skill)
 - [Quick start](#quick-start-1)
 - [How it works (remote-only)](#how-it-works-remote-only)
+- [User-mode sshd (FreeIPA-style hosts)](#user-mode-sshd-freeipa-style-hosts)
+- [Disconnects and resuming](#disconnects-and-resuming)
 - [Server SSH/SSHFS Long-Lived Connection Tuning](#server-sshsshfs-long-lived-connection-tuning)
 - [Requirements](#requirements)
 - [Repo layout](#repo-layout)
@@ -354,8 +423,12 @@ In the agent running on the remote box:
 $remote-harness English, remote dev local project, yolo
 ```
 
-Claude Code / opencode use `/remote-harness English, remote dev local project, yolo`. The agent
-returns a command to run in your **local terminal**.
+Claude Code / opencode use `/remote-harness English, remote dev local project, yolo`. For anything
+the request leaves open, the agent first asks with options: which remote agent (Claude Code / Codex /
+opencode), YOLO or not, and whether the laptop uses its system sshd or the
+[user-mode sshd](#user-mode-sshd-freeipa-style-hosts) (FreeIPA-style hosts). It then returns a command
+for your **local terminal** with those choices filled in and a note on how to change each one. SSH
+targets, project paths, and mountpoints are entered only in the local terminal, never in chat.
 
 **Claude multi-agent support**
 
@@ -403,7 +476,7 @@ box:   ssh <alias>          → 127.0.0.1:<PORT> → (tunnel) → laptop:22
 Simple reverse uses session-local SSH config files and `known_hosts` under
 `~/.remote-harness/.sessions/...`, with OpenSSH multiplexing disabled. The only `~/.ssh` write
 exception is that the laptop may get a tagged temporary `authorized_keys` block that is
-removed on exit.
+removed on exit; [user-mode sshd](#user-mode-sshd-freeipa-style-hosts) does not write even that.
 
 The per-session reverse key is bound to a forced SSH command. Only standard SFTP, health checks,
 `remote-harness-exec`, and the `git`/`rg`-only `remote-harness-tool` verb are accepted; arbitrary
@@ -412,6 +485,74 @@ laptop through session PATH shims instead of lstat-ing and reading files over SS
 configs still disable multiplexing, and only routed commands use a session-scoped master passed on
 the command line. If the connection is force-closed before the laptop can clean up, a remote session
 watcher reclaims the mount, session dir, and temporary key itself.
+
+### User-mode sshd (FreeIPA-style hosts)
+
+By default the tunnel reaches the system sshd on the laptop's `:22`, and remote-harness adds a
+temporary block to `~/.ssh/authorized_keys`. Some laptops cannot work that way:
+
+- FreeIPA/sssd (or LDAP) managed hosts: sshd fetches keys from the directory through
+  `AuthorizedKeysCommand`, `~/.ssh/authorized_keys` may be ignored, and you can neither change the
+  local sshd authentication setup nor add a temporary key to IPA;
+- `AuthorizedKeysFile none`, or a home on a root-squashed NFS export the system sshd cannot read;
+- no SSH server runs on the laptop and you have no root.
+
+Use the user-mode sshd there: prefix the local command with `RH_LOCAL_SSHD=user`, for example
+
+```bash
+RH_LOCAL_SSHD=user RH_LANG=en bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh" \
+  --mode reverse --launch claude
+```
+
+For the fetch form, put `RH_LOCAL_SSHD=user` at the start of its last line (`RH_VIA="$h" ...`). The
+wizard also offers it when the local sshd uses `AuthorizedKeysCommand` or nothing listens on `:22`;
+the choice is remembered, and `RH_LOCAL_SSHD=system` switches back.
+
+In user mode the laptop starts an sshd as you, for this session only:
+
+- it listens only on a free loopback port probed on `127.0.0.1`; if the port is taken at bind time
+  it retries on another one, and only then is the tunnel written as `RemoteForward <PORT> 127.0.0.1:<that port>`;
+- it reads only a session-private `authorized_keys` holding the same authorization line as system
+  mode (forced gateway, loopback source), with `AuthorizedKeysCommand none`, public keys only, no
+  PAM, and no forwarding or TTYs;
+- it needs no root and leaves `~/.ssh` untouched. Its host key, config, pid, and log live under
+  `~/.remote-harness/.sessions/rev.*/sshd/`; it lives exactly as long as the reverse tunnel and is
+  stopped and removed on exit.
+
+Notes:
+
+- The sshd binary (openssh-server) must be installed; it does not need to be running.
+- This sshd bypasses PAM, so FreeIPA HBAC/PAM account policy does not apply to this loopback
+  connection. It can only log in as you and only run the gateway, so it grants nothing new, but check
+  whether your organization requires every login to pass IPA policy.
+- When the mount fails, the error includes the refusal reasons from the user-mode sshd log (for
+  example a directory that fails `StrictModes`).
+
+### Disconnects and resuming
+
+- **SSHFS is not a sync**: the remote has no copy of the project; every read and write goes over SFTP
+  to the laptop's disk as it happens. `close` waits for the write, and writes in flight during a drop
+  fail instead of being lost silently. For speed the remote caches directory entries, attributes, and
+  "no such file" answers for 20 seconds (`RH_SSHFS_CACHE_SECONDS`), so files created or changed on the
+  laptop can take up to 20 seconds to appear remotely. Short drops recover through sshfs `reconnect`.
+- **Remote heartbeat**: the remote watcher runs a health check through the reverse tunnel to the
+  laptop gateway every 30 seconds. Only when every check fails for 10 minutes (any success restarts the
+  count) does it treat the laptop as gone: it ends the agent, cleans up the remote session, and leaves
+  a resume marker. Tune it with `RH_HEARTBEAT_INTERVAL` and `RH_HEARTBEAT_TIMEOUT` (seconds, `0`
+  disables) in the remote login environment. A terminal hung up earlier by the server sshd's
+  `ClientAliveInterval` ends the agent and leaves a marker the same way.
+- **Local cleanup retries**: when the remote is unreachable on exit, cleanup retries after 10, 20, and
+  30 seconds (`RH_RELEASE_RETRY_DELAYS`). If it is still unreachable and this launch created the tunnel,
+  it stops the tunnel and the user-mode sshd and removes the local authorization; the heartbeat cleans
+  up the remote side. An unclear answer from a reachable remote still retains everything, with the
+  reason in the message, for the next launch to reclaim.
+- **Resuming**: conversations live on the remote (Claude `~/.claude/projects/`, Codex
+  `~/.codex/sessions/`) keyed by working directory, and the default mountpoint is fixed by project name,
+  so reconnecting the same project finds the last conversation. When the last session ended on a lost
+  connection, the next launch of the same project and agent asks "Continue that conversation? [Y/n]"
+  (Enter continues; asked once) and starts `claude --continue`, `codex resume --last`, or
+  `opencode --continue`. `RH_RESUME=1` always continues the last conversation, `RH_RESUME=0` never does.
+  The tool call running at the moment of the drop is not resumed.
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 
@@ -442,7 +583,9 @@ See the full template, verification commands, and rollback notes in
   so the local command can fetch scripts from the remote box. The box generates a new
   remote-harness key beside the session SSH config; the local setup may add that public key
   to the laptop's `~/.ssh/authorized_keys` as a tagged, loopback-scoped temporary block and remove it
-  on exit. The box's sshd must allow TCP forwarding (the default).
+  on exit. If the laptop's sshd ignores `authorized_keys` (FreeIPA/sssd) or none runs, use the
+  [user-mode sshd](#user-mode-sshd-freeipa-style-hosts). The box's sshd must allow TCP forwarding
+  (the default).
 - **The remote agent server needs `sshfs` + FUSE**:
   - Linux/WSL: `sudo apt-get install -y sshfs` (FUSE usually present; the script gives the right
     per-distro command).
@@ -504,10 +647,12 @@ remote-harness/
   existing active matching key first, otherwise appends a tagged
   `remote-harness:reverse-auth:<tag>` block restricted with `from="127.0.0.1,::1"`. Managed blocks
   are reference-counted under `~/.remote-harness/.sessions/authorized-keys/...` and removed when the
-  last session exits.
+  last session exits. User-mode sshd writes nothing under `~/.ssh`; its authorization line lives in a
+  session-private `authorized_keys`.
 - Every session uses a separate remote key bound to `project-host-gateway`. Setup refuses a matching
   unrestricted user authorization for that key.
-- The reverse tunnel binds loopback only (`RemoteForward <PORT> 127.0.0.1:22`); on a multi-user box
+- The reverse tunnel binds loopback only (`RemoteForward <PORT> 127.0.0.1:22`, or the user-mode
+  sshd's loopback port); on a multi-user box
   other local users can reach that port but cannot authenticate without your private key.
 - When several people share one server account, simple reverse uses the session alias `rlocal` and
   keeps alias/known_hosts state in the remote session directory, so one run does not overwrite the
@@ -535,3 +680,6 @@ Common issues:
 - Files become unreadable mid-session (`Transport endpoint is not connected`) → the tunnel dropped;
   exit the agent and start remote-harness again (it detects the stale mount and remounts).
 - Mount reports `not-empty` → pick a different empty dir (the script prompts).
+- The mount fails (e.g. `read: Connection reset by peer`, `Permission denied`) on a laptop whose sshd
+  is managed by FreeIPA/sssd and ignores `~/.ssh/authorized_keys` → rerun with `RH_LOCAL_SSHD=user`;
+  see [User-mode sshd](#user-mode-sshd-freeipa-style-hosts).

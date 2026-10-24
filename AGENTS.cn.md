@@ -40,6 +40,10 @@
 - 每个远端会话目录生成独立 reverse key。
 - 本机授权包含 `command="...project-host-gateway..."`、回环来源限制、no PTY、no port/X11/agent forwarding。
 - 同一会话 key 若已出现在无限制用户授权行中，必须拒绝。
+- `RH_LOCAL_SSHD=user`（`--local-sshd user`）用以用户身份运行的会话级 sshd 替代系统 sshd：仅回环、
+  探测空闲端口并在绑定失败时重试、同样的 forced-gateway 授权行放在会话私有 `authorized_keys`、
+  `AuthorizedKeysCommand none`、只允许公钥、不走 PAM、无转发和 TTY。用于 sshd 不读取
+  `~/.ssh/authorized_keys` 的 FreeIPA/sssd 类主机，随隧道的资源记录一起停止。
 - gateway 只接受标准 SFTP、`remote-harness-health`、
   `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`，以及
   `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`；工具动词直接 exec 二进制
@@ -73,10 +77,12 @@
 
 1. 所有拼入远程命令的值必须正确 shell quoting；绝不 `eval` 用户 SSH 输入。
 2. 会话 SSH config 和可变 host-key 状态位于 `~/.remote-harness/.sessions`。
-3. `~/.ssh` 下只允许修改带标签的 forced-gateway `authorized_keys` 块。
+3. `~/.ssh` 下只允许修改带标签的 forced-gateway `authorized_keys` 块；用户态 sshd 不修改该目录。
 4. 清理必须移除挂载、远端会话 key、gateway 登记、授权、hook 和临时 SSH 状态。本地清理无法执行时，
    由远端会话 watcher 和下次启动的 GC 回收已死会话；它们只处理 `$RH_HOME/.sessions` 的直接子目录，
-   且绝不卸载其它存活会话仍在使用的挂载。
+   且绝不卸载其它存活会话仍在使用的挂载。watcher 只在隧道心跳在整个 `RH_HEARTBEAT_TIMEOUT` 内持续失败
+   后才结束 Agent；本机清理只有在隧道由本次启动创建、且重试期间远端始终不可达时，才在没有远端答复的
+   情况下停止隧道。
 5. 被程序解析的脚本 stdout 保持 `KEY=VALUE`。
 6. 中英文 Markdown 必须同步。
 

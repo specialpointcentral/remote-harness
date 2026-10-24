@@ -15,7 +15,7 @@ The laptop opens a reverse SSH tunnel to the remote box. Both SSH aliases are se
 ```text
 laptop session ssh_config:
   Host <box-session-alias>
-      RemoteForward <port> 127.0.0.1:22
+      RemoteForward <port> 127.0.0.1:22    # or the user-mode sshd's loopback port
 
 box session ssh_config:
   Host rlocal
@@ -28,7 +28,24 @@ The simple reverse path keeps session config files and `known_hosts` under
 and tool shims pass a short session-scoped multiplexing master on the command line only), and
 removes temporary state on cleanup where possible. It does not write `~/.ssh/config`, `known_hosts`, or SSH keys. Its only
 `~/.ssh` mutation is the laptop `authorized_keys` managed block used for temporary reverse
-authentication.
+authentication; the user-mode sshd below does not make even that change.
+
+## User-Mode sshd
+
+When the laptop's sshd ignores `~/.ssh/authorized_keys` (FreeIPA/sssd or LDAP key lookup through
+`AuthorizedKeysCommand`, `AuthorizedKeysFile none`, a root-squashed NFS home) or no SSH server runs,
+set `RH_LOCAL_SSHD=user` (or `--local-sshd user` on `simple-laptop-setup.sh` / `laptop-setup.sh`).
+The wizard offers it when it detects `AuthorizedKeysCommand` or nothing on `:22`, and remembers an
+explicit choice as `LAST_LOCAL_SSHD`; `RH_LOCAL_SSHD=system` switches back.
+
+`laptop-setup.sh` then starts an sshd as the current user for this session: `ListenAddress
+127.0.0.1` on a probed free port (a lost bind race retries on another port; the tunnel's `RemoteForward` is
+written once it has bound), a session-private `authorized_keys` holding the usual forced-gateway line,
+`AuthorizedKeysCommand none`, `AuthenticationMethods publickey`, `UsePAM no`, `DisableForwarding
+yes`, and `PermitTTY no`. Its files live in `~/.remote-harness/.sessions/rev.*/sshd/`; the resource
+record stops it (after checking PID, start time, and config path) together with the tunnel. A failed
+mount prints the refusal reasons from its log. It needs the sshd binary but no root, and it bypasses
+PAM, so directory HBAC policy does not apply to this loopback login.
 
 ## Bootstrap Shape
 
@@ -80,7 +97,14 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    remaining mount needs it, removes temp ssh configs, and removes default empty mountpoint dirs.
 8. If the connection is force-closed and the laptop never runs that cleanup, the remote session
    watcher notices the agent exit (or hung-up terminal) and performs the remote cleanup itself;
-   the next launch's GC repeats it for anything a reboot left behind.
+   the next launch's GC repeats it for anything a reboot left behind. The watcher also checks the
+   project host through the tunnel every `RH_HEARTBEAT_INTERVAL` (30) seconds and ends the agent
+   once every check has failed for `RH_HEARTBEAT_TIMEOUT` (600) seconds.
+9. A session ended by a lost connection leaves `$RH_HOME/.sessions/.resume/<mountpoint>.<agent>`;
+   the next launch of that mountpoint and agent asks once whether to continue the conversation
+   (`--continue` / `resume --last`). `RH_RESUME=1|0` forces the choice. Local cleanup retries an
+   unreachable remote after `RH_RELEASE_RETRY_DELAYS` (10 20 30) seconds, then stops only a tunnel
+   this launch created, with its user-mode sshd and local authorization.
 
 ## Preconditions
 
@@ -91,7 +115,8 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
   loopback-scoped `remote-harness:reverse-auth:<tag>` block to `~/.ssh/authorized_keys`. Managed
   blocks are reference-counted and removed on exit when no active session still uses them.
 - remote-harness is installed on the remote box at `~/.remote-harness`, or `RH_HOME` points to it.
-- The laptop can run an SSH server; the wizard detects and guides enabling it when possible.
+- The laptop can run an SSH server; the wizard detects and guides enabling it when possible. Without
+  root, or when that sshd ignores `~/.ssh/authorized_keys`, use the user-mode sshd.
 - The remote box has `sshfs` and the selected agent CLI (`codex`, `claude`, or `opencode`).
 - For shared remote boxes with many users or long-lived SSHFS mounts, tune server-side sshd capacity
   and keepalive as described in `docs/ssh-sshfs-long-lived-connections.md`.
@@ -106,5 +131,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
   port when the listener does not reach this laptop.
 - Stale mount: exit the agent and rerun remote-harness; stale sshfs mounts are revalidated and
   replaced.
+- Mount fails (`read: Connection reset by peer`, `Permission denied`) on a FreeIPA/sssd laptop whose
+  sshd ignores `~/.ssh/authorized_keys`: rerun with `RH_LOCAL_SSHD=user`.
 - Frequent disconnects under load: check server-side `MaxStartups`, `ClientAlive*`, `nofile`, and
   TCP queue settings; see `docs/ssh-sshfs-long-lived-connections.md`.

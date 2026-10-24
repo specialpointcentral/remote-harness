@@ -35,6 +35,10 @@
 #                         Codex passes 'codex', opencode passes 'opencode')
 #   --yolo                bypass approvals on the launched agent — claude/codex get their
 #                         bypass flag; opencode gets a temporary permission=allow config (restored)
+#   --local-sshd <mode>   SSH server the tunnel reaches on this laptop: 'system' (default; the
+#                         sshd on :22 reading ~/.ssh/authorized_keys) or 'user' (a per-session sshd
+#                         run as you on a free loopback port, for sshds that ignore authorized_keys
+#                         such as FreeIPA/sssd). Defaults to $RH_LOCAL_SSHD when set.
 #   --setup-only          stop after Phase 1 — skip reconnect / dir-pick / mount / launch
 #   --yes                 non-interactive (skip all confirm prompts)
 set -uo pipefail
@@ -50,6 +54,7 @@ need_arg() {
 HOST="" PORT="" PUBKEY="" VIA="" BOX_ALIAS="" BOX_SSH_CONFIG="" ASSUME_YES=0 SETUP_ONLY=0
 BOX_USER="" REMOTE_MP="" LAUNCH="claude" PROJ_DIR_ARG=""
 YOLO=0; EFF_LAUNCH=""; LAUNCH_BASE="claude"
+LOCAL_SSHD_MODE="${RH_LOCAL_SSHD:-system}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --host)          need_arg "$1" "${2-}"; HOST="$2";           shift 2;;
@@ -63,6 +68,7 @@ while [ $# -gt 0 ]; do
     --box-user)      need_arg "$1" "${2-}"; BOX_USER="$2";       shift 2;;
     --remote-mountpoint) need_arg "$1" "${2-}"; REMOTE_MP="$2";  shift 2;;   # exact box dir to mount at (e.g. your invoking cwd)
     --project-dir)   need_arg "$1" "${2-}"; PROJ_DIR_ARG="$2";   shift 2;;   # laptop project dir (skip the interactive prompt)
+    --local-sshd)    need_arg "$1" "${2-}"; LOCAL_SSHD_MODE="$2"; shift 2;;
     --setup-only)    SETUP_ONLY=1;        shift;;
     --yes|-y)        ASSUME_YES=1;        shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
@@ -71,6 +77,11 @@ done
 [ -n "$PORT" ] || { printf 'need --port\n' >&2; exit 2; }
 printf '%s' "$PORT" | grep -qE '^[0-9]+$' || { printf 'port must be numeric: %s\n' "$PORT" >&2; exit 2; }
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { printf 'port out of range: %s\n' "$PORT" >&2; exit 2; }
+case "$LOCAL_SSHD_MODE" in
+  system|auto|"") LOCAL_SSHD_MODE=system;;
+  user) [ "$SETUP_ONLY" = 0 ] || { printf -- '--local-sshd user needs a full session (not --setup-only)\n' >&2; exit 2; };;
+  *) printf 'unsupported --local-sshd %s (expected system|user)\n' "$LOCAL_SSHD_MODE" >&2; exit 2;;
+esac
 
 # ---- shared helpers (colors, say/ok/warn/err/hdr/ask, sq, OS vars, parse_via, ssh-config) -------
 # laptop-setup.sh is fetched to the laptop and run STANDALONE (the laptop usually has no install),
@@ -85,8 +96,10 @@ else printf 'error: missing _common.sh next to %s — re-copy the full command\n
 STEP_TOTAL=$((STEP_N + RH_LAPTOP_STEPS))
 
 # ---- auto-cleanup on exit/disconnect ---------------------------------------
-TUNNEL_PID=""; TUNNEL_START=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0
+TUNNEL_PID=""; TUNNEL_START=""; MOUNTED=0; CLEANED=0; RULE_INJECTED=0; RCU_DETAIL=""; RELEASE_DETAIL=""
 LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""; RULE_SESSION_ID=""
+# The tunnel's laptop end: :22 for the system sshd, or the per-session user-mode sshd's port.
+LOCAL_SSHD_PORT=22; LOCAL_SSHD_DIR=""; LOCAL_SSHD_PID=""; LOCAL_SSHD_START=""; LOCAL_SSHD_CFG=""
 REMOTE_SESSION_DIR=""
 # The box logs into THIS laptop as the box alias's `User`, so the login user must be US. The laptop's
 # own `id -un` is the single source of truth (whatever the box-side setup guessed, e.g. from a
@@ -134,7 +147,9 @@ ssh() {
       *" -N "*|*" -O "*|*" -M "*|*" -t "*|*" -tt "*) ;;
       *) if [ -S "$SETUP_MUX_DIR/m" ]; then
            command ssh -F "$LOCAL_SSH_CONFIG" -o ControlMaster=no -o "ControlPath=$SETUP_MUX_DIR/m" "$@"
-           return
+           # Explicit status: a bare return inside the EXIT-trap cleanup would report the status the
+           # script exited with instead of this ssh's, so a failed launch could never release its tunnel.
+           return $?
          fi ;;
     esac
     command ssh -F "$LOCAL_SSH_CONFIG" "$@"
@@ -162,11 +177,26 @@ tunnel_state_path() {
     "$(printf '%s-%s' "${TARGET:-}" "${PORT:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 }
 # Release a specific transport under the remote resource lock; an uncertain response retains it.
+# Returns 1 when released, 0 when another session uses it, 3 when the server is unreachable (ssh
+# itself failed), 2 for any other unclear answer. RCU_DETAIL explains a result that retains it.
 remote_config_usage() {
-  local _usage
-  _usage=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
-    "rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"; \"\$rh/scripts/session-reaper.sh\" release-config $(sq "$BOX_SSH_CONFIG")" 2>/dev/null) || return 2
-  case "$_usage" in USED=0) return 1;; USED=1) return 0;; *) return 2;; esac
+  local _out _rc _used
+  _out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
+    "rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"; \"\$rh/scripts/session-reaper.sh\" release-config $(sq "$BOX_SSH_CONFIG")" 2>/dev/null)
+  _rc=$?
+  # Trust the reaper's verdict line even when the remote shell added output or a non-zero exit:
+  # it prints USED=0 only after it has already removed the box-side config.
+  _used=$(printf '%s\n' "$_out" | sed -n 's/^USED=\([01]\)$/\1/p' | tail -1)
+  case "$_used" in
+    0) RCU_DETAIL=""; return 1;;
+    1) RCU_DETAIL="another remote session still uses this transport"; return 0;;
+  esac
+  if [ "$_rc" = 255 ] && [ -z "$_out" ]; then
+    RCU_DETAIL="remote host unreachable"
+    return 3
+  fi
+  RCU_DETAIL="remote release check failed (ssh exit $_rc${_out:+: $(printf '%s' "$_out" | tr '\n' ' ' | cut -c1-160)})"
+  return 2
 }
 
 resource_value() { # records are base64 values, never executable shell configuration
@@ -176,42 +206,63 @@ resource_value() { # records are base64 values, never executable shell configura
   else printf '%s' "$_raw" | base64 --decode; fi
 }
 
+RESOURCE_FIELDS="TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID TUNNEL_START AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR LOCAL_SSHD_PID LOCAL_SSHD_START LOCAL_SSHD_CFG"
+
 write_local_resource_record() {
   [ -n "$LOCAL_SESSION_DIR" ] || return 0
   local _name _value
   {
-    for _name in TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID TUNNEL_START AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR; do
+    for _name in $RESOURCE_FIELDS; do
       _value="${!_name}"
       printf '%s=%s\n' "$_name" "$(printf '%s' "$_value" | base64 | tr -d '\n')"
     done
-    printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" "$(printf '%s' "$(ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')" | base64 | tr -d '\n')"
+    printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" "$(proc_start "$$" | base64 | tr -d '\n')"
   } > "$LOCAL_SESSION_DIR/resources.env.tmp" && mv "$LOCAL_SESSION_DIR/resources.env.tmp" "$LOCAL_SESSION_DIR/resources.env"
 }
 
+# Stop a recorded process only while it is still the same one (start time and command line match);
+# one that is gone, or whose pid now has another start time, counts as stopped.
+kill_recorded() {  # pid recorded-start args-needle
+  case "$1" in ''|*[!0-9]*) return 0;; esac
+  [ -n "$2" ] && [ -n "$3" ] && [ "$(proc_start "$1")" = "$2" ] || return 0
+  case "$(ps -ww -p "$1" -o args= 2>/dev/null)" in *"$3"*) kill "$1" 2>/dev/null;; *) return 1;; esac
+}
+
 release_local_resources() { # only release records whose exact remote config is confirmed unused
-  local _dir="$1" _file="$1/resources.env" _usage _start _actual _args _name _state_file
-  local TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR
+  local _dir="$1" _file="$1/resources.env" _usage _name _state_file _delay _step
+  # shellcheck disable=SC2086 # declares each record field as a local name.
+  local $RESOURCE_FIELDS
   [ -f "$_file" ] && [ ! -L "$_dir" ] || return 1
-  for _name in TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR; do
+  for _name in $RESOURCE_FIELDS; do
     printf -v "$_name" '%s' "$(resource_value "$_file" "$_name")"
   done
   [ -n "$TARGET" ] && [ -n "$BOX_SSH_CONFIG" ] || return 1
   remote_config_usage
   _usage=$?
-  if [ "$_usage" != 1 ]; then
-    return 1 # both a shared config and an unreachable server retain the tunnel and authorization
+  # A dropped network often comes back within a minute; retry before deciding for this session.
+  if [ "$_usage" = 3 ] && [ "$_dir" = "$LOCAL_SESSION_DIR" ]; then
+    _step=$STEP_LABEL
+    for _delay in ${RH_RELEASE_RETRY_DELAYS:-10 20 30}; do
+      step_label "$(tr2 "Remote host unreachable; retrying in ${_delay}s" "远端不可达，${_delay} 秒后重试")"
+      sleep "$_delay"
+      remote_config_usage
+      _usage=$?
+      [ "$_usage" = 3 ] || break
+    done
+    [ -z "$STEP_LABEL" ] || STEP_LABEL=$_step
   fi
-  case "$TUNNEL_PID" in
-    ''|*[!0-9]*) ;;
-    *)
-      _start=$(resource_value "$_file" TUNNEL_START)
-      _actual=$(ps -p "$TUNNEL_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-      _args=$(ps -ww -p "$TUNNEL_PID" -o args= 2>/dev/null)
-      if [ -n "$_start" ] && [ "$_actual" = "$_start" ]; then
-        case "$_args" in *"$LOCAL_SSH_CONFIG"*) kill "$TUNNEL_PID" 2>/dev/null || return 1;; *) return 1;; esac
-      fi
-      ;;
+  [ "$_dir" != "$LOCAL_SESSION_DIR" ] || RELEASE_DETAIL="$RCU_DETAIL"
+  # A shared config or an unclear answer retains everything. An unreachable server retains only a
+  # tunnel this launch did not create; its own tunnel is stopped below, after which the server can no
+  # longer use the sshd or authorization either, and the remote watcher cleans up its side.
+  case "$_usage" in
+    1) ;;
+    3) [ -n "$TUNNEL_PID" ] || return 1 ;;
+    *) return 1 ;;
   esac
+  kill_recorded "$TUNNEL_PID" "$TUNNEL_START" "$LOCAL_SSH_CONFIG" || return 1
+  # The user-mode sshd lives exactly as long as the tunnel that reaches it.
+  kill_recorded "$LOCAL_SSHD_PID" "$LOCAL_SSHD_START" "$LOCAL_SSHD_CFG" || return 1
   cleanup_reverse_authorized_key || return 1
   _state_file=$(tunnel_state_path)
   if [ -n "$TUNNEL_PID" ] && [ "$(cat "$_state_file" 2>/dev/null)" = "$TUNNEL_PID" ]; then rm -f "$_state_file"; fi
@@ -227,7 +278,7 @@ sweep_local_resources() {
     _pid=$(sed -n 's/^OWNER_PID=//p' "$_file" | head -1)
     _start=$(resource_value "$_file" OWNER_START)
     case "$_pid" in ''|*[!0-9]*) continue;; esac
-    _actual=$(ps -p "$_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    _actual=$(proc_start "$_pid")
     if [ "$_dir" != "$LOCAL_SESSION_DIR" ] && [ -n "$_start" ] && [ "$_start" = "$_actual" ]; then continue; fi
     release_local_resources "$_dir" || true
   done
@@ -370,11 +421,19 @@ append_managed_authorized_key() {
 
 prepare_reverse_authorized_key() {
   if [ -z "$PUBKEY" ]; then
+    if [ "$LOCAL_SSHD_MODE" = user ]; then
+      warn "user-mode sshd needs the box's session public key (--pubkey)"
+      return 1
+    fi
     warn "No remote-harness public key was provided; the box must already be authorized to SSH back to this laptop."
     return 0
   fi
   parse_pubkey_for_authorized_keys || return 1
-  _ak_file="$HOME/.ssh/authorized_keys"
+  # The user-mode sshd reads only its own authorized_keys, so ~/.ssh stays untouched.
+  _ak_file="$HOME/.ssh/authorized_keys" _ak_label="authorized_keys: temporarily authorized"
+  if [ "$LOCAL_SSHD_MODE" = user ]; then
+    _ak_file="$LOCAL_SSHD_DIR/authorized_keys" _ak_label="user-mode sshd: authorized"
+  fi
 
   authkey_lock || { warn "could not lock authorized_keys; not modifying SSH authorization"; return 1; }
   if authorized_key_match user "$_ak_file"; then
@@ -390,7 +449,10 @@ prepare_reverse_authorized_key() {
     authkey_unlock
     return 1
   }
-  AUTHKEY_MANAGED=1
+
+  # Only the ~/.ssh block is managed (reference-counted and removed on exit); the private file goes
+  # away with its session directory.
+  [ "$LOCAL_SSHD_MODE" = user ] || AUTHKEY_MANAGED=1
 
   if authorized_key_match managed "$_ak_file"; then
     ok "authorized_keys: reusing existing remote-harness temporary authorization"
@@ -399,7 +461,7 @@ prepare_reverse_authorized_key() {
   fi
 
   if append_managed_authorized_key "$_ak_file"; then
-    ok "authorized_keys: temporarily authorized the forced project-host gateway"
+    ok "$_ak_label the forced project-host gateway"
     authkey_unlock
     return 0
   fi
@@ -408,7 +470,7 @@ prepare_reverse_authorized_key() {
   AUTHKEY_TOKEN=""
   AUTHKEY_MANAGED=0
   authkey_unlock
-  warn "could not update ~/.ssh/authorized_keys"
+  warn "could not update $_ak_file"
   return 1
 }
 
@@ -484,7 +546,7 @@ cleanup() {
     step_begin "$(tr2 "Removing the local tunnel and temporary authorization" "移除本机隧道与临时授权")"
     sweep_local_resources
     if [ -d "$LOCAL_SESSION_DIR" ]; then
-      step_end warn "$(tr2 "shared or unverified transport retained with its config and authorization" "传输仍被共享或无法确认，已保留其配置与授权")"
+      step_end warn "$(tr2 "shared or unverified transport retained with its config and authorization" "传输仍被共享或无法确认，已保留其配置与授权")${RELEASE_DETAIL:+ ($RELEASE_DETAIL)}"
     else
       step_end ok
     fi
@@ -537,12 +599,24 @@ step_begin -s "$(tr2 "Local checks (SSH server, git, rg) and temporary authoriza
 if [ -n "$PUBKEY" ]; then
   ok "box key visible: $(printf '%s' "$PUBKEY" | awk '{print $1, substr($2,1,14)"...", $3}')"
 fi
-say  "  Reverse auth: remote-harness may add a tagged temporary entry to ~/.ssh/authorized_keys."
-say  "  A matching unrestricted key is rejected; only the managed forced-gateway entry is reusable."
+if [ "$LOCAL_SSHD_MODE" = user ]; then
+  say  "  Reverse auth: a per-session sshd reads only its own authorized_keys; ~/.ssh is not modified."
+else
+  say  "  Reverse auth: remote-harness may add a tagged temporary entry to ~/.ssh/authorized_keys."
+  say  "  A matching unrestricted key is rejected; only the managed forced-gateway entry is reusable."
+fi
 
 # -- ensure SSH server running --
-ssh_listening() { (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
-if ssh_listening; then
+ssh_listening() { ! local_port_free 22; }
+if [ "$LOCAL_SSHD_MODE" = user ]; then
+  # Started after the session authorization exists; only its binary is needed now.
+  if _usd_bin=$(user_sshd_bin); then
+    ok "SSH server: user-mode sshd ($_usd_bin) on a free loopback port, this session only"
+  else
+    err "user-mode sshd: no sshd binary found (install openssh-server; it does not need to run)"
+    exit 1
+  fi
+elif ssh_listening; then
   ok "SSH server: listening on :22"
 else
   if [ "$PLAT" = macos ]; then
@@ -647,7 +721,7 @@ write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
   || { err "could not create session SSH runtime directory"; exit 1; }
 write_target_forward() {
   local _port="$1" _rf_line
-  _rf_line="    RemoteForward $_port 127.0.0.1:22"
+  _rf_line="    RemoteForward $_port 127.0.0.1:$LOCAL_SSHD_PORT"
   # Create-or-replace a DEDICATED session alias carrying the exact --via identity + RemoteForward.
   # Keepalives so a half-open tunnel (NAT idle / laptop sleep) is detected;
   # ExitOnForwardFailure so a port-collision fails loudly instead of leaving a live-but-no-forward
@@ -662,7 +736,10 @@ write_target_forward() {
     return 1
   fi
 }
-write_target_forward "$PORT" || exit 2
+# The user-mode sshd's forward is written once it has bound its port, after the cleanup trap exists.
+if [ "$LOCAL_SSHD_MODE" != user ]; then
+  write_target_forward "$PORT" || exit 2
+fi
 say "    Session ssh alias: ${_B}ssh $TARGET${_0}"
 chmod 600 "$CFG" 2>/dev/null || true
 
@@ -688,6 +765,29 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
+if [ "$LOCAL_SSHD_MODE" = user ]; then
+  LOCAL_SSHD_DIR="$LOCAL_SESSION_DIR/sshd"
+  user_sshd_start "$LOCAL_SSHD_DIR" "$LAPTOP_USER"
+  _usd_rc=$?
+  if [ -n "$USER_SSHD_PID" ]; then
+    LOCAL_SSHD_PID="$USER_SSHD_PID" LOCAL_SSHD_START="$USER_SSHD_START" LOCAL_SSHD_CFG="$USER_SSHD_CFG"
+    write_local_resource_record
+  fi
+  if [ "$_usd_rc" = 3 ]; then
+    err "user-mode sshd: sshd StrictModes would refuse its keys: $USER_SSHD_UNSAFE_DIR is writable by group/others or not owned by you"
+    say "    $(tr2 "Fix it, then rerun:" "修复后重新运行：") ${_B}chmod go-w $(sq "$USER_SSHD_UNSAFE_DIR")${_0}"
+    exit 1
+  fi
+  if [ "$_usd_rc" != 0 ]; then
+    err "user-mode sshd did not start"
+    user_sshd_log_reasons "$USER_SSHD_LOG" 8 | sed 's/^/    /'
+    exit 1
+  fi
+  LOCAL_SSHD_PORT="$USER_SSHD_PORT"
+  write_target_forward "$PORT" || exit 2
+  chmod 600 "$CFG" 2>/dev/null || true
+  ok "user-mode sshd: listening on 127.0.0.1:$LOCAL_SSHD_PORT (pid $LOCAL_SSHD_PID)"
+fi
 start_setup_mux
 prepare_reverse_authorized_key || exit 1
 write_local_resource_record
@@ -835,7 +935,7 @@ while :; do
   # Bypass the shell wrapper so $! owns the actual SSH process rather than a function subshell.
   command ssh -F "$LOCAL_SSH_CONFIG" -N "$TARGET" >/dev/null 2>&1 &
   TUNNEL_PID=$!
-  TUNNEL_START=$(ps -p "$TUNNEL_PID" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  TUNNEL_START=$(proc_start "$TUNNEL_PID")
   write_local_resource_record
 
   # Poll until the remote port is listening (up to 20s)
@@ -1011,6 +1111,12 @@ while :; do
       ERR=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^ERROR=/{print $2; exit}')
       err "Mount failed (STATUS=${STATUS:-unknown}): ${ERR:-(no error detail)}"
       say "  Check: is the tunnel active? Is '${BOX_ALIAS}' the right alias on the remote?"
+      if [ "$LOCAL_SSHD_MODE" = user ]; then
+        _usd_reasons=$(user_sshd_log_reasons "$USER_SSHD_LOG" 5)
+        [ -z "$_usd_reasons" ] || { say "  user-mode sshd log ($USER_SSHD_LOG):"; printf '%s\n' "$_usd_reasons" | sed 's/^/    /'; }
+      else
+        say "  $(tr2 "If this machine's sshd ignores ~/.ssh/authorized_keys (e.g. FreeIPA/sssd), rerun with RH_LOCAL_SSHD=user." "如果本机 sshd 不读取 ~/.ssh/authorized_keys（例如 FreeIPA/sssd），请加 RH_LOCAL_SSHD=user 重新运行。")"
+      fi
       exit 1
       ;;
   esac
@@ -1068,6 +1174,28 @@ if [ "$rh_status" = INJECTED ]; then
     # Compatibility with older injectors: the directory still has the same mount/session key.
     _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
     REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
+  fi
+  # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
+  # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
+  rh_resume=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_AVAILABLE=//p' | head -1)
+  rh_resume_args=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_ARGS=//p' | head -1)
+  RESUME=0
+  case "${RH_RESUME:-}" in
+    1|yes) RESUME=1;;
+    0|no) ;;
+    *)
+      if [ -n "$rh_resume" ]; then
+        _resume_at=${rh_resume#*,}
+        case "$_resume_at" in ''|*[!0-9]*) _resume_ago="?";; *) _resume_ago=$(( ($(date +%s) - _resume_at) / 60 ));; esac
+        warn "$(tr2 "The last ${LAUNCH_BASE} session of this project ended on a lost connection (${_resume_ago} min ago)." \
+                    "该项目上一次的 ${LAUNCH_BASE} 会话因断线结束（${_resume_ago} 分钟前）。")"
+        ask "$(tr2 "Continue that conversation?" "继续该会话？")" y && RESUME=1
+      fi
+      ;;
+  esac
+  if [ "$RESUME" = 1 ] && [ -n "$rh_resume_args" ]; then
+    EFF_LAUNCH="$LAUNCH_BASE $rh_resume_args${EFF_LAUNCH#"$LAUNCH_BASE"}"
+    ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
   fi
   EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"

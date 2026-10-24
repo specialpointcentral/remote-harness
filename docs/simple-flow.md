@@ -55,7 +55,10 @@ not migrated while running. See [design.md](design.md) for lifecycle details.
 6. The per-session public key is added to local `~/.ssh/authorized_keys` inside a tagged managed
    block. Its line is limited to loopback tunnel sources, binds a forced gateway command, and
    disables PTY, port, X11, and SSH-agent forwarding.
-7. The local SSH connection opens `RemoteForward <port> 127.0.0.1:22` to the remote server.
+   With `RH_LOCAL_SSHD=user` the line goes to a session-private `authorized_keys` read only by a
+   per-session loopback sshd started as the user; `~/.ssh` is not modified.
+7. The local SSH connection opens `RemoteForward <port> 127.0.0.1:22` to the remote server (the
+   user-mode sshd's free loopback port instead of `22` when it is used).
 8. The remote server uses the session key and config to mount the selected local project with
    SSHFS.
 9. For opencode, the remote CLI preloads the session plugin and must create its readiness marker.

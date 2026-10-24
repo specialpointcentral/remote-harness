@@ -44,7 +44,10 @@ SSH 传输从暂存目录打包的八个 helper、bootstrap 副本和 SHA-256 �
    `~/.remote-harness/.sessions/gateways/<session-tag>/project-root.b64`。
 6. 每会话公钥以带标签托管块加入本机 `~/.ssh/authorized_keys`。授权行只允许来自回环隧道的连接，
    绑定 forced gateway command，并禁用 PTY、port、X11 和 SSH-agent forwarding。
-7. 本机 SSH 连接向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`。
+   使用 `RH_LOCAL_SSHD=user` 时，授权行写入会话私有的 `authorized_keys`，只由以用户身份启动的会话级
+   回环 sshd 读取；不修改 `~/.ssh`。
+7. 本机 SSH 连接向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`（使用用户态 sshd 时，`22`
+   换成它的空闲回环端口）。
 8. 远端服务器使用会话 key/config，通过 SSHFS 挂载选定的本机项目。
 9. opencode 会先在远端预加载会话 plugin，并且必须写出 readiness marker；失败时在交互式 Agent 启动前中止。
 10. 选定 Agent 只在远端服务器、SSHFS 挂载目录内启动。

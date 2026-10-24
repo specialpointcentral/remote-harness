@@ -6,10 +6,13 @@
 - `simple-dispatch.sh`：reverse-only dispatcher，拒绝 forward。
 - `simple-laptop-setup.sh`：本地 reverse 向导。记住的远端挂载点只在对应的项目目录下作为默认值；
   其它情况默认 auto（`~/.remote-harness/mounts/<项目目录名>`）。
+  `--local-sshd auto|system|user`（或 `RH_LOCAL_SSHD`）选择隧道连接的本机 SSH 服务；auto 在系统 sshd
+  使用 `AuthorizedKeysCommand` 或 `:22` 无服务时询问是否改用用户态 sshd。
 - `laptop-setup.sh`：建立反向隧道、forced 授权、挂载、远端 Agent 和清理。本机检查完成后建立一条只通过
   命令行参数启用的复用主连接（短路径 `/tmp/rh.*` socket，`ControlPersist=300`），后续 setup 调用和
   清理都复用它，省去每次 SSH 握手；反向隧道和交互式 Agent 会话仍使用独立连接，启动前还会把本机终端
-  尺寸设置到远端 pty 上。
+  尺寸设置到远端 pty 上。`--local-sshd user` 时以当前用户身份启动会话级回环 sshd（`_common.sh` 中的
+  `user_sshd_*` 辅助函数），隧道转发到它。
 - `simple-local-setup.sh`、`local-setup.sh`：拒绝本机 Agent 的兼容 stub。
 - `setup-tunnel.sh`：创建远端会话 SSH config 和每会话 key。
 - `check-tunnel.sh`：通过 `remote-harness-health` 检查 forced gateway。
@@ -41,14 +44,15 @@
   （`RH_TOOL_CONCURRENCY`，默认 6），传输失败时不经复用 master 重试一次，否则以非零退出。
 - `session-reaper.sh`：远端每会话 watcher 加启动时 GC。Agent 进程消失（或其终端已挂断）时，
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录
-  以及会话 SSH config 和 private key。
+  以及会话 SSH config 和 private key。经隧道的心跳检查连续失败满 `RH_HEARTBEAT_TIMEOUT` 秒后结束 Agent；
+  断线会留下 `.resume` 标记，由 `inject-rule.sh on` 以 `RH_RESUME_AVAILABLE=<原因>,<时间戳>` 报告一次。
   挂载登记、launcher 释放和 GC 共用锁，分别追踪命令配置和实际 SSHFS 配置。卸载失败保留重连
   配置及实现。`release-config` 仅在具体通道可回收后返回 `USED=0`；sshfs 进程（及其 sftp ssh）只在其挂载点
   仍处于挂载状态时才算正在使用该配置。失败时保留本地隧道、配置和
   授权记录，供后续重试。运行入口使用每会话 `impl` 副本，本机 gateway 按密钥保存副本。
 
 运行状态位于 `~/.remote-harness/.sessions`。`~/.ssh` 下唯一写入是带标签、仅回环、forced-command
-的 `authorized_keys` 块。清理会删除授权、gateway 登记、远端 private key、挂载、hook 和临时 config。若本地一侧先断开，
+的 `authorized_keys` 块（用户态 sshd 模式不写，授权放在其会话目录中）。清理会删除授权、gateway 登记、远端 private key、挂载、hook 和临时 config。若本地一侧先断开，
 远端 watcher 或下次启动的 GC 会完成其中远端部分；残留的本机 `authorized_keys` 块随之失效，
 因为对应 private key 已不存在。
 

@@ -4,11 +4,14 @@
 - `simple-dispatch.sh`: reverse-only dispatcher; rejects forward.
 - `simple-laptop-setup.sh`: local reverse wizard. A remembered remote mountpoint is offered only for the
   project it was chosen for; otherwise the default is auto (`~/.remote-harness/mounts/<project dir name>`).
+  `--local-sshd auto|system|user` (or `RH_LOCAL_SSHD`) picks the SSH server the tunnel reaches; auto
+  offers the user-mode sshd when the system sshd uses `AuthorizedKeysCommand` or nothing listens on `:22`.
 - `laptop-setup.sh`: creates the reverse tunnel, forced authorization, mount, remote agent, and cleanup.
   After the local checks it opens a command-line-only multiplexing master (short `/tmp/rh.*` socket,
   `ControlPersist=300`) so later setup calls and cleanup skip the per-connection SSH handshake; the
   reverse tunnel and the interactive agent session keep their own connections, and the agent's remote
-  pty is given the local terminal size before launch.
+  pty is given the local terminal size before launch. With `--local-sshd user` it starts a per-session
+  loopback sshd as the current user (helpers `user_sshd_*` in `_common.sh`) and forwards the tunnel to it.
 - `simple-local-setup.sh`, `local-setup.sh`: compatibility stubs that reject local-agent execution.
 - `setup-tunnel.sh`: creates remote session SSH config and a per-session key.
 - `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`.
@@ -46,7 +49,9 @@
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is
   gone (or its terminal was hung up), it stops the multiplexing master and leftover routed processes,
   unmounts the session mount unless another live session uses it, and removes the session dir and the
-  session SSH config with its private key.
+  session SSH config with its private key. A heartbeat through the tunnel ends the agent after
+  `RH_HEARTBEAT_TIMEOUT` seconds of failed checks; disconnects leave a `.resume` marker that
+  `inject-rule.sh on` reports once as `RH_RESUME_AVAILABLE=<reason>,<epoch>`.
   Mount registration, launcher release and GC share a lock and track command versus actual SSHFS
   configs separately. Failed unmounts retain reconnect config and implementation. `release-config`
   reports `USED=0` only when the specific transport can be reclaimed; an sshfs daemon (or its sftp ssh)
@@ -55,7 +60,8 @@
   gateway implementations use per-key copies.
 
 Runtime state belongs under `~/.remote-harness/.sessions`. The only `~/.ssh` write is the tagged,
-loopback-scoped, forced-command `authorized_keys` block. Session cleanup removes authorization,
+loopback-scoped, forced-command `authorized_keys` block (none with the user-mode sshd, whose
+authorization lives in its session directory). Session cleanup removes authorization,
 gateway registration, remote private key, mount, hooks, and temporary configs. If the local side
 dies first, the remote watcher or the next launch's GC performs the remote part of that cleanup;
 the stale local `authorized_keys` block is then inert because its private key no longer exists.

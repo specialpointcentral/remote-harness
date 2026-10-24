@@ -10,7 +10,9 @@
    `~/.remote-harness/.sessions/gateways/<session-tag>/bin`.
 6. The local `authorized_keys` entry binds the session key to the forced gateway. An unrestricted
    matching authorization is rejected.
-7. The local machine opens `RemoteForward <port> 127.0.0.1:22` to the remote server.
+   With `RH_LOCAL_SSHD=user` that entry lives in a per-session sshd's private `authorized_keys`.
+7. The local machine opens `RemoteForward <port> 127.0.0.1:22` to the remote server (or to the
+   user-mode sshd's loopback port).
 8. The local bootstrap registers the physical project root for this gateway session.
 9. The remote server verifies `remote-harness-health`, then SSHFS-mounts the local project.
 10. `inject-rule.sh` installs Claude/Codex hooks or the opencode session plugin plus `rh-run`.

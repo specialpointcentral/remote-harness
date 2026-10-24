@@ -42,6 +42,11 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Local authorization includes `command="...project-host-gateway..."`, loopback source limits,
   no PTY, no port forwarding, no X11, and no agent forwarding.
 - Refuse a session key already present in an unrestricted user authorization line.
+- `RH_LOCAL_SSHD=user` (`--local-sshd user`) replaces the system sshd with a per-session sshd run as
+  the user: loopback only, a probed free port with bind retry, the same forced-gateway line in a
+  session-private `authorized_keys`, `AuthorizedKeysCommand none`, public keys only, no PAM,
+  forwarding, or TTY. It is for FreeIPA/sssd-style hosts whose sshd ignores `~/.ssh/authorized_keys`,
+  and it stops with the tunnel's resource record.
 - The gateway accepts only standard SFTP, `remote-harness-health`,
   `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`, and
   `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`; the tool verb execs the binary
@@ -78,11 +83,14 @@ it provides files over SSHFS and executes project commands through a forced gate
 
 1. Shell-quote every value interpolated into a remote command; never `eval` user SSH input.
 2. Session SSH config and mutable host-key state stay under `~/.remote-harness/.sessions`.
-3. Only the tagged forced-gateway `authorized_keys` block may change under `~/.ssh`.
+3. Only the tagged forced-gateway `authorized_keys` block may change under `~/.ssh`; user-mode sshd
+   changes nothing there.
 4. Cleanup removes mounts, per-session remote keys, gateway registration, authorization, hooks,
    and temporary SSH state. When local cleanup cannot run, the remote session watcher and the next
    launch's GC reap dead sessions; they only touch `$RH_HOME/.sessions` children and never unmount a
-   mount another live session uses.
+   mount another live session uses. The watcher ends an agent only after the tunnel heartbeat has
+   failed for the whole `RH_HEARTBEAT_TIMEOUT`, and local cleanup stops a tunnel without a remote
+   answer only when this launch created it and the remote stayed unreachable through the retries.
 5. Programmatically consumed scripts retain `KEY=VALUE` stdout.
 6. Keep bilingual Markdown pairs synchronized.
 

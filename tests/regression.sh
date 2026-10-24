@@ -585,6 +585,55 @@ RH_HOME="$rh_home" HOME="$home_dir" \
 assert_grep "$tmp/inject-off.out" "RH_STATUS=RESTORED" "inject off"
 [ ! -d "$session_dir" ] || fail "inject session dir was not removed"
 
+# Heartbeat: an unreachable project host ends the agent after the timeout and leaves a resume marker
+# that the next launch of the same mountpoint and agent reports once.
+hb_mount="$tmp/mount-heartbeat"
+hb_bin="$tmp/heartbeat-bin"
+mkdir -p "$hb_mount" "$hb_bin"
+printf '#!/bin/sh\n[ -z "${HB_OK:-}" ] || { printf "RH_OK host user"; exit 0; }\nexit 255\n' > "$hb_bin/ssh"
+chmod +x "$hb_bin/ssh"
+hb_inject() {  # on|off session-id
+  if [ "$1" = on ]; then
+    RH_HOME="$rh_home" HOME="$home_dir" \
+      "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$hb_mount" 0 "$basic_ssh_cfg" "$2"
+  else
+    RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" off claude "$hb_mount" "$2" >/dev/null 2>&1 || true
+  fi
+}
+wait_gone() {  # pid [tenths of a second]
+  for _ in $(seq 1 "${2:-200}"); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
+  return 1
+}
+hb_inject on hb.1 > "$tmp/inject-hb1.out"
+assert_grep "$tmp/inject-hb1.out" "RH_RESUME_AVAILABLE=" "inject reports resume availability"
+assert_grep "$tmp/inject-hb1.out" "RH_RESUME_ARGS=--continue" "inject reports how claude continues"
+refute_grep "$tmp/inject-hb1.out" "RH_RESUME_AVAILABLE=heartbeat" "a fresh mountpoint offers no resume"
+hb_sd=$(sed -n 's/^RH_SESSION_DIR=//p' "$tmp/inject-hb1.out")
+hb_watch() {  # runs the watcher on a sleeping stand-in agent
+  hb_owner=$(sh -c 'sleep 120 >/dev/null 2>&1 & echo $!')  # not a job of this shell: no kill notice
+  printf 'OWNER_PID=%s\nOWNER_START=%s\nOWNER_TTY=\n' "$hb_owner" "$(b64 "$(proc_start "$hb_owner")")" > "$hb_sd/owner.env"
+  RH_HOME="$rh_home" PATH="$hb_bin:$PATH" RH_HEARTBEAT_INTERVAL=1 RH_HEARTBEAT_TIMEOUT=2 \
+    RH_REAP_POLL=1 RH_REAP_GRACE=0 "$hb_sd/impl/session-reaper.sh" watch "$hb_sd" </dev/null >/dev/null 2>&1 &
+  hb_watcher=$!
+}
+HB_OK=1 hb_watch  # the watcher inherits HB_OK
+sleep 3  # longer than the 2s timeout
+kill -0 "$hb_owner" 2>/dev/null || fail "a reachable project host ended the agent"
+kill "$hb_watcher" "$hb_owner" 2>/dev/null || true
+wait "$hb_watcher" 2>/dev/null || true
+hb_watch
+wait_gone "$hb_owner" || { kill "$hb_owner" "$hb_watcher"; fail "an unreachable project host did not end the agent"; }
+wait_gone "$hb_watcher" || kill "$hb_watcher" 2>/dev/null
+wait "$hb_watcher" 2>/dev/null || true
+[ -n "$(find "$rh_home/.sessions/.resume" -name '*.claude' -print -quit 2>/dev/null)" ] || fail "heartbeat loss left no resume marker"
+hb_inject off hb.1
+hb_inject on hb.2 > "$tmp/inject-hb2.out"
+assert_grep_e "$tmp/inject-hb2.out" "^RH_RESUME_AVAILABLE=heartbeat,[0-9]+$" "next launch of the mountpoint offers resume"
+hb_inject off hb.2
+hb_inject on hb.3 > "$tmp/inject-hb3.out"
+refute_grep "$tmp/inject-hb3.out" "RH_RESUME_AVAILABLE=heartbeat" "a resume marker is offered only once"
+hb_inject off hb.3
+
 ssh_cfg="$tmp/session_ssh_config"
 printf 'Host rlocal\n    HostName 127.0.0.1\n' > "$ssh_cfg"
 session_key_wrapped="$(printf '%s' "$tmp/mount-wrapped" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -1035,6 +1084,19 @@ case "$(simple_rerun "$simple_project")" in *rh-simple-remote*) fail "a cache wi
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_project_dir "$cached_project" 1)"' "simple cached project prompts for confirmation"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ "$YOLO_REQUESTED" = 1 ]; then' "explicit yolo has a no-reprompt branch"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'YOLO=1' "explicit yolo locks yolo on"
+# An explicit local sshd choice is handed off last and remembered for later runs.
+simple_sshd_run() {  # extra args...; prints the value handed off after --local-sshd
+  : > "$tmp/simple-laptop.args"
+  HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh" RH_SIMPLE_CACHE="$tmp/simple-sshd-cache.env" \
+    SIMPLE_LAPTOP_ARGS="$tmp/simple-laptop.args" bash "$simple_dir/simple-laptop-setup.sh" \
+    --via "ssh -p 2222 bytepilot@42.121.2.119" --namespace tester --project-dir "$simple_project" --launch codex --yes "$@" \
+    </dev/null >/dev/null 2>&1 || true
+  awk -F= 'prev {print substr($0, index($0, "=") + 1); exit} $2=="--local-sshd" {prev=1}' "$tmp/simple-laptop.args"
+}
+assert_eq "explicit user-mode sshd handed off" "$(simple_sshd_run --local-sshd user)" "user"
+assert_grep "$tmp/simple-sshd-cache.env" "LAST_LOCAL_SSHD=user" "explicit local sshd choice remembered"
+assert_eq "remembered user-mode sshd reused" "$(simple_sshd_run)" "user"
+assert_eq "RH_LOCAL_SSHD overrides the remembered choice" "$(RH_LOCAL_SSHD=system simple_sshd_run)" "system"
 
 if bash "$ROOT/scripts/simple-local-setup.sh" --launch codex \
     >"$tmp/simple-local.out" 2>"$tmp/simple-local.err"; then
@@ -1216,6 +1278,8 @@ for arg in "$@"; do
   case "$arg" in
     *'session-reaper.sh'*'config-used'*|*'session-reaper.sh'*'release-config'*)
       [ "${RESOURCE_USED:-0}" != error ] || exit 255
+      # A remote shell that adds output and fails after the reaper already gave its verdict.
+      [ "${RESOURCE_USED:-0}" != noisy ] || { printf 'login banner\nUSED=0\n'; exit 1; }
       printf 'USED=%s\n' "${RESOURCE_USED:-0}"; exit 0;;
     *'session-reaper.sh'*'release'*) printf 'STATUS=released\n'; exit 0;;
     -tt)
@@ -1235,11 +1299,23 @@ result = subprocess.run(['sh', '-c', command], env=env, text=True, capture_outpu
 open(sys.argv[1] + '.health', 'w').write(result.stdout)
 PY
       fi
+      # User-mode sshd: reach the live session sshd with a real client, as the box's sshfs would.
+      if [ -n "${USER_SSHD_PROBE:-}" ]; then
+        ucfg=$(find "$HOME/.remote-harness/.sessions" -path '*/sshd/sshd_config' | head -1)
+        cp "$ucfg" "$USER_SSHD_PROBE.cfg"
+        cat "$HOME"/.remote-harness/.sessions/rev.*/ssh_config > "$USER_SSHD_PROBE.ssh_config"
+        cat "$(dirname "$ucfg")/sshd.pid" > "$USER_SSHD_PROBE.pid"
+        "$REAL_SSH" -F /dev/null -p "$(awk '$1=="Port"{print $2}' "$ucfg")" -i "$USER_SSHD_KEY" \
+          -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          127.0.0.1 remote-harness-health > "$USER_SSHD_PROBE.health" 2> "$USER_SSHD_PROBE.err" || true
+      fi
       ;;
     -N) printf 'unexpected ssh -N while reusable tunnel is up\n' >&2; exit 99;;
     *'check-tunnel.sh'*) printf 'SSH=up\n'; exit 0;;
     *'grep -qx'*) exit 0;;
-    *'mount-project.sh'*) printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
+    *'mount-project.sh'*)
+      [ -z "${MOUNT_FAIL:-}" ] || { printf 'STATUS=failed\nERROR=read: Connection reset by peer\n'; exit 0; }
+      printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
     *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\n'; exit 0;;
   esac
 done
@@ -1304,7 +1380,7 @@ shared_home="$tmp/shared-project-host"
 mkdir -p "$shared_home"
 for resource_used in 1 error 0; do
   HOME="$shared_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-    SSH_LOG="$ssh_log" RESOURCE_USED="$resource_used" \
+    SSH_LOG="$tmp/shared-$resource_used.ssh.log" RESOURCE_USED="$resource_used" RH_RELEASE_RETRY_DELAYS="0 0 0" \
     bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32023 --via 'ssh user@example.com' \
       --pubkey 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test' \
       --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
@@ -1323,6 +1399,118 @@ done
   || fail 'unused deferred transport records were not reclaimed'
 if grep -q 'remote-harness:reverse-auth:' "$shared_home/.ssh/authorized_keys"; then
   fail 'unused deferred authorization was not reclaimed'
+fi
+assert_grep "$tmp/shared-error.out" "remote host unreachable" "retained transport explains the unreachable server"
+assert_grep "$tmp/shared-error.out" "Remote host unreachable; retrying in 0s" "unreachable server is retried"
+assert_eq "unreachable server retried three times" "$(grep -c 'Remote host unreachable; retrying' "$tmp/shared-error.out")" "3"
+assert_grep "$tmp/shared-1.out" "another remote session still uses this transport" "retained transport explains sharing"
+noisy_home="$tmp/noisy-release-home"
+mkdir -p "$noisy_home"
+HOME="$noisy_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
+  SSH_LOG="$ssh_log" RESOURCE_USED=noisy \
+  bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32023 --via 'ssh user@example.com' \
+    --pubkey 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test' \
+    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+    --remote-mountpoint /tmp/rh-remote --project-dir "$valid_project" --launch codex --yes \
+    > "$tmp/noisy-release.out"
+[ -z "$(find "$noisy_home/.remote-harness/.sessions" -name resources.env -print -quit)" ] \
+  || fail 'a USED=0 verdict wrapped in shell output did not release the transport'
+# A launch that fails (here: the mount) runs cleanup from the EXIT trap and must still release.
+failed_home="$tmp/failed-mount-home"
+mkdir -p "$failed_home"
+if HOME="$failed_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
+  SSH_LOG="$ssh_log" MOUNT_FAIL=1 \
+  bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32023 --via 'ssh user@example.com' \
+    --pubkey 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test' \
+    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+    --remote-mountpoint /tmp/rh-remote --project-dir "$valid_project" --launch codex --yes \
+    > "$tmp/failed-mount.out" 2>&1; then
+  fail 'laptop-setup succeeded although the mount failed'
+fi
+assert_grep "$tmp/failed-mount.out" "Mount failed (STATUS=failed)" "failed mount reported"
+[ -z "$(find "$failed_home/.remote-harness/.sessions" -name resources.env -print -quit)" ] \
+  || { cat "$tmp/failed-mount.out" >&2; fail 'a failed launch retained its unused transport'; }
+if grep -q 'remote-harness:reverse-auth:' "$failed_home/.ssh/authorized_keys" 2>/dev/null; then
+  fail 'a failed launch retained its temporary authorization'
+fi
+
+# User-mode sshd: the tunnel reaches a per-session sshd that reads only its own authorized_keys.
+if bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32029 --local-sshd user --setup-only \
+    >/dev/null 2>"$tmp/user-sshd-setup-only.err"; then
+  fail "user-mode sshd accepted --setup-only"
+fi
+assert_grep "$tmp/user-sshd-setup-only.err" "needs a full session" "user-mode sshd rejects setup-only"
+if bash "$ROOT/scripts/laptop-setup.sh" --host example.com --port 32029 --local-sshd bogus \
+    >/dev/null 2>"$tmp/user-sshd-bogus.err"; then
+  fail "laptop-setup accepted an unknown --local-sshd"
+fi
+assert_grep "$tmp/user-sshd-bogus.err" "unsupported --local-sshd bogus" "unknown local sshd mode rejected"
+printf 'AuthorizedKeysCommand /usr/bin/sss_ssh_authorizedkeys\n' > "$tmp/sshd-ipa.conf"
+printf 'AuthorizedKeysCommand none\n' > "$tmp/sshd-plain.conf"
+if local_port_free 22; then
+  assert_eq "user-mode hint without an sshd" "$(local_sshd_user_mode_hint)" "no-sshd"
+else
+  assert_eq "user-mode hint for key lookup outside authorized_keys" \
+    "$(RH_SSHD_CONFIG="$tmp/sshd-ipa.conf" RH_SSHD_CONFIG_DIR="$tmp/none" local_sshd_user_mode_hint)" "external-keys"
+  if RH_SSHD_CONFIG="$tmp/sshd-plain.conf" RH_SSHD_CONFIG_DIR="$tmp/none" local_sshd_user_mode_hint >/dev/null; then
+    fail "AuthorizedKeysCommand none suggested user-mode sshd"
+  fi
+fi
+# sshd StrictModes rejects key files below the world-writable /tmp, so this home lives in the real one.
+if user_sshd_bin >/dev/null && [ -n "${HOME:-}" ] && user_home=$(mktemp -d "$HOME/.rh-regression-sshd.XXXXXX" 2>/dev/null); then
+  trap 'rm -rf "$tmp" "$user_home"' EXIT
+  user_project="$user_home/project"
+  mkdir -p "$user_project"
+  ssh-keygen -q -t ed25519 -N '' -f "$user_home/box_key" </dev/null
+  real_ssh=$(command -v ssh)  # resolved before the stub directory joins PATH
+  # A umask of 002 leaves remote-harness directories group-writable; setup must tighten them.
+  mkdir -p "$user_home/.remote-harness/.sessions" && chmod 775 "$user_home/.remote-harness" "$user_home/.remote-harness/.sessions"
+  HOME="$user_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
+    REAL_SSH="$real_ssh" USER_SSHD_KEY="$user_home/box_key" USER_SSHD_PROBE="$user_home/probe" \
+    bash "$ROOT/scripts/laptop-setup.sh" --local-sshd user \
+      --host example.com --port 32029 --via "ssh user@example.com" \
+      --pubkey "$(cat "$user_home/box_key.pub")" \
+      --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+      --remote-mountpoint /tmp/rh-remote --project-dir "$user_project" --launch codex --yes \
+      > "$tmp/user-sshd.out" 2>&1 || { cat "$tmp/user-sshd.out" >&2; fail "user-mode sshd session failed"; }
+  assert_grep "$tmp/user-sshd.out" "user-mode sshd: authorized the forced project-host gateway" "user-mode sshd authorizes privately"
+  assert_grep_e "$tmp/user-sshd.out" "user-mode sshd: listening on 127\.0\.0\.1:[0-9]+" "user-mode sshd started"
+  user_port=$(awk '$1=="Port"{print $2}' "$user_home/probe.cfg")
+  assert_grep "$user_home/probe.ssh_config" "RemoteForward 32029 127.0.0.1:$user_port" "tunnel forwards to the user-mode sshd port"
+  assert_grep "$user_home/probe.cfg" "ListenAddress 127.0.0.1" "user-mode sshd listens on loopback only"
+  assert_grep "$user_home/probe.cfg" "AuthorizedKeysCommand none" "user-mode sshd skips external key lookup"
+  assert_grep "$user_home/probe.cfg" "AuthenticationMethods publickey" "user-mode sshd allows public keys only"
+  assert_grep "$user_home/probe.cfg" "DisableForwarding yes" "user-mode sshd disables forwarding"
+  assert_grep "$user_home/probe.cfg" "PermitTTY no" "user-mode sshd disables TTYs"
+  case "$(cat "$user_home/probe.health")" in RH_OK*) ;; *) cat "$user_home/probe.err" >&2; fail "box key did not reach the gateway through the user-mode sshd";; esac
+  [ ! -e "$user_home/.ssh/authorized_keys" ] || fail "user-mode sshd wrote ~/.ssh/authorized_keys"
+  case "$(ls -ld "$user_home/.remote-harness")" in d????w*|d???????w*) fail "group-writable ~/.remote-harness was not tightened";; esac
+  user_pid=$(cat "$user_home/probe.pid")
+  if kill -0 "$user_pid" 2>/dev/null; then kill "$user_pid"; fail "cleanup left the user-mode sshd running"; fi
+  [ -z "$(find "$user_home/.remote-harness/.sessions" -name resources.env -print -quit)" ] \
+    || fail "user-mode sshd session left its resource record"
+  # A port taken between the pick and the bind: sshd fails to bind and the start retries another.
+  python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); print(s.getsockname()[1], flush=True); time.sleep(60)' \
+    > "$user_home/busy" &
+  busy_pid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$user_home/busy" ] && break; sleep 0.2; done
+  eval "$(declare -f user_sshd_pick_port | sed '1s/user_sshd_pick_port/real_user_sshd_pick_port/')"
+  user_sshd_pick_port() {  # the first pick loses the race
+    if [ -e "$user_home/raced" ]; then real_user_sshd_pick_port; else : > "$user_home/raced"; cat "$user_home/busy"; fi
+  }
+  user_sshd_start "$user_home/retry" "$(id -un)" || fail "user-mode sshd did not retry after a lost bind race"
+  eval "$(declare -f real_user_sshd_pick_port | sed '1s/real_user_sshd_pick_port/user_sshd_pick_port/')"
+  kill "$busy_pid" 2>/dev/null || true
+  [ -e "$user_home/raced" ] && [ "$USER_SSHD_PORT" != "$(cat "$user_home/busy")" ] || fail "user-mode sshd kept a taken port"
+  kill "$USER_SSHD_PID" 2>/dev/null || true
+  # Below the world-writable /tmp StrictModes would refuse every key: report it instead of starting.
+  user_sshd_rc=0; user_sshd_start "$tmp/user-sshd-in-tmp" "$(id -un)" || user_sshd_rc=$?
+  assert_eq "user-mode sshd refuses a StrictModes-unsafe directory" "$user_sshd_rc" "3"
+  [ -n "$USER_SSHD_UNSAFE_DIR" ] || fail "user-mode sshd did not name the unsafe directory"
+  rm -rf "$user_home"
+  trap 'rm -rf "$tmp"' EXIT
+else
+  printf 'skip: user-mode sshd end-to-end test (no sshd binary or no writable home)\n'
 fi
 
 preauth_home="$tmp/preauth-home"

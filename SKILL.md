@@ -38,7 +38,28 @@ bash "${RH_HOME:-$HOME/.remote-harness}/scripts/suggest-via.sh"
 ```
 
 Use `VIA=` only when the helper returns `STATUS=ok`. It is an editable prompt default, never a
-silent connection choice. Never expose the client address/port fields from `SSH_CONNECTION`.
+silent connection choice. Never expose the client address/port fields from `SSH_CONNECTION`. When the
+user has named the SSH alias their local machine uses for this server, use that as `<default_via>`
+instead; never ask for it.
+
+## Guided Choices
+
+Before returning the command, settle these choices. Treat anything the request already states (the
+agent CLI, "yolo"/no approvals, FreeIPA or user-mode sshd) as final and do not ask about it again.
+Ask about the rest in a single round, using the host's multiple-choice question tool when it has one
+(for example Claude Code's AskUserQuestion); otherwise list numbered options and wait for the reply.
+
+1. Remote agent CLI: Claude Code (`--launch claude`), Codex (`--launch codex`), or opencode
+   (`--launch opencode`). Recommend the agent handling this request.
+2. Approval mode: normal (recommended) or YOLO (`--yolo`, only on an explicit choice).
+3. Local SSH server: system sshd on `:22` (recommended); user-mode sshd (`RH_LOCAL_SSHD=user`) for
+   FreeIPA/sssd or other hosts whose sshd ignores `~/.ssh/authorized_keys`, or when there is no SSH
+   server and no root; or not sure (system; the local wizard detects FreeIPA-style hosts and offers
+   user mode).
+
+Never ask in chat for SSH targets, local paths, mountpoints, or local host names; the local wizard
+collects those. Then return the final command with the choices filled in, followed by one short line
+per choice saying how to change it (swap `--launch`, add `--yolo`, or add `RH_LOCAL_SSHD=user`).
 
 ## Command To Return
 
@@ -76,6 +97,9 @@ bash -n "$s/simple-bootstrap.sh" || exit 1
 RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
+
+For the user-mode sshd, prefix the local-install command with `RH_LOCAL_SSHD=user`, or start the
+fetch form's last line with it: `RH_LOCAL_SSHD=user RH_VIA="$h" RH_LANG=<lang> bash ...`.
 
 Tell the user to run the command in a fresh local terminal. All concrete SSH targets, project paths,
 mountpoints, and approvals are collected there rather than in agent chat.

@@ -9,7 +9,8 @@
 5. 本地 bootstrap 将 `project-host-gateway.sh` 和 `run-on-project-host.sh` 安装到
    `~/.remote-harness/.sessions/gateways/<session-tag>/bin`。
 6. 本机 `authorized_keys` 把会话 key 绑定到 forced gateway；若存在同 key 的无限制授权则拒绝。
-7. 本机向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`。
+   使用 `RH_LOCAL_SSHD=user` 时，该授权位于会话级 sshd 的私有 `authorized_keys` 中。
+7. 本机向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`（或用户态 sshd 的回环端口）。
 8. 本地 bootstrap 为 gateway 会话登记物理项目根。
 9. 远端服务器调用 `remote-harness-health` 验证 gateway，然后 SSHFS 挂载本机项目。
 10. `inject-rule.sh` 安装 Claude/Codex hook 或 opencode 会话 plugin，以及远端 `rh-run`。

@@ -35,7 +35,24 @@ bash "${RH_HOME:-$HOME/.remote-harness}/scripts/suggest-via.sh"
 ```
 
 只有 `STATUS=ok` 时才使用 `VIA=`，且它只能作为可编辑提示默认值。绝不能暴露
-`SSH_CONNECTION` 的客户端地址和端口字段。
+`SSH_CONNECTION` 的客户端地址和端口字段。如果用户已经说出其本机连接这台服务器所用的 SSH 别名，
+改用该别名作为 `<default_via>`；但不要主动询问。
+
+## 引导式选择
+
+返回命令前先确定以下选择。请求中已经明确的内容（Agent CLI、"yolo"/免审批、FreeIPA 或用户态 sshd）
+视为最终决定，不再重复询问。其余项一次性询问：宿主有选择题工具时使用它（例如 Claude Code 的
+AskUserQuestion）；否则列出编号选项并等待回复。
+
+1. 远端 Agent CLI：Claude Code（`--launch claude`）、Codex（`--launch codex`）或 opencode
+   （`--launch opencode`）。推荐当前处理请求的 Agent。
+2. 审批模式：正常（推荐）或 YOLO（`--yolo`，仅在用户明确选择时）。
+3. 本机 SSH 服务：系统 sshd（`:22`，推荐）；用户态 sshd（`RH_LOCAL_SSHD=user`），适用于 FreeIPA/sssd
+   等 sshd 不读取 `~/.ssh/authorized_keys` 的主机，或没有 SSH 服务也没有 root 的情况；或不确定（按系统
+   sshd 处理，本地向导会检测 FreeIPA 类主机并询问是否改用用户态）。
+
+不要在聊天中询问 SSH target、本机路径、挂载点或本机主机名；这些由本地向导收集。随后返回已填好选择的
+最终命令，并为每项选择附一行简短的修改说明（换 `--launch`、加 `--yolo` 或加 `RH_LOCAL_SSHD=user`）。
 
 ## 返回给用户的命令
 
@@ -73,6 +90,9 @@ bash -n "$s/simple-bootstrap.sh" || exit 1
 RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch <launch>
 )
 ```
+
+选择用户态 sshd 时，在本机安装形式的命令前加 `RH_LOCAL_SSHD=user`；fetch 形式则让最后一行以它开头：
+`RH_LOCAL_SSHD=user RH_VIA="$h" RH_LANG=<lang> bash ...`。
 
 告诉用户在新的本地终端运行命令。具体 SSH target、项目路径、挂载点和审批选择都在终端收集，
 不进入 Agent 聊天。

@@ -8,10 +8,14 @@
 #   session-reaper.sh release <session-dir>   normal launcher cleanup, using the same resource lock
 #   session-reaper.sh release-config <ssh-config>   USED=0 only after all references are gone
 #   session-reaper.sh gc                    reap every dead session under $RH_HOME/.sessions
+#   session-reaper.sh resume-take <session-dir>   RESUME=<reason>,<epoch> once, after a disconnect
 #
-# A session is alive while its recorded agent process (pid + start time) exists. When it dies, or
-# when its terminal was hung up but the agent lingers, the watcher waits a short grace period for the
-# normal local cleanup, then removes whatever is left: the multiplexing master, leftover routed
+# A session is alive while its recorded agent process (pid + start time) exists. When it dies, when
+# its terminal was hung up but the agent lingers, or when the project host has been unreachable
+# through the reverse tunnel for RH_HEARTBEAT_TIMEOUT seconds (checked every RH_HEARTBEAT_INTERVAL;
+# 0 disables), the watcher ends the agent, records a resume marker for the next launch of the same
+# mountpoint and agent, waits a short grace period for the normal local cleanup, then removes
+# whatever is left: the multiplexing master, leftover routed
 # tool/command processes, the SSHFS mount (unless another live session uses it), the session dir, and
 # the session SSH config with its private key (which also makes any stale local authorization inert).
 # `gc` repeats this for every session at the next launch, covering watchers lost to a reboot.
@@ -27,6 +31,8 @@ POLL="${RH_REAP_POLL:-5}"
 GRACE="${RH_REAP_GRACE:-20}"
 UNLAUNCHED_MINUTES="${RH_REAP_UNLAUNCHED_MINUTES:-30}"
 ORPHAN_CONFIG_MINUTES="${RH_REAP_ORPHAN_CONFIG_MINUTES:-60}"
+HEARTBEAT_INTERVAL="${RH_HEARTBEAT_INTERVAL:-30}"
+HEARTBEAT_TIMEOUT="${RH_HEARTBEAT_TIMEOUT:-600}"
 RESOURCE_LOCK_HELD=0
 
 # All mount registration, release and GC decisions use this lock. A missing owner record is
@@ -164,6 +170,56 @@ owner_detached() {
   _od_tty=$(trim "$(ps -p "$(kv "$_od_file" OWNER_PID)" -o tty= 2>/dev/null)")
   case "$_od_tty" in ""|"?"|"??") return 0 ;; esac
   return 1
+}
+
+# One health check through the reverse tunnel to the project-host gateway. It rides the session's
+# routed-command master when one is up (no new handshake every interval); a session without a usable
+# config never counts as unreachable.
+project_host_reachable() {  # $1=session dir; caches the config in hb_cfg / hb_alias / hb_mux
+  if [ -z "${hb_cfg+x}" ]; then
+    hb_cfg=$(kv_b64 "$1/session.env" SSH_CONFIG)
+    hb_alias=$(kv_b64 "$1/session.env" ALIAS)
+    hb_mux=$(kv_b64 "$1/session.env" CONTROL_PATH)
+  fi
+  [ -n "$hb_alias" ] && [ -f "$hb_cfg" ] || return 0
+  _phr_mux=none
+  [ -z "$hb_mux" ] || [ ! -S "$hb_mux" ] || _phr_mux=$hb_mux
+  set -- ssh -F "$hb_cfg" -n -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 -o ControlMaster=no -o "ControlPath=$_phr_mux" "$hb_alias" remote-harness-health
+  if command -v timeout >/dev/null 2>&1; then set -- timeout -k 5 30 "$@"; fi
+  case "$("$@" 2>/dev/null </dev/null)" in RH_OK*) return 0 ;; esac
+  return 1
+}
+
+# True once every check for HEARTBEAT_TIMEOUT seconds has failed; one success resets the count, so
+# a short network drop (which SSHFS reconnects through) never ends the agent.
+heartbeat_lost() {  # $1=session dir; uses hb_next / hb_failing_since
+  [ "$HEARTBEAT_TIMEOUT" -gt 0 ] 2>/dev/null || return 1
+  _hb_now=$(date +%s)
+  [ "$_hb_now" -ge "${hb_next:-0}" ] || return 1
+  if project_host_reachable "$1"; then
+    hb_failing_since=""
+  else
+    [ -n "${hb_failing_since:-}" ] || hb_failing_since=$_hb_now
+  fi
+  _hb_now=$(date +%s)
+  hb_next=$((_hb_now + HEARTBEAT_INTERVAL))
+  [ -n "${hb_failing_since:-}" ] && [ $((_hb_now - hb_failing_since)) -ge "$HEARTBEAT_TIMEOUT" ]
+}
+
+# The next launch of the same mountpoint and agent offers to continue the conversation (resume-take).
+resume_marker() {  # $1=session dir
+  _rm_mp=$(kv "$1/session.env" MOUNTPOINT)
+  _rm_agent=$(kv_b64 "$1/session.env" AGENT)
+  case "$_rm_agent" in claude|codex|opencode) ;; *) return 1 ;; esac
+  [ -n "$_rm_mp" ] || return 1
+  printf '%s/.resume/%s.%s' "$SESSIONS" "$(printf '%s' "$_rm_mp" | tr '/+=' '_.-')" "$_rm_agent"
+}
+
+mark_disconnected() {  # $1=session dir $2=reason
+  _md_file=$(resume_marker "$1") || return 0
+  mkdir -p "$SESSIONS/.resume" 2>/dev/null || return 0
+  printf 'REASON=%s\nTIME=%s\n' "$2" "$(date +%s)" > "$_md_file.tmp" && mv "$_md_file.tmp" "$_md_file"
 }
 
 terminate_owner() {
@@ -368,7 +424,14 @@ watch() {
     owner_state "$sd"
     case $? in
       0)
-        owner_detached "$sd" && terminate_owner "$sd"
+        lost=""
+        if owner_detached "$sd"; then lost=detached
+        elif heartbeat_lost "$sd"; then lost=heartbeat
+        fi
+        if [ -n "$lost" ]; then
+          mark_disconnected "$sd" "$lost"
+          terminate_owner "$sd"
+        fi
         ;;
       2)
         # The launcher writes the owner record before starting the watcher; give up eventually.
@@ -390,6 +453,8 @@ gc() {
   resource_lock || return 0
   trap resource_unlock EXIT
   trap 'resource_unlock; exit 1' HUP INT TERM
+  # A resume offer for a project that has not been relaunched within a week is stale.
+  find "$SESSIONS/.resume" -type f -mtime +7 -exec rm -f {} + 2>/dev/null || true
 
   for gc_meta in "$SESSIONS"/*/session.env; do
     [ -f "$gc_meta" ] || continue
@@ -449,6 +514,12 @@ gc() {
 if [ "${RH_REAPER_LIBRARY:-0}" != 1 ]; then
 case "${1:-}" in
   watch) [ -n "${2:-}" ] || exit 2; watch "$2" ;;
+  resume-take)
+    [ -n "${2:-}" ] || exit 2
+    _rt_file=$(resume_marker "$2") && [ -f "$_rt_file" ] || exit 0
+    printf 'RESUME=%s,%s\n' "$(sed -n 's/^REASON=\([a-z]*\)$/\1/p' "$_rt_file")" "$(sed -n 's/^TIME=\([0-9]*\)$/\1/p' "$_rt_file")"
+    rm -f "$_rt_file"
+    ;;
   reap|release) [ -n "${2:-}" ] || exit 2; release_session "$2" "${3:-}" ;;
   config-used|release-config)
     [ -n "${2:-}" ] || exit 2

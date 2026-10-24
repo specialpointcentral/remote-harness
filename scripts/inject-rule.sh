@@ -22,6 +22,9 @@
 #   inject-rule.sh off <agent> <mountpoint> [session_id]
 #
 # 'on'  prints: RH_STATUS=INJECTED  RH_LAUNCH_ENV=<env prefix>  RH_LAUNCH_FLAGS=<trailing flags>
+#               RH_RESUME_AVAILABLE=<reason>,<epoch> when the last session of this mountpoint and
+#               agent ended on a lost connection (offered once; the marker is consumed), and
+#               RH_RESUME_ARGS=<agent arguments that continue the last conversation>
 #               RH_READY_FILE=<opencode marker>  RH_LAUNCH_PREFIX=<session launcher for the final launch>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
 # Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
@@ -573,7 +576,11 @@ case "${1:-}" in
         fi
         ;;
     esac
+    resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
+    case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
     printf 'RH_STATUS=INJECTED\n'
+    printf 'RH_RESUME_AVAILABLE=%s\n' "$resume_out"
+    printf 'RH_RESUME_ARGS=%s\n' "$resume_args"
     printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
