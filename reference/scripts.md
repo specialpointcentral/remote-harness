@@ -30,6 +30,8 @@
   remote runner. opencode emits a readiness marker path that must be observed before launch.
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
   project or cleaning up a dead launch never removes another live session's hook or runner.
+  With `RH_LANG=zh` (forwarded by `laptop-setup.sh`) the rule also tells the agent to reply in
+  Simplified Chinese.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
 - `run-on-project-host.sh`: validates and executes the local project command (in `watch` mode with
   `/dev/null` stdin, its own process group, and a channel-EOF watchdog), or runs an allowlisted
@@ -51,7 +53,10 @@
   unmounts the session mount unless another live session uses it, and removes the session dir and the
   session SSH config with its private key. A heartbeat through the tunnel ends the agent after
   `RH_HEARTBEAT_TIMEOUT` seconds of failed checks; disconnects leave a `.resume` marker that
-  `inject-rule.sh on` reports once as `RH_RESUME_AVAILABLE=<reason>,<epoch>`.
+  `inject-rule.sh on` reports once as `RH_RESUME_AVAILABLE=<reason>,<epoch>`. An agent that exits by
+  itself while the project host is unreachable (as on SIGHUP) leaves the marker too (`exited`).
+  `laptop-setup.sh` keeps a local marker when the interactive ssh exits 255 and offers resume from
+  either one.
   Mount registration, launcher release and GC share a lock and track command versus actual SSHFS
   configs separately. Failed unmounts retain reconnect config and implementation. `release-config`
   reports `USED=0` only when the specific transport can be reclaimed; an sshfs daemon (or its sftp ssh)

@@ -219,7 +219,10 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
   目录区分；默认挂载点按项目名固定，所以同一项目重连后能找到上次对话。若上次会话因断线结束，下次启动
   同一项目、同一 Agent 时会询问"继续该会话？[Y/n]"（回车即继续，只问一次），分别以
   `claude --continue`、`codex resume --last`、`opencode --continue` 启动。`RH_RESUME=1` 总是继续上次
-  对话，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。
+  对话，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。Agent 收到 SIGHUP 后往往
+  立刻自行退出，远端 watcher 来不及看到它"终端已挂断但仍在运行"：此时若项目主机经隧道不可达，watcher
+  同样留下标记；本机的交互 `ssh -tt` 因断线返回 255 时，也会在本机
+  `~/.remote-harness/.sessions/.resume/` 记下一次，两者任一存在都会触发上面的询问。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -552,7 +555,11 @@ Notes:
   connection, the next launch of the same project and agent asks "Continue that conversation? [Y/n]"
   (Enter continues; asked once) and starts `claude --continue`, `codex resume --last`, or
   `opencode --continue`. `RH_RESUME=1` always continues the last conversation, `RH_RESUME=0` never does.
-  The tool call running at the moment of the drop is not resumed.
+  The tool call running at the moment of the drop is not resumed. Agents usually exit on their own
+  when SIGHUP arrives, before the remote watcher can see a hung-up agent linger; the watcher still
+  leaves the marker when the project host is unreachable through the tunnel at that moment, and an
+  interactive `ssh -tt` that returns 255 on a lost connection records a local marker under
+  `~/.remote-harness/.sessions/.resume/`. Either one triggers the question above.
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 

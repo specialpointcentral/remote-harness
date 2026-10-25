@@ -375,6 +375,12 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
   cmds="$(detect_cmds "$4")"
   {
     printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
+    # laptop-setup.sh passes RH_LANG=zh for a Chinese session (normalized by _common.sh is_zh).
+    if [ "${RH_LANG:-}" = zh ]; then
+      printf 'Always reply to the user in Simplified Chinese (简体中文), even though these instructions,\n'
+      printf 'tool output, and project files are in English. Keep code, commands, paths, identifiers, and\n'
+      printf 'quoted output unchanged.\n\n'
+    fi
     printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools operate on the\n' "$2" "$3"
     printf 'mount, while a session router sends every Bash command to `%s`.\n\n' "$3"
     printf 'Run ordinary relative commands. Do not wrap them in `ssh`, and do not replace the routing\n'

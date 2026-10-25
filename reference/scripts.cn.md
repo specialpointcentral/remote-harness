@@ -28,6 +28,7 @@
   opencode 还会返回启动前必须出现的 readiness marker 路径。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
   不会删除其它仍在运行的会话的 hook 或 runner。
+  `RH_LANG=zh` 时（由 `laptop-setup.sh` 转发），规则还会要求 Agent 用简体中文回复。
 - `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。
 - `run-on-project-host.sh`：校验并执行本机项目命令（watch 模式下 stdin 为 `/dev/null`、使用独立
   进程组和通道 EOF 看门狗），或直接运行白名单内的 `git`/`rg`（不经 shell、
@@ -46,6 +47,8 @@
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录
   以及会话 SSH config 和 private key。经隧道的心跳检查连续失败满 `RH_HEARTBEAT_TIMEOUT` 秒后结束 Agent；
   断线会留下 `.resume` 标记，由 `inject-rule.sh on` 以 `RH_RESUME_AVAILABLE=<原因>,<时间戳>` 报告一次。
+  Agent 在项目主机不可达时自行退出（如收到 SIGHUP）也会留下标记（`exited`）。交互 ssh 以 255 退出时，
+  `laptop-setup.sh` 会在本机记下标记；任一标记存在都会询问是否继续。
   挂载登记、launcher 释放和 GC 共用锁，分别追踪命令配置和实际 SSHFS 配置。卸载失败保留重连
   配置及实现。`release-config` 仅在具体通道可回收后返回 `USED=0`；sshfs 进程（及其 sftp ssh）只在其挂载点
   仍处于挂载状态时才算正在使用该配置。失败时保留本地隧道、配置和

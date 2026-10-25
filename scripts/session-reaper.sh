@@ -18,6 +18,8 @@
 # whatever is left: the multiplexing master, leftover routed
 # tool/command processes, the SSHFS mount (unless another live session uses it), the session dir, and
 # the session SSH config with its private key (which also makes any stale local authorization inert).
+# An agent that exits by itself while the project host is unreachable (typically on the SIGHUP of
+# a dropped connection) leaves the same resume marker.
 # `gc` repeats this for every session at the next launch, covering watchers lost to a reboot.
 # Release/query commands print KEY=VALUE; watcher/GC cleanup is silent on success.
 set -u
@@ -420,6 +422,7 @@ watch() {
   sd=$1
   session_dir_ok "$sd" || exit 0
   waited=0
+  lost=""
   while [ -d "$sd" ]; do
     owner_state "$sd"
     case $? in
@@ -439,7 +442,15 @@ watch() {
         [ "$waited" -lt 600 ] || exit 0
         ;;
       *)
-        sleep "$GRACE"
+        # Most agents exit on their own when the terminal hangs up, before owner_detached can see
+        # them linger. A project host that is unreachable right then still marks the session lost;
+        # the check runs during the grace period, so it never delays the release.
+        sleep "$GRACE" &
+        grace=$!
+        if [ -z "$lost" ] && [ "$HEARTBEAT_TIMEOUT" -gt 0 ] 2>/dev/null && ! project_host_reachable "$sd"; then
+          mark_disconnected "$sd" exited
+        fi
+        wait "$grace"
         [ -d "$sd" ] && release_session "$sd"
         exit 0
         ;;

@@ -633,6 +633,23 @@ hb_inject off hb.2
 hb_inject on hb.3 > "$tmp/inject-hb3.out"
 refute_grep "$tmp/inject-hb3.out" "RH_RESUME_AVAILABLE=heartbeat" "a resume marker is offered only once"
 hb_inject off hb.3
+# An agent that exits by itself (as most do on the SIGHUP of a dropped connection) leaves a resume
+# marker only when the project host is unreachable at that moment.
+hb_exit() {  # session-id: the stand-in agent exits on its own, then the watcher finishes
+  hb_sd=$(hb_inject on "$1" | sed -n 's/^RH_SESSION_DIR=//p')
+  hb_watch
+  kill "$hb_owner" 2>/dev/null || true
+  wait_gone "$hb_watcher" || { kill "$hb_watcher"; fail "the watcher did not finish after the agent exited"; }
+  wait "$hb_watcher" 2>/dev/null || true
+  hb_inject off "$1"
+}
+HB_OK=1 hb_exit hb.4
+[ -z "$(find "$rh_home/.sessions/.resume" -type f 2>/dev/null)" ] \
+  || fail "an agent exit with a reachable project host left a resume marker"
+hb_exit hb.5
+hb_inject on hb.6 > "$tmp/inject-hb6.out"
+assert_grep_e "$tmp/inject-hb6.out" "^RH_RESUME_AVAILABLE=exited,[0-9]+$" "an agent exit with an unreachable project host offers resume"
+hb_inject off hb.6
 
 ssh_cfg="$tmp/session_ssh_config"
 printf 'Host rlocal\n    HostName 127.0.0.1\n' > "$ssh_cfg"
@@ -1272,7 +1289,8 @@ case " $* " in
     if [ -n "${LAUNCH_DIR:-}" ]; then
       eval "rcmd=\${$#}"
       SHELL=/bin/echo sh -c "${rcmd//\/tmp\/rh-remote/$LAUNCH_DIR}" > "$LAUNCH_DIR.out" 2>&1
-    fi;;
+    fi
+    [ -z "${TT_EXIT:-}" ] || exit "$TT_EXIT";;
 esac
 for arg in "$@"; do
   case "$arg" in
@@ -1316,7 +1334,7 @@ PY
     *'mount-project.sh'*)
       [ -z "${MOUNT_FAIL:-}" ] || { printf 'STATUS=failed\nERROR=read: Connection reset by peer\n'; exit 0; }
       printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
-    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\n'; exit 0;;
+    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\n'; exit 0;;
   esac
 done
 exit 0
@@ -1333,14 +1351,16 @@ launch_dir="$tmp/launch-project"
 mkdir -p "$launch_dir/.git/refs/heads"
 printf 'ref: refs/heads/main\n' > "$launch_dir/.git/HEAD"
 printf '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n' > "$launch_dir/.git/config"
-HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
-  AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" LAUNCH_DIR="$launch_dir" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32023 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-    --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$valid_project" --launch codex --yes > "$tmp/project-valid.out"
+project_launch() {  # output file; the caller's environment is passed through
+  HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" LAUNCH_DIR="$launch_dir" \
+    bash "$ROOT/scripts/laptop-setup.sh" \
+      --host example.com --port 32023 --via "ssh user@example.com" \
+      --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
+      --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+      --remote-mountpoint /tmp/rh-remote \
+      --project-dir "$valid_project" --launch codex --yes > "$1"
+}
+SSH_LOG="$ssh_log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" project_launch "$tmp/project-valid.out"
 assert_grep "$tmp/project-valid.out" "authorized_keys: temporarily authorized" "reverse authkey added"
 assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse authkey uses forced command gateway"
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
@@ -1356,7 +1376,18 @@ assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
 assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -n " "setup calls reuse the multiplexing master"
 refute_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -tt " "the interactive agent session must keep its own connection"
 assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
+assert_grep_e "$ssh_log" "RH_LANG=[^ ]*en[^ ]* [^ ]*inject-rule\.sh" "setup passes the interface language to the rule injector"
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
+# An interactive ssh that lost its connection (exit 255) makes the next launch of the same remote,
+# mountpoint and agent offer to continue, once.
+refute_grep "$tmp/project-valid.out" "ended on a lost connection" "a first launch offered resume"
+TT_EXIT=255 project_launch "$tmp/resume-lost.out"
+assert_grep "$tmp/resume-lost.out" "Lost the connection to the remote codex session" "a dropped interactive ssh is reported"
+project_launch "$tmp/resume-next.out"
+assert_grep "$tmp/resume-next.out" "ended on a lost connection" "the launch after a dropped ssh offers resume"
+assert_grep "$launch_dir.out" "-lic codex --continue" "an accepted resume continues the conversation"
+[ -z "$(find "$proj_home/.remote-harness/.sessions/.resume" -type f 2>/dev/null)" ] \
+  || fail "a local resume marker was not consumed by the launch that offered it"
 ! sh "$ROOT/scripts/run-on-project-host.sh" --find-tool rh-no-such-tool >/dev/null 2>&1 || fail "--find-tool reported a missing tool"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"
@@ -1662,6 +1693,10 @@ assert_grep "$tmp/ir-b.out" "$ir_sd.rev.b/claude-settings.json" "inject-rule key
 ir off claude "$ir_mp" rev.a >/dev/null
 [ ! -d "$ir_sd.rev.a" ] && [ -x "$ir_sd.rev.b/bin/rh-run" ] || fail "inject-rule: off did not remove exactly its own session"
 ir off claude "$ir_mp" rev.b >/dev/null
+RH_LANG=zh ir on codex "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.zh > "$tmp/ir-zh.out"
+assert_grep "$ir_sd.rev.zh/rule.md" "Always reply to the user in Simplified Chinese (简体中文)" "a Chinese session rule asks for Chinese replies"
+assert_grep "$tmp/ir-zh.out" "Simplified Chinese (简体中文)" "codex developer instructions carry the reply language"
+ir off codex "$ir_mp" rev.zh >/dev/null
 for ir_bad in .. 'a/b' 'a b'; do
   { ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_bad" || true; } | grep -qx RH_STATUS=ERROR \
     || fail "inject-rule accepted unsafe session id '$ir_bad'"
@@ -1690,6 +1725,7 @@ if [ -x "$rp_sd/bin/rg" ]; then
   assert_grep "$tmp/rp-inject.out" "USE_BUILTIN_RIPGREP=0" "claude uses the rg shim when one is installed"
 fi
 assert_grep "$rp_sd/rule.md" "Git commands you run through the Bash tool are routed" "rule describes Bash git routing"
+refute_grep "$rp_sd/rule.md" "Simplified Chinese" "an English session rule asks for Chinese replies"
 refute_grep "$rp_sd/rule.md" "All Git commands are routed too" "rule still claims every Git command is routed"
 
 # Agent exits without any local cleanup: the watcher removes leftovers server-side.

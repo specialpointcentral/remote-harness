@@ -1139,6 +1139,12 @@ fi
 # ===========================================================================
 # Phase 5: Launch Claude Code on the remote
 # ===========================================================================
+# Local resume marker (the epoch of the drop) for this remote, remote mountpoint and agent. ssh exits
+# 255 when the interactive connection drops; the next launch then offers to continue even if the
+# remote left no marker.
+LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%s' "$TARGET" \
+  "$REMOTE_MOUNTPOINT" "$LAUNCH_BASE" | cksum | awk '{print $1}')"
+
 # Inject the run-on-laptop rule SCOPED TO THIS SESSION: inject-rule builds box-side, per-session
 # artifacts (nothing global, nothing in the mounted repo, so other projects on this box are
 # unaffected) and prints how to launch so ONLY this agent reads it — a session flag for claude, or
@@ -1150,7 +1156,8 @@ RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
-inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+# RH_LANG travels with it so a Chinese session's rule asks the agent to reply in Chinese.
+inject_remote_cmd="RH_LANG=$(is_zh && echo zh || echo en) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
 # Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
@@ -1179,6 +1186,16 @@ if [ "$rh_status" = INJECTED ]; then
   # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
   rh_resume=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_AVAILABLE=//p' | head -1)
   rh_resume_args=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_ARGS=//p' | head -1)
+  # The remote watcher cannot record a disconnect that the agent outran by exiting on SIGHUP; the
+  # local marker from an interactive ssh that lost its connection covers that case.
+  if [ -f "$LOCAL_RESUME_MARKER" ]; then
+    _local_resume_at=$(cat "$LOCAL_RESUME_MARKER" 2>/dev/null)
+    rm -f "$LOCAL_RESUME_MARKER"
+    case "$_local_resume_at" in ''|*[!0-9]*) ;; *)
+      [ -n "$rh_resume" ] || [ $(( $(date +%s) - _local_resume_at )) -gt 604800 ] \
+        || rh_resume="disconnected,$_local_resume_at" ;;
+    esac
+  fi
   RESUME=0
   case "${RH_RESUME:-}" in
     1|yes) RESUME=1;;
@@ -1328,6 +1345,9 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
 }
 launch_remote_agent
 CLAUDE_EXIT=$?
+if [ "$CLAUDE_EXIT" = 255 ]; then
+  mkdir -p "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null && date +%s > "$LOCAL_RESUME_MARKER" 2>/dev/null || true
+fi
 
 # ===========================================================================
 # Post-session cleanup offer
@@ -1335,6 +1355,9 @@ CLAUDE_EXIT=$?
 sep
 if [ "$CLAUDE_EXIT" = 0 ]; then
   ok "${LAUNCH} session ended."
+elif [ "$CLAUDE_EXIT" = 255 ]; then
+  warn "$(tr2 "Lost the connection to the remote ${LAUNCH} session; the next launch of this project offers to continue it." \
+              "与远端 ${LAUNCH} 会话的连接已断开；下次启动该项目时会询问是否继续该会话。")"
 else
   warn "${LAUNCH} session ended (exit code $CLAUDE_EXIT)."
 fi
