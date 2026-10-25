@@ -7,18 +7,16 @@ fail() {
   exit 2
 }
 
-BASE64_DECODE_FLAG=""
+# Probed once here: decode_b64 runs inside $(...), where a lazily cached flag would be lost.
+if base64 --decode </dev/null >/dev/null 2>&1; then
+  BASE64_DECODE_FLAG=--decode
+elif base64 -d </dev/null >/dev/null 2>&1; then
+  BASE64_DECODE_FLAG=-d
+else
+  BASE64_DECODE_FLAG=-D
+fi
 
 decode_b64() {
-  if [ -z "$BASE64_DECODE_FLAG" ]; then
-    if base64 --decode </dev/null >/dev/null 2>&1; then
-      BASE64_DECODE_FLAG=--decode
-    elif base64 -d </dev/null >/dev/null 2>&1; then
-      BASE64_DECODE_FLAG=-d
-    else
-      BASE64_DECODE_FLAG=-D
-    fi
-  fi
   printf '%s' "$1" | base64 "$BASE64_DECODE_FLAG"
 }
 
@@ -45,15 +43,26 @@ reject_direct_agent_launch() {
 make_agent_guard_path() {
   _mag_dir=$(mktemp -d "${TMPDIR:-/tmp}/remote-harness-no-agent.XXXXXX") \
     || fail "could not create the local no-agent guard"
-  for _mag_name in claude codex opencode; do
-    cat > "$_mag_dir/$_mag_name" <<'EOF'
-#!/usr/bin/env sh
-printf 'remote-harness: Agent processes must run on the remote agent host.\n' >&2
-exit 126
-EOF
-    chmod +x "$_mag_dir/$_mag_name"
+  for _mag_name in claude codex opencode; do  # printf is a builtin: no process per stub
+    printf '%s\n' '#!/usr/bin/env sh' \
+      "printf 'remote-harness: Agent processes must run on the remote agent host.\\n' >&2" \
+      'exit 126' > "$_mag_dir/$_mag_name"
   done
+  chmod +x "$_mag_dir/claude" "$_mag_dir/codex" "$_mag_dir/opencode"
   printf '%s' "$_mag_dir"
+}
+
+# Both dispatch verbs: drop AI credentials, shadow agent CLIs with $guard_path, and always remove it.
+start_agent_guard() {
+  scrub_agent_credentials
+  guard_path=$(make_agent_guard_path)
+  trap 'rm -rf "$guard_path"' EXIT HUP INT TERM
+}
+
+finish_agent_guard() {  # $1 = exit status
+  rm -rf "$guard_path"
+  trap - EXIT HUP INT TERM
+  exit "$1"
 }
 
 resolve_target() {  # $1=project root b64 $2=relative cwd b64 -> target_physical
@@ -162,9 +171,7 @@ dispatch() {
   case "$shell" in /*) ;; *) shell=/bin/sh ;; esac
   [ -x "$shell" ] || shell=/bin/sh
   export GIT_OPTIONAL_LOCKS=0
-  scrub_agent_credentials
-  guard_path=$(make_agent_guard_path)
-  trap 'rm -rf "$guard_path"' EXIT HUP INT TERM
+  start_agent_guard
   cd "$target_physical"
   guarded_command="PATH=$(sq "$guard_path"):\$PATH; export PATH; $command"
   status=0
@@ -173,25 +180,32 @@ dispatch() {
   else
     "$shell" -lc "$guarded_command" || status=$?
   fi
-  rm -rf "$guard_path"
-  trap - EXIT HUP INT TERM
-  exit "$status"
+  finish_agent_guard "$status"
 }
 
-# Fixed tool search path for direct tool dispatch. A forced-command SSH session has a minimal PATH and
-# no login shell, so look in the usual package-manager locations instead of sourcing user profiles.
+# Fixed tool path for direct tool dispatch. A forced-command SSH session has a minimal PATH and no
+# login shell, so use the usual package-manager locations instead of sourcing user profiles. The same
+# list finds the tool and becomes its PATH, so helpers git spawns (git-lfs, ...) resolve alike.
+PROJECT_TOOL_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/home/linuxbrew/.linuxbrew/bin"
+PROJECT_TOOL_PATH="$PROJECT_TOOL_PATH:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin"
+PROJECT_TOOL_PATH="$PROJECT_TOOL_PATH:$HOME/.nix-profile/bin:$HOME/.local/bin:$HOME/.cargo/bin:/usr/sbin:/sbin"
+
 find_project_tool() {  # $1=tool name
-  for _fpt_dir in /opt/homebrew/bin /usr/local/bin /usr/bin /bin /home/linuxbrew/.linuxbrew/bin \
-      /nix/var/nix/profiles/default/bin /run/current-system/sw/bin \
-      "$HOME/.nix-profile/bin" "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+  _fpt_ifs=$IFS
+  IFS=:
+  for _fpt_dir in $PROJECT_TOOL_PATH; do
+    IFS=$_fpt_ifs
     [ -x "$_fpt_dir/$1" ] && [ ! -d "$_fpt_dir/$1" ] || continue
     # macOS /usr/bin/git is a stub that only works once the Command Line Tools are installed.
-    if [ "$_fpt_dir/$1" = /usr/bin/git ] && [ "$(uname -s)" = Darwin ] && ! xcode-select -p >/dev/null 2>&1; then
+    # xcode-select exists only on macOS; `command -v` is a builtin, so Linux pays no process here.
+    if [ "$_fpt_dir/$1" = /usr/bin/git ] && command -v xcode-select >/dev/null 2>&1 \
+        && ! xcode-select -p >/dev/null 2>&1; then
       continue
     fi
     printf '%s' "$_fpt_dir/$1"
     return 0
   done
+  IFS=$_fpt_ifs
   return 1
 }
 
@@ -230,10 +244,8 @@ dispatch_tool() {
     exit 127
   }
   export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat PAGER=cat
-  scrub_agent_credentials
-  guard_path=$(make_agent_guard_path)
-  trap 'rm -rf "$guard_path"' EXIT HUP INT TERM
-  PATH="$guard_path:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  start_agent_guard
+  PATH="$guard_path:$PROJECT_TOOL_PATH"
   export PATH
   cd "$target_physical"
 
@@ -243,9 +255,7 @@ dispatch_tool() {
   else
     "$tool_path" "$@" </dev/null || status=$?
   fi
-  rm -rf "$guard_path"
-  trap - EXIT HUP INT TERM
-  exit "$status"
+  finish_agent_guard "$status"
 }
 
 # Launch-time preflight on the project host: report where the tool verb would find $2.
@@ -274,6 +284,7 @@ control_path_usable() {
 ssh_config=""
 alias_name=""
 project_root=""
+project_root_b64=""
 relative_cwd=""
 command_b64=""
 tool=""
@@ -286,6 +297,7 @@ while [ "$#" -gt 0 ]; do
     --ssh-config) [ "$#" -ge 2 ] || fail "missing --ssh-config value"; ssh_config=$2; shift 2 ;;
     --alias) [ "$#" -ge 2 ] || fail "missing --alias value"; alias_name=$2; shift 2 ;;
     --project-root) [ "$#" -ge 2 ] || fail "missing --project-root value"; project_root=$2; shift 2 ;;
+    --project-root-b64) [ "$#" -ge 2 ] || fail "missing --project-root-b64 value"; project_root_b64=$2; shift 2 ;;
     --cwd-relative-b64) [ "$#" -ge 2 ] || fail "missing --cwd-relative-b64 value"; relative_cwd=$2; shift 2 ;;
     --command-b64) [ "$#" -ge 2 ] || fail "missing --command-b64 value"; command_b64=$2; shift 2 ;;
     --tool) [ "$#" -ge 2 ] || fail "missing --tool value"; tool=$2; shift 2 ;;
@@ -303,7 +315,10 @@ case "$project_root" in /*) ;; *) fail "project root must be absolute" ;; esac
 relative_decoded=$(decode_b64 "$relative_cwd") || fail "could not decode relative working directory"
 safe_relative_dir "$relative_decoded" || fail "invalid relative working directory"
 
-project_root_b64=$(encode_b64 "$project_root")
+# Callers may pass the root pre-encoded (it never changes within a session) to skip a base64 here; the
+# project host checks the decoded root against the registered one either way.
+[ -n "$project_root_b64" ] || project_root_b64=$(encode_b64 "$project_root")
+case "$project_root_b64" in *[!A-Za-z0-9+/=]*) fail "invalid project root encoding" ;; esac
 if [ -n "$tool" ]; then
   case "$tool" in git|rg) ;; *) fail "unsupported project tool" ;; esac
   case "$tool_args" in -) ;; ""|*[!A-Za-z0-9+/=,]*) fail "invalid tool argument encoding" ;; esac

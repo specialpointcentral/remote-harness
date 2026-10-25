@@ -91,18 +91,10 @@ candidate_hosts() {
   fi
 }
 
-pick_host() {
-  _seen=""
+pick_host() {  # first public IPv4, else the first usable candidate
   _all="$(candidate_hosts | sed '/^$/d')"
   for _h in $_all; do
     is_bad_host "$_h" && continue
-    case "
-$_seen
-" in *"
-$_h
-"*) continue;; esac
-    _seen="${_seen}
-$_h"
     is_ipv4 "$_h" && ! is_private_v4 "$_h" && { printf '%s' "$_h"; return 0; }
   done
   for _h in $_all; do
@@ -138,6 +130,7 @@ if [ -z "$host" ]; then
   [ -n "$host" ] || unavailable no_server_address
 fi
 
+# Defense in depth: re-check whatever source produced the host before it is emitted.
 is_bad_host "$host" && unavailable unsafe_host
 valid_port "$port" || unavailable unsafe_port
 

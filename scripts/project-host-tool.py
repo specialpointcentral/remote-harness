@@ -384,6 +384,7 @@ def runner_command(args: argparse.Namespace, relative: str, spec: str, mux: bool
         "--ssh-config", args.ssh_config,
         "--alias", args.alias,
         "--project-root", args.project_root,
+        "--project-root-b64", base64.b64encode(os.fsencode(args.project_root)).decode("ascii"),
         "--cwd-relative-b64", base64.b64encode(os.fsencode(relative)).decode("ascii"),
         "--tool", args.tool,
         "--args-b64", spec,

@@ -98,4 +98,4 @@ git diff --check
 ```
 
 完整远端服务器到本机项目的 SSHFS 流程仍需人工集成测试。未经用户要求不得 commit/push；只推送
-授权 fork，并使用 GitHub noreply 身份。
+授权 fork。

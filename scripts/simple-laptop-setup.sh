@@ -9,13 +9,6 @@
 set -uo pipefail
 set -f
 
-need_arg() {
-  if [ -z "${2+x}" ] || [ -z "$2" ]; then
-    printf 'missing value for %s\n' "$1" >&2
-    exit 2
-  fi
-}
-
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 RH_COMMON="${RH_COMMON:-$SCRIPT_DIR/_common.sh}"
 if [ -f "$RH_COMMON" ]; then
@@ -25,7 +18,6 @@ else
   printf 'error: missing _common.sh next to %s\n' "$0" >&2
   exit 2
 fi
-
 
 prompt_line() {
   _label="$1"
@@ -122,11 +114,6 @@ choose_project_dir() {
     if is_zh; then warn "项目目录不存在：$_candidate"; else warn "Project directory does not exist: $_candidate"; fi
     _candidate=""
   done
-}
-
-kv_value() {
-  _key="$1"
-  sed -n "s/^${_key}=//p" | head -1
 }
 
 cache_file() {

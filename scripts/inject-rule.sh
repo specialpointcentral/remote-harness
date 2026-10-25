@@ -39,6 +39,14 @@ set -uo pipefail
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
 
+# After `on` has created the session dir, every failure removes it so a relaunch never finds a
+# half-built session it refuses to overwrite.
+abort_session() {
+  rm -rf "$SD" 2>/dev/null || true
+  echo "RH_STATUS=ERROR"
+  exit 1
+}
+
 safe_ssh_token() {
   case "${1:-}" in
     ""|-*|*[[:space:]]*) return 1;;
@@ -173,8 +181,9 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
-    printf 'exec %s%s --ssh-config %s --alias %s --project-root %s%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
-      "$_wsr_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" "$_wsr_mux"
+    printf 'exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$_wsr_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
+      "$(b64_value "$3")" "$_wsr_mux"
   } > "$_wsr_runner" || return 1
   chmod +x "$_wsr_runner" 2>/dev/null || return 1
   printf '%s' "$_wsr_runner"
@@ -443,16 +452,16 @@ case "${1:-}" in
     # Generated entry points only reference this per-session implementation snapshot. Mutable
     # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
     source_scripts="$SCRIPT_DIR"
-    mkdir "$SD/impl" || { echo RH_STATUS=ERROR; exit 1; }
+    mkdir "$SD/impl" || abort_session
     for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
-      cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || { rm -rf "$SD"; echo RH_STATUS=ERROR; exit 1; }
-      chmod 500 "$SD/impl/$impl_file" || { echo RH_STATUS=ERROR; exit 1; }
+      cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || abort_session
+      chmod 500 "$SD/impl/$impl_file" || abort_session
     done
     SCRIPT_DIR="$SD/impl"
     if [ -n "$SESSION_LEASE" ]; then
-      RH_REAPER_LIBRARY=1 . "$SCRIPT_DIR/session-reaper.sh" || { echo RH_STATUS=ERROR; exit 1; }
+      RH_REAPER_LIBRARY=1 . "$SCRIPT_DIR/session-reaper.sh" || abort_session
       unset RH_REAPER_LIBRARY
-      resource_lock || { echo RH_STATUS=ERROR; exit 1; }
+      resource_lock || abort_session
       mount_meta=$(mount_record "$(kv_b64 "$SESSION_LEASE/lease.env" MOUNTPOINT)")
       if [ -f "$mount_meta" ] && [ -z "$(kv_b64 "$mount_meta" IMPLEMENTATION)" ]; then
         printf 'IMPLEMENTATION=%s\n' "$(b64_value "$SD/impl")" >> "$mount_meta"
@@ -464,82 +473,79 @@ case "${1:-}" in
     env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""
     [ -z "$ssh_config" ] || control_path="$(session_control_path "$ssh_config")"
     write_session_meta "$SD" "$agent" "$mp" "$ba" "$ssh_config" "$control_path" \
-      || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || { echo "RH_STATUS=ERROR"; exit 1; }
+      || abort_session
+    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || abort_session
     if [ -n "$ssh_config" ]; then
       if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
       fi
     fi
-    if [ "$agent" = claude ] || [ "$agent" = codex ] || [ "$agent" = opencode ]; then
-      [ -n "$ssh_config" ] && [ -f "$ssh_config" ] \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      # Command guard and tool shims need python3 on this host; without it, routed commands are not
-      # watched and git/rg simply keep their SSHFS behavior.
-      PYTHON3=$(command -v python3 2>/dev/null || true)
-      runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3") \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      launcher=$(write_session_launcher "$SD") \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-      prefix_out="$(sq "$launcher")"
-      rg_shim=0
-      if [ -n "$PYTHON3" ] && [ -f "$SCRIPT_DIR/project-host-tool.py" ]; then
-        real_git=$(command -v git 2>/dev/null || true)
-        write_tool_shim "$SD" git "$real_git" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" \
-          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-        # Only shim rg when a real one exists here, so calls outside the project keep working. A
-        # native Claude install embeds ripgrep and serves it when invoked with argv0 `rg`.
-        real_rg=$(command -v rg 2>/dev/null || true)
-        rg_argv0=""
-        case "$real_rg" in /*) ;; *) real_rg="";; esac
-        # Standalone Codex ships rg beside bin/ in codex-path/, but that directory need not be in
-        # the SSH login shell's PATH yet. Resolve the CLI symlink without changing its installation.
-        if [ -z "$real_rg" ] && [ "$agent" = codex ]; then
-          codex_bin=$(command -v codex 2>/dev/null || true)
-          case "$codex_bin" in
-            /*)
-              codex_real=$("$PYTHON3" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$codex_bin")
-              codex_rg="$(dirname "$(dirname "$codex_real")")/codex-path/rg"
-              if [ -x "$codex_rg" ] && "$codex_rg" --version </dev/null 2>/dev/null | grep -q '^ripgrep '; then
-                real_rg="$codex_rg"
-              fi
-              ;;
-          esac
-        fi
-        if [ -z "$real_rg" ] && [ "$agent" = claude ]; then
-          claude_bin=$(command -v claude 2>/dev/null || true)
-          case "$claude_bin" in
-            /*)
-              if (exec -a rg "$claude_bin" --version </dev/null 2>/dev/null) | grep -q '^ripgrep '; then
-                real_rg="$claude_bin"; rg_argv0=rg
-              fi
-              ;;
-          esac
-        fi
-        if [ -n "$real_rg" ]; then
-          write_tool_shim "$SD" rg "$real_rg" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" "$rg_argv0" \
-            || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
-          rg_shim=1
-        fi
+    [ -n "$ssh_config" ] && [ -f "$ssh_config" ] \
+      || abort_session
+    [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
+      || abort_session
+    # Command guard and tool shims need python3 on this host; without it, routed commands are not
+    # watched and git/rg simply keep their SSHFS behavior.
+    PYTHON3=$(command -v python3 2>/dev/null || true)
+    runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3") \
+      || abort_session
+    launcher=$(write_session_launcher "$SD") \
+      || abort_session
+    prefix_out="$(sq "$launcher")"
+    rg_shim=0
+    if [ -n "$PYTHON3" ] && [ -f "$SCRIPT_DIR/project-host-tool.py" ]; then
+      real_git=$(command -v git 2>/dev/null || true)
+      write_tool_shim "$SD" git "$real_git" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" \
+        || abort_session
+      # Only shim rg when a real one exists here, so calls outside the project keep working. A
+      # native Claude install embeds ripgrep and serves it when invoked with argv0 `rg`.
+      real_rg=$(command -v rg 2>/dev/null || true)
+      rg_argv0=""
+      case "$real_rg" in /*) ;; *) real_rg="";; esac
+      # Standalone Codex ships rg beside bin/ in codex-path/, but that directory need not be in
+      # the SSH login shell's PATH yet. Resolve the CLI symlink without changing its installation.
+      if [ -z "$real_rg" ] && [ "$agent" = codex ]; then
+        codex_bin=$(command -v codex 2>/dev/null || true)
+        case "$codex_bin" in
+          /*)
+            codex_real=$("$PYTHON3" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$codex_bin")
+            codex_rg="$(dirname "$(dirname "$codex_real")")/codex-path/rg"
+            if [ -x "$codex_rg" ] && "$codex_rg" --version </dev/null 2>/dev/null | grep -q '^ripgrep '; then
+              real_rg="$codex_rg"
+            fi
+            ;;
+        esac
+      fi
+      if [ -z "$real_rg" ] && [ "$agent" = claude ]; then
+        claude_bin=$(command -v claude 2>/dev/null || true)
+        case "$claude_bin" in
+          /*)
+            if (exec -a rg "$claude_bin" --version </dev/null 2>/dev/null) | grep -q '^ripgrep '; then
+              real_rg="$claude_bin"; rg_argv0=rg
+            fi
+            ;;
+        esac
+      fi
+      if [ -n "$real_rg" ]; then
+        write_tool_shim "$SD" rg "$real_rg" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" "$rg_argv0" \
+          || abort_session
+        rg_shim=1
       fi
     fi
     if [ "$agent" = claude ] || [ "$agent" = codex ]; then
-      PYTHON3=$(command -v python3 2>/dev/null || true)
       [ -n "$PYTHON3" ] && [ -x "$PYTHON3" ] \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        || abort_session
       [ -x "$SCRIPT_DIR/route-command.py" ] \
-        || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+        || abort_session
       hook_command="$(sq "$PYTHON3") $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
     fi
     case "$agent" in
       claude)
         CLAUDE_SETTINGS="$SD/claude-settings.json"
         worktree_blocker=$(write_claude_worktree_blocker "$SD") \
-          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+          || abort_session
         write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" \
-          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+          || abort_session
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
@@ -561,7 +567,7 @@ case "${1:-}" in
         ready_file="$SD/opencode-plugin.ready"
         rm -f "$ready_file" 2>/dev/null || true
         opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file") \
-          || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+          || abort_session
         [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
         [ "$approval" = yolo ] || approval=normal  # opencode has no automatic approval review
         # JSON-escape session paths: escape \ then " (both legal in Unix paths; rare but correct).
@@ -579,17 +585,15 @@ case "${1:-}" in
         # initialization could otherwise move a bundled rg or system git ahead of the shims.
         tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
         flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
-        # codex's default sandbox gates network, which blocks the rule's `ssh <host> ...`. The
-        # `[sandbox_workspace_write]` sub-table only merges when workspace-write is EXPLICITLY
-        # selected, so `-s workspace-write` is required — `network_access` alone at the implicit
-        # default is IGNORED. Under --yolo, --dangerously-bypass-approvals-and-sandbox already drops
-        # the sandbox entirely, so DON'T add -s there (it would conflict).
-        # workspace-write needs explicit network access for the rule's `ssh <host> ...`, plus write
-        # access to the session-owned directories where the wrapper/config put temporary known_hosts.
-        # Do not add ~/.ssh; user SSH files remain read-only/user-managed.
+        # codex's default sandbox gates network, which blocks the session runner's ssh to the project
+        # host. The `[sandbox_workspace_write]` sub-table only merges when workspace-write is
+        # EXPLICITLY selected, so `-s workspace-write` is required — `network_access` alone at the
+        # implicit default is IGNORED. It also needs write access to the session-owned directories
+        # where the wrapper/config put temporary known_hosts; never ~/.ssh. Under --yolo,
+        # --dangerously-bypass-approvals-and-sandbox already drops the sandbox, so DON'T add -s there.
         if [ "$yolo" != 1 ]; then
           roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
-            || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
+            || abort_session
           flags_out="$flags_out -s workspace-write -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
         fi
         if [ "$approval" = auto ]; then

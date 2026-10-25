@@ -110,11 +110,11 @@ register_mount_lease() { # session id, physical mountpoint, command config, moun
   fi
 }
 
-b64d() {
-  if printf '' | base64 --decode >/dev/null 2>&1; then printf '%s' "$1" | base64 --decode
-  elif printf '' | base64 -d >/dev/null 2>&1; then printf '%s' "$1" | base64 -d
-  else printf '%s' "$1" | base64 -D; fi
-}
+# Probed once: b64d mostly runs inside $(...), where a lazily cached flag would be lost.
+if printf '' | base64 --decode >/dev/null 2>&1; then B64D_FLAG=--decode
+elif printf '' | base64 -d >/dev/null 2>&1; then B64D_FLAG=-d
+else B64D_FLAG=-D; fi
+b64d() { printf '%s' "$1" | base64 "$B64D_FLAG"; }
 
 kv() {  # $1=file $2=key -> raw value
   sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1
@@ -148,18 +148,25 @@ ssh_config_ok() {  # per-launch session SSH config: $RH_HOME/.sessions/<dir>/ssh
 
 process_start() { trim "$(ps -p "$1" -o lstart= 2>/dev/null)"; }
 
+# The launcher writes owner.env once, so the watcher's polls read it only once per session dir.
+owner_record() {  # $1=session dir -> or_pid / or_start / or_tty
+  [ "${or_dir:-}" != "$1" ] || return 0
+  or_pid=$(kv "$1/owner.env" OWNER_PID)
+  or_start=$(kv_b64 "$1/owner.env" OWNER_START)
+  or_tty=$(kv_b64 "$1/owner.env" OWNER_TTY)
+  or_dir=$1
+}
+
 # 0 = agent alive, 1 = agent gone, 2 = never launched (no owner record yet)
 owner_state() {
-  _os_file="$1/owner.env"
-  [ -f "$_os_file" ] || return 2
-  [ -r "$_os_file" ] || return 0
-  _os_pid=$(kv "$_os_file" OWNER_PID)
-  case "$_os_pid" in ""|*[!0-9]*) return 0 ;; esac
-  kill -0 "$_os_pid" 2>/dev/null || return 1
-  _os_start=$(kv_b64 "$_os_file" OWNER_START)
-  _os_observed=$(process_start "$_os_pid")
+  [ -f "$1/owner.env" ] || return 2
+  [ -r "$1/owner.env" ] || return 0
+  owner_record "$1"
+  case "$or_pid" in ""|*[!0-9]*) return 0 ;; esac
+  kill -0 "$or_pid" 2>/dev/null || return 1
+  _os_observed=$(process_start "$or_pid")
   [ -n "$_os_observed" ] || return 0
-  if [ -n "$_os_start" ] && [ "$_os_observed" != "$_os_start" ]; then
+  if [ -n "$or_start" ] && [ "$_os_observed" != "$or_start" ]; then
     return 1  # pid reused by an unrelated process
   fi
   return 0
@@ -167,9 +174,9 @@ owner_state() {
 
 # The agent was launched on a terminal, but that terminal is gone (connection force-closed).
 owner_detached() {
-  _od_file="$1/owner.env"
-  case "$(kv_b64 "$_od_file" OWNER_TTY)" in /dev/*) ;; *) return 1 ;; esac
-  _od_tty=$(trim "$(ps -p "$(kv "$_od_file" OWNER_PID)" -o tty= 2>/dev/null)")
+  owner_record "$1"
+  case "$or_tty" in /dev/*) ;; *) return 1 ;; esac
+  _od_tty=$(trim "$(ps -p "$or_pid" -o tty= 2>/dev/null)")
   case "$_od_tty" in ""|"?"|"??") return 0 ;; esac
   return 1
 }
@@ -225,7 +232,8 @@ mark_disconnected() {  # $1=session dir $2=reason
 }
 
 terminate_owner() {
-  _to_pid=$(kv "$1/owner.env" OWNER_PID)
+  owner_record "$1"
+  _to_pid=$or_pid
   case "$_to_pid" in ""|*[!0-9]*) return 0 ;; esac
   for _to_signal in HUP TERM KILL; do
     owner_state "$1" || return 0
@@ -399,6 +407,13 @@ reap() {  # $1=session dir $2=--session-only?
   fi
 }
 
+# A mount lease that never became an agent session gets a session.env so reap can release it.
+lease_session_env() {  # $1=lease dir
+  printf 'MOUNTPOINT=%s\nSSH_CONFIG=%s\nLEASE_DIR=%s\nMOUNT_SSH_CONFIG=%s\n' \
+    "$(kv "$1/lease.env" MOUNTPOINT)" "$(kv "$1/lease.env" SSH_CONFIG)" \
+    "$(printf '%s' "$1" | base64 | tr -d '\n')" "$(kv "$1/lease.env" MOUNT_SSH_CONFIG)" > "$1/session.env"
+}
+
 release_session() {
   resource_lock || return 1
   trap resource_unlock EXIT
@@ -409,10 +424,7 @@ release_session() {
     return 1
   fi
   if [ -f "$1/lease.env" ] && [ ! -f "$1/session.env" ]; then
-    _rs_lease="$1/lease.env"
-    printf 'MOUNTPOINT=%s\nSSH_CONFIG=%s\nLEASE_DIR=%s\nMOUNT_SSH_CONFIG=%s\n' \
-      "$(kv "$_rs_lease" MOUNTPOINT)" "$(kv "$_rs_lease" SSH_CONFIG)" \
-      "$(printf '%s' "$1" | base64 | tr -d '\n')" "$(kv "$_rs_lease" MOUNT_SSH_CONFIG)" > "$1/session.env"
+    lease_session_env "$1"
   fi
   reap "$1" "${2:-}"
   printf 'STATUS=released\n'
@@ -486,11 +498,7 @@ gc() {
     gc_ld=$(dirname "$gc_lease")
     reference_live "$gc_ld" "$gc_lease" && continue
     # An early launch that never reached injection has no watcher; release its mount lease too.
-    gc_mp=$(kv_b64 "$gc_lease" MOUNTPOINT)
-    gc_cfg=$(kv_b64 "$gc_lease" SSH_CONFIG)
-    printf 'MOUNTPOINT=%s\nSSH_CONFIG=%s\nLEASE_DIR=%s\nMOUNT_SSH_CONFIG=%s\n' \
-      "$(kv "$gc_lease" MOUNTPOINT)" "$(kv "$gc_lease" SSH_CONFIG)" \
-      "$(printf '%s' "$gc_ld" | base64 | tr -d '\n')" "$(kv "$gc_lease" MOUNT_SSH_CONFIG)" > "$gc_ld/session.env"
+    lease_session_env "$gc_ld"
     reap "$gc_ld"
   done
 
@@ -545,6 +553,6 @@ case "${1:-}" in
     fi
     ;;
   gc) gc ;;
-  *) echo "usage: session-reaper.sh watch <session-dir> | reap <session-dir> [--session-only] | gc" >&2; exit 2 ;;
+  *) echo "usage: session-reaper.sh watch|resume-take|reap|release <session-dir> [--session-only] | config-used|release-config <ssh-config> | gc" >&2; exit 2 ;;
 esac
 fi

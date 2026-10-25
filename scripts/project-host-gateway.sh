@@ -40,6 +40,15 @@ fi
 root_file="$session_dir/project-root.b64"
 original=${SSH_ORIGINAL_COMMAND:-}
 
+# Every exec/tool request must name this session's registered project root, and the dispatcher that
+# re-validates it on the project host must be in place.
+require_session_root() {  # $1 = requested project root (base64)
+  [ -r "$root_file" ] || fail "session project root is unavailable"
+  expected_root=$(cat "$root_file")
+  [ "$1" = "$expected_root" ] || fail "project root does not match this session"
+  [ -x "$dispatcher" ] || fail "project-host dispatcher is unavailable"
+}
+
 case "$original" in
   remote-harness-health)
     printf 'RH_OK %s %s' "$(hostname 2>/dev/null || printf unknown)" "$(id -un 2>/dev/null || printf unknown)"
@@ -53,10 +62,7 @@ case "$original" in
       [ "$#" -eq 4 ] || fail "invalid execution request"
     fi
     safe_b64 "$2" && safe_b64 "$3" && safe_b64 "$4" || fail "invalid execution encoding"
-    [ -r "$root_file" ] || fail "session project root is unavailable"
-    expected_root=$(cat "$root_file")
-    [ "$2" = "$expected_root" ] || fail "project root does not match this session"
-    [ -x "$dispatcher" ] || fail "project-host dispatcher is unavailable"
+    require_session_root "$2"
     exec "$dispatcher" --dispatch "$2" "$3" "$4" ${5:+"$5"}
     ;;
   remote-harness-tool\ *)
@@ -65,10 +71,7 @@ case "$original" in
     safe_b64 "$2" && safe_b64 "$3" || fail "invalid tool encoding"
     case "$4" in git|rg) ;; *) fail "unsupported project tool" ;; esac
     case "$5" in -) ;; ""|*[!A-Za-z0-9+/=,]*) fail "invalid tool argument encoding" ;; esac
-    [ -r "$root_file" ] || fail "session project root is unavailable"
-    expected_root=$(cat "$root_file")
-    [ "$2" = "$expected_root" ] || fail "project root does not match this session"
-    [ -x "$dispatcher" ] || fail "project-host dispatcher is unavailable"
+    require_session_root "$2"
     exec "$dispatcher" --dispatch-tool "$2" "$3" "$4" "$5"
     ;;
   internal-sftp|internal-sftp\ *|sftp-server|sftp-server\ *|/usr/libexec/sftp-server|/usr/libexec/sftp-server\ *|/usr/lib/openssh/sftp-server|/usr/lib/openssh/sftp-server\ *)

@@ -144,7 +144,7 @@ awk -v b="$BEGIN" -v e="$END" '
 ' "$CFG" > "$strip"
 
 # Build the new config in a SAME-DIRECTORY temp, then rename over $CFG. The rename is atomic on one
-# filesystem, so even if the lock above was lost (timeout / no flock), a concurrent reader/writer sees
+# filesystem, so a concurrent reader/writer of the same config (writes are not locked) sees
 # the old OR the fully-new file — never a half-written one, and at worst a lost update, not corruption.
 new="$(mktemp "$(dirname "$CFG")/.rh-cfg.XXXXXX" 2>/dev/null)" || new="$CFG.rh-new.$$"
 {
@@ -177,9 +177,6 @@ emit KNOWN_HOSTS "$KH"
 emit REMOTEFORWARD_LINE "RemoteForward $PORT 127.0.0.1:22"
 if [ -n "$IDENTITY" ] && [ -f "$IDENTITY.pub" ]; then
   emit PUBKEY "$(cat "$IDENTITY.pub")"
-  # Keep a diagnostic copy as well; the simple path consumes the PUBKEY line above directly.
-  mkdir -p "$RH_HOME" 2>/dev/null || true
-  cp "$IDENTITY.pub" "$RH_HOME/.tunnel-pubkey" 2>/dev/null || true
 else
   emit PUBKEY ""
   note "No remote-harness public key available; the laptop must already accept agent/key auth,"

@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# remote-harness / _common.sh — shared helpers, SOURCED (not executed) by the two setup scripts:
-#   laptop-setup.sh  (reverse: agent on a remote box, code on the laptop — reverse tunnel)
-#   local-setup.sh   (disabled compatibility entry; local agents are not supported)
-# Both source it via:  . "$(dirname "$0")/_common.sh"
-# For the reverse flow the skill's one-command fetches THIS file next to laptop-setup.sh so the
-# laptop (which usually has no install) still finds it. Sets colors + OS vars at source time and
-# defines output/quoting/ssh-config helpers. Sourced files must NOT set -e or exit.
+# remote-harness / _common.sh — shared helpers, SOURCED (not executed) on the local machine by
+# laptop-setup.sh, simple-laptop-setup.sh and simple-dispatch.sh, each from beside itself (or
+# $RH_COMMON). The bootstrap fetches THIS file next to them, so a laptop without an install still
+# finds it. Sets colors + OS vars at source time and defines output/quoting/ssh-config helpers.
+# Sourcing must not set -e or exit; only need_arg exits, on a usage error.
 # shellcheck disable=SC2034 # this library intentionally sets variables for callers.
 
 # ---- colors (ANSI, only when stdout is a real terminal) --------------------
@@ -130,12 +128,15 @@ proc_start() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:
 # breaking — or injecting into — the ssh command strings the setup scripts build.
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
+# First value of KEY in KEY=VALUE lines on stdin (values may contain '=').
+kv_value() { sed -n "s/^$1=//p" | head -1; }
+
+# Option parsing: a flag without a value is a usage error that ends the script.
 need_arg() {
   if [ -z "${2+x}" ] || [ -z "$2" ]; then
     printf 'missing value for %s\n' "$1" >&2
-    return 2
+    exit 2
   fi
-  return 0
 }
 
 safe_ssh_token() {

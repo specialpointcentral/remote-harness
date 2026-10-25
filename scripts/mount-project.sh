@@ -297,9 +297,8 @@ err="$(mktemp "$RH_HOME/.sessions/rh-mount.XXXXXX" 2>/dev/null)" || err="${RH_HO
 # remote uid → ours; omitted on macOS, where FUSE-T's sshfs mounts via NFS and doesn't accept it.
 # We deliberately KEEP sshfs's default attribute/dir caching (no cache_timeout=0): disabling it
 # slows stat-heavy operations — git status, editor file-watchers, tree-scanning builds — noticeably
-# over the tunnel. The trade-off is a brief window where a just-written edit may not yet be visible
-# to a remote `ssh <alias> 'cd … && build'`; the injected rule tells the agent to simply re-run the
-# command once if a build fails right after an edit.
+# over the tunnel. The trade-off is a brief window where a file changed on the project host (for
+# example by a routed build) may still look stale through the mount.
 case "$OS" in
   Darwin) SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks";;
   *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,idmap=user";;

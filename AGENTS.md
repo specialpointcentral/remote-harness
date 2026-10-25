@@ -107,4 +107,4 @@ git diff --check
 ```
 
 The full remote-server-to-local-project SSHFS flow remains a manual integration test. Never commit
-or push unless the user asks; push only the authorized fork with a GitHub noreply identity.
+or push unless the user asks; push only the authorized fork.

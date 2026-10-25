@@ -56,7 +56,6 @@ def prompt_active(view: str) -> bool:
         or "Action Required" in view
         or "None of the above" in view
         or "to submit answer" in view
-        or "enter to submit answer" in view
     )
 
 
@@ -165,20 +164,19 @@ def main() -> int:
     final_command_seen = False
     last_debug = 0.0
 
+    patterns = [
+        "Question ",
+        "Action Required",
+        "None of the above",
+        "to submit answer",
+        "simple-bootstrap\\.sh",
+        pexpect.TIMEOUT,
+        pexpect.EOF,
+    ]
+    eof_idx = len(patterns) - 1
     deadline = time.time() + args.timeout
     try:
         while time.time() < deadline:
-            patterns = [
-                "Question ",
-                "Action Required",
-                "None of the above",
-                "to submit answer",
-                "enter to submit answer",
-                "simple-bootstrap\\.sh",
-                pexpect.TIMEOUT,
-                pexpect.EOF,
-            ]
-            eof_idx = len(patterns) - 1
             idx = child.expect(patterns, timeout=10)
             before = child.before if isinstance(child.before, str) else ""
             after = child.after if isinstance(child.after, str) else ""
@@ -196,11 +194,7 @@ def main() -> int:
             if idx == eof_idx:
                 break
 
-            if (
-                "Run this" in view
-                or "在你的本地电脑终端运行" in view
-                or "simple-bootstrap.sh" in view
-            ) and "simple-bootstrap.sh" in view and "--launch codex" in view and "--yolo" in view:
+            if "simple-bootstrap.sh" in view and "--launch codex" in view and "--yolo" in view:
                 final_command_seen = True
                 print("[driver] final command observed", flush=True)
                 child.sendcontrol("c")

@@ -444,19 +444,24 @@ prepare_reverse_authorized_key() {
   fi
 
   authkey_lock || { warn "could not lock authorized_keys; not modifying SSH authorization"; return 1; }
+  local _rc=0
+  update_authorized_key_locked || _rc=$?
+  authkey_unlock
+  return "$_rc"
+}
+
+# Body of prepare_reverse_authorized_key, run while holding the authorized_keys lock; its caller
+# releases the lock on every path.
+update_authorized_key_locked() {
   if authorized_key_match user "$_ak_file"; then
-    authkey_unlock
     warn "authorized_keys contains the session key without the forced gateway; refusing unsafe reuse"
     return 1
   fi
 
-  install_project_host_gateway || { authkey_unlock; return 1; }
+  install_project_host_gateway || return 1
 
-  mkdir -p "$AUTHKEY_REF_DIR" 2>/dev/null || { authkey_unlock; return 1; }
-  printf 'pid=%s\nstarted=%s\n' "$$" "$(date 2>/dev/null || true)" > "$AUTHKEY_TOKEN" 2>/dev/null || {
-    authkey_unlock
-    return 1
-  }
+  mkdir -p "$AUTHKEY_REF_DIR" 2>/dev/null || return 1
+  printf 'pid=%s\nstarted=%s\n' "$$" "$(date 2>/dev/null || true)" > "$AUTHKEY_TOKEN" 2>/dev/null || return 1
 
   # Only the ~/.ssh block is managed (reference-counted and removed on exit); the private file goes
   # away with its session directory.
@@ -464,20 +469,17 @@ prepare_reverse_authorized_key() {
 
   if authorized_key_match managed "$_ak_file"; then
     ok "authorized_keys: reusing existing remote-harness temporary authorization"
-    authkey_unlock
     return 0
   fi
 
   if append_managed_authorized_key "$_ak_file"; then
     ok "$_ak_label the forced project-host gateway"
-    authkey_unlock
     return 0
   fi
 
   rm -f "$AUTHKEY_TOKEN" 2>/dev/null || true
   AUTHKEY_TOKEN=""
   AUTHKEY_MANAGED=0
-  authkey_unlock
   warn "could not update $_ak_file"
   return 1
 }
@@ -485,9 +487,17 @@ prepare_reverse_authorized_key() {
 cleanup_reverse_authorized_key() {
   [ -n "${AUTHKEY_TOKEN:-}" ] || return 0
   authkey_lock || { warn "could not lock authorized_keys for cleanup; temporary authorization may remain"; return 1; }
+  local _rc=0
+  release_authorized_key_locked || _rc=$?
+  authkey_unlock
+  return "$_rc"
+}
+
+# Body of cleanup_reverse_authorized_key, run while holding the authorized_keys lock: drop this
+# launch's reference, and the managed block and gateway registration once no reference is left.
+release_authorized_key_locked() {
   rm -f "$AUTHKEY_TOKEN" 2>/dev/null || true
   if [ -d "$AUTHKEY_REF_DIR" ] && find "$AUTHKEY_REF_DIR" -type f -print -quit 2>/dev/null | grep -q .; then
-    authkey_unlock
     return 0
   fi
   rmdir "$AUTHKEY_REF_DIR" 2>/dev/null || true
@@ -496,12 +506,10 @@ cleanup_reverse_authorized_key() {
       ok "authorized_keys: temporary remote-harness authorization removed"
     else
       warn "could not remove temporary remote-harness authorized_keys block"
-      authkey_unlock
       return 1
     fi
   fi
   [ -z "$GATEWAY_SESSION_DIR" ] || rm -rf "$GATEWAY_SESSION_DIR" 2>/dev/null || true
-  authkey_unlock
 }
 
 cleanup() {
@@ -578,7 +586,6 @@ if [ "$APPROVAL" = yolo ]; then
     claude)   EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex)    EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
     opencode) warn "YOLO: opencode permission=allow (set in this session's config only — nothing global)";;
-    *)        warn "YOLO requested but unknown agent '$LAUNCH' — launching without bypass";;
   esac
 fi
 
@@ -753,8 +760,7 @@ chmod 600 "$CFG" 2>/dev/null || true
 
 # -- default box-alias --
 if [ -z "$BOX_ALIAS" ]; then
-  LUSER=$(id -un 2>/dev/null || echo user)
-  BOX_ALIAS="${LUSER}-mac"
+  BOX_ALIAS="${LAPTOP_USER}-mac"
 fi
 
 # == Phase 1 done ==
@@ -762,7 +768,7 @@ if [ "$SETUP_ONLY" = 1 ]; then
   step_end ok
   ok "Phase 1 done (--setup-only)."
   say "  Session config: ${_B}$LOCAL_SSH_CONFIG${_0}"
-  say "  Reconnect: ${_B}ssh -F $(sq "$LOCAL_SSH_CONFIG") -O exit $TARGET 2>/dev/null; ssh -F $(sq "$LOCAL_SSH_CONFIG") $TARGET${_0}"
+  say "  Reconnect: ${_B}ssh -F $(sq "$LOCAL_SSH_CONFIG") $TARGET${_0}"
   exit 0
 fi
 [ -n "$BOX_SSH_CONFIG" ] || {
@@ -806,18 +812,16 @@ step_end ok
 # Phase 2: Reconnect — establish the reverse tunnel automatically
 # ===========================================================================
 step_begin "$(tr2 "Establishing the reverse tunnel" "建立反向隧道")"
-# Kill the session-local master connection to the harness target, if any.
-ssh -O exit "$TARGET" 2>/dev/null || true
 
-remote_port_listening() {
-  local _port="$1"
-  # Portable listener check on the box (ss -> netstat -an [GNU/BSD] -> lsof), matching
-  # check-tunnel.sh; extracts the port from host:PORT or BSD host.PORT and matches exactly.
-  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=3 "$TARGET" \
-    "{ if command -v ss >/dev/null 2>&1; then ss -tlnH 2>/dev/null | awk '{print \$4}';
+# Listening TCP ports on the box, one per line (ss -> netstat -an [GNU/BSD] -> lsof), matching
+# check-tunnel.sh; extracts the port from host:PORT or BSD host.PORT.
+REMOTE_LISTENING_PORTS="{ if command -v ss >/dev/null 2>&1; then ss -tlnH 2>/dev/null | awk '{print \$4}';
        elif command -v netstat >/dev/null 2>&1; then netstat -an 2>/dev/null | awk '/^tcp/ && /LISTEN/{print \$4}';
        elif command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print \$9}';
-       fi; } | sed -E 's/.*[:.]([0-9]+)\$/\1/' | grep -qx $(sq "$_port")" 2>/dev/null
+       fi; } | sed -E 's/.*[:.]([0-9]+)\$/\1/'"
+remote_port_listening() {
+  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=3 "$TARGET" \
+    "$REMOTE_LISTENING_PORTS | grep -qx $(sq "$1")" 2>/dev/null
 }
 tunnel_alias_up() {
   local _port="$1" out laptop_host laptop_user local_host local_user
@@ -830,8 +834,8 @@ tunnel_alias_up() {
     fi
   " 2>/dev/null || true)
   if printf '%s\n' "$out" | grep -q '^SSH=up'; then
-    laptop_host=$(printf '%s\n' "$out" | awk -F= '/^LAPTOP_HOSTNAME=/{print $2; exit}')
-    laptop_user=$(printf '%s\n' "$out" | awk -F= '/^LAPTOP_USER=/{print $2; exit}')
+    laptop_host=$(printf '%s\n' "$out" | kv_value LAPTOP_HOSTNAME)
+    laptop_user=$(printf '%s\n' "$out" | kv_value LAPTOP_USER)
   elif printf '%s' "$out" | grep -q '^RH_OK'; then
     laptop_host=$(printf '%s' "$out" | awk '{print $2}')
     laptop_user=$(printf '%s' "$out" | awk '{print $3}')
@@ -845,66 +849,57 @@ tunnel_alias_up() {
   return 0
 }
 
+# First port from $1 through $1+200 that is not listening on the box (one round trip).
 find_next_remote_port() {
-  local _start="$1" _port _end
-  _port="$_start"
-  _end=$((_start + 200))
+  local _end=$(($1 + 200))
   [ "$_end" -le 65535 ] || _end=65535
-  while [ "$_port" -le "$_end" ]; do
-    if ! remote_port_listening "$_port"; then
-      printf '%s' "$_port"
-      return 0
-    fi
-    _port=$((_port + 1))
-  done
-  return 1
+  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
+    "$REMOTE_LISTENING_PORTS" 2>/dev/null \
+    | awk -v s="$1" -v e="$_end" '{ used[$1] = 1 } END { for (p = s; p <= e; p++) if (!(p in used)) { print p; exit 0 } exit 1 }'
 }
 
-remote_box_alias_info() {
-  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+# Point the box alias at port $1 with this laptop's login user, keeping the identity it already
+# resolves to, in one round trip. With --if-user-differs it prints UNCHANGED=1 and changes nothing
+# when the alias already logs in as LAPTOP_USER.
+set_box_alias() {  # port [--if-user-differs]
+  local _only=0
+  [ "${2:-}" = --if-user-differs ] && _only=1
+  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" "
+    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    [ -x \"\$rh/scripts/setup-tunnel.sh\" ] || { printf 'ERROR=missing setup-tunnel.sh\n'; exit 2; }
     cfg=\$(ssh $(box_ssh_f_arg) -G $(sq "$BOX_ALIAS") 2>/dev/null || true)
     user=\$(printf '%s\n' \"\$cfg\" | awk 'tolower(\$1)==\"user\"{print \$2; exit}')
+    [ $_only = 0 ] || [ \"\$user\" != $(sq "$LAPTOP_USER") ] || { printf 'UNCHANGED=1\n'; exit 0; }
     identity=\$(printf '%s\n' \"\$cfg\" | awk 'tolower(\$1)==\"identityfile\"{print \$2; exit}')
     case \"\$identity\" in \"~/\"*) identity=\"\$HOME/\${identity#~/}\";; esac
-    [ -f \"\$identity\" ] || identity=\"\"
-    printf 'USER=%s\nIDENTITY=%s\n' \"\$user\" \"\$identity\"
-  " 2>/dev/null || true
+    set --
+    [ ! -f \"\$identity\" ] || set -- --identity \"\$identity\"
+    \"\$rh/scripts/setup-tunnel.sh\"$(box_setup_config_arg) --alias $(sq "$BOX_ALIAS") --port $(sq "$1") --user $(sq "$LAPTOP_USER") \"\$@\"
+  " 2>&1
 }
 
 update_box_alias_port() {
-  local _port="$1" info identity identity_arg="" out
-  info=$(remote_box_alias_info)
-  identity=$(printf '%s\n' "$info" | awk -F= '/^IDENTITY=/{print $2; exit}')
-  [ -n "$identity" ] && identity_arg=" --identity $(sq "$identity")"
-  out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" "
-    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    [ -x \"\$rh/scripts/setup-tunnel.sh\" ] || { printf 'ERROR=missing setup-tunnel.sh\n'; exit 2; }
-    \"\$rh/scripts/setup-tunnel.sh\"$(box_setup_config_arg) --alias $(sq "$BOX_ALIAS") --port $(sq "$_port") --user $(sq "$LAPTOP_USER")$identity_arg
-  " 2>&1) || {
-    err "Could not update remote alias '$BOX_ALIAS' to port $_port."
+  local out
+  out=$(set_box_alias "$1") || {
+    err "Could not update remote alias '$BOX_ALIAS' to port $1."
     printf '%s\n' "$out" >&2
     return 1
   }
-  ok "box alias: updated '$BOX_ALIAS' to remote port $_port (login user $LAPTOP_USER)"
+  ok "box alias: updated '$BOX_ALIAS' to remote port $1 (login user $LAPTOP_USER)"
 }
 
 # Force the box alias's login user to THIS laptop's `id -un` (see LAPTOP_USER note above), overriding
 # any box-side guess. No-op when already correct. Non-fatal: the tunnel_alias_up/switch fallback still
 # guards a stale mismatch, so we never abort here.
 ensure_box_alias_user() {
-  local info cur identity identity_arg="" out
-  info=$(remote_box_alias_info)
-  cur=$(printf '%s\n' "$info" | awk -F= '/^USER=/{print $2; exit}')
-  [ "$cur" = "$LAPTOP_USER" ] && return 0
-  identity=$(printf '%s\n' "$info" | awk -F= '/^IDENTITY=/{print $2; exit}')
-  [ -n "$identity" ] && identity_arg=" --identity $(sq "$identity")"
-  out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" "
-    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    [ -x \"\$rh/scripts/setup-tunnel.sh\" ] || { printf 'ERROR=missing setup-tunnel.sh\n'; exit 2; }
-    \"\$rh/scripts/setup-tunnel.sh\"$(box_setup_config_arg) --alias $(sq "$BOX_ALIAS") --port $(sq "$PORT") --user $(sq "$LAPTOP_USER")$identity_arg
-  " 2>&1) \
-    && ok "box alias: login user set to '$LAPTOP_USER' (this laptop account)" \
-    || { warn "could not set box alias '$BOX_ALIAS' login user to '$LAPTOP_USER'"; printf '%s\n' "$out" >&2; }
+  local out
+  if out=$(set_box_alias "$PORT" --if-user-differs); then
+    [ "$(printf '%s\n' "$out" | kv_value UNCHANGED)" = 1 ] \
+      || ok "box alias: login user set to '$LAPTOP_USER' (this laptop account)"
+  else
+    warn "could not set box alias '$BOX_ALIAS' login user to '$LAPTOP_USER'"
+    printf '%s\n' "$out" >&2
+  fi
   return 0
 }
 
@@ -1063,32 +1058,29 @@ step_begin "$(tr2 "Mounting the project on the remote (sshfs)" "在远端挂载�
 # Determine the remote mountpoint:
 #  - explicit --remote-mountpoint (e.g. the dir you invoked /remote-harness from) wins;
 #  - otherwise default to <remote $RH_HOME>/mounts/<project-name>.
-if [ -n "$REMOTE_MP" ]; then
-  REMOTE_MOUNTPOINT="$REMOTE_MP"
-else
-  REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" \
-    "rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"; printf '%s/mounts/%s' \"\$rh\" $(sq "$PROJ_NAME")" 2>/dev/null || true)
-  [ -z "$REMOTE_MOUNTPOINT" ] && { warn "could not resolve remote RH_HOME; please pass --remote-mountpoint <empty-dir>"; exit 1; }
-fi
+#    The mount call itself resolves that default, so it costs no extra round trip.
+REMOTE_MOUNTPOINT="$REMOTE_MP"
 
 # Mount, with interactive retry: a recoverable failure (sshfs missing / target not empty) loops
 # back instead of exiting, so the tunnel we just established is NOT thrown away.
 while :; do
-  say "  Remote mountpoint: ${_B}${REMOTE_MOUNTPOINT}${_0}"
+  [ -z "$REMOTE_MOUNTPOINT" ] || say "  Remote mountpoint: ${_B}${REMOTE_MOUNTPOINT}${_0}"
   MOUNT_OUT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" "
-    mkdir -p $(sq "$REMOTE_MOUNTPOINT")
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    mp=$(sq "$REMOTE_MOUNTPOINT")
+    [ -n \"\$mp\" ] || mp=\"\$rh/mounts/\"$(sq "$PROJ_NAME")
+    mkdir -p \"\$mp\"
     \"\$rh/scripts/mount-project.sh\" \
       --alias $(sq "$BOX_ALIAS") \
       --remote-path $(sq "$PROJ_DIR") \
-      --mountpoint $(sq "$REMOTE_MOUNTPOINT")$(box_check_config_arg) \
+      --mountpoint \"\$mp\"$(box_check_config_arg) \
       --session-id $(sq "$RULE_SESSION_ID")
   " 2>/dev/null || true)
-  STATUS=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^STATUS=/{print $2; exit}')
+  STATUS=$(printf '%s\n' "$MOUNT_OUT" | kv_value STATUS)
+  _mounted_path=$(printf '%s\n' "$MOUNT_OUT" | kv_value MOUNTPOINT)
+  [ -z "$_mounted_path" ] || REMOTE_MOUNTPOINT="$_mounted_path"
   case "$STATUS" in
     mounted|already-mounted)
-      _mounted_path=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^MOUNTPOINT=/{print $2; exit}')
-      [ -z "$_mounted_path" ] || REMOTE_MOUNTPOINT="$_mounted_path"
       _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
       REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
       ok "Mounted ${PROJ_DIR} → remote:${REMOTE_MOUNTPOINT}"
@@ -1096,7 +1088,7 @@ while :; do
       break
       ;;
     need-sshfs)
-      INSTALL_CMD=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^INSTALL_CMD=/{print $2; exit}')
+      INSTALL_CMD=$(printf '%s\n' "$MOUNT_OUT" | kv_value INSTALL_CMD)
       warn "sshfs not installed on the remote box."
       say "  On the remote box, run: ${_B}${INSTALL_CMD:-install sshfs via your package manager}${_0}"
       ask "  Installed sshfs on the box — retry the mount?" && continue
@@ -1116,7 +1108,7 @@ while :; do
       continue
       ;;
     *)
-      ERR=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^ERROR=/{print $2; exit}')
+      ERR=$(printf '%s\n' "$MOUNT_OUT" | kv_value ERROR)
       err "Mount failed (STATUS=${STATUS:-unknown}): ${ERR:-(no error detail)}"
       say "  Check: is the tunnel active? Is '${BOX_ALIAS}' the right alias on the remote?"
       if [ "$LOCAL_SSHD_MODE" = user ]; then
@@ -1130,7 +1122,7 @@ while :; do
   esac
 done
 
-if [ "$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^KILL_USER_PROCESSES=/{print $2; exit}')" = 1 ]; then
+if [ "$(printf '%s\n' "$MOUNT_OUT" | kv_value KILL_USER_PROCESSES)" = 1 ]; then
   warn "the remote box has systemd-logind KillUserProcesses=yes: ending an SSH login kills the mount,"
   say  "    the agent, and remote-harness's cleanup watcher. Ask the server admin to set"
   say  "    KillUserProcesses=no (see docs/ssh-sshfs-long-lived-connections.md)."
@@ -1138,14 +1130,14 @@ fi
 
 # AGENTS.md-only project: only matters for Claude Code (reads CLAUDE.md, not AGENTS.md); codex and
 # opencode read AGENTS.md natively. remote-harness does not create repo guidance files implicitly.
-AGENTS_ONLY=$(printf '%s\n' "$MOUNT_OUT" | awk -F= '/^AGENTS_MD_ONLY=/{print $2; exit}')
+AGENTS_ONLY=$(printf '%s\n' "$MOUNT_OUT" | kv_value AGENTS_MD_ONLY)
 if [ "$AGENTS_ONLY" = 1 ] && [ "$LAUNCH_BASE" = claude ]; then
   say ""
   warn "this project has AGENTS.md but no CLAUDE.md; Claude Code may not read that guidance."
 fi
 
 # ===========================================================================
-# Phase 5: Launch Claude Code on the remote
+# Phase 5: Launch the agent on the remote
 # ===========================================================================
 # Local resume marker (the epoch of the drop) for this remote, remote mountpoint and agent. ssh exits
 # 255 when the interactive connection drops; the next launch then offers to continue even if the
@@ -1158,9 +1150,8 @@ LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%
 # unaffected) and prints how to launch so ONLY this agent reads it — a session flag for claude, or
 # an env/config prefix (Codex developer_instructions / OPENCODE_CONFIG) for codex/opencode. For opencode, YOLO's
 # permission=allow is folded into that per-session config too.
-# The box-side session dir is keyed by mountpoint AND this launch's unique session dir name, so a
+# The box-side session dir is keyed by mountpoint AND this launch's RULE_SESSION_ID, so a
 # relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
-RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
@@ -1174,25 +1165,25 @@ rh_rc=0
 rh_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
      "if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 120 $inject_shell; else exec $inject_shell; fi" \
      2>"$inject_err") || rh_rc=$?
-rh_status=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_STATUS=//p' | head -1)
+rh_status=$(printf '%s\n' "$rh_out" | kv_value RH_STATUS)
 [ "$rh_rc" = 0 ] || rh_status=ERROR
 if [ "$rh_status" = INJECTED ]; then
   RULE_INJECTED=1
-  rh_env=$(printf  '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_ENV=//p'   | head -1)
-  rh_flags=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_FLAGS=//p' | head -1)
+  rh_env=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_ENV)
+  rh_flags=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_FLAGS)
   if [ "$APPROVAL" = auto ]; then
-    if [ "$(printf '%s\n' "$rh_out" | sed -n 's/^RH_APPROVAL=//p' | head -1)" = auto ]; then
+    if [ "$(printf '%s\n' "$rh_out" | kv_value RH_APPROVAL)" = auto ]; then
       ok "$(tr2 "Approvals: ${LAUNCH_BASE} automatic review (auto mode)" "审批模式：${LAUNCH_BASE} 自动审核（auto 模式）")"
     else
       warn "$(tr2 "This remote ${LAUNCH_BASE} has no auto approval mode; it will ask for approvals as usual." \
                   "远端 ${LAUNCH_BASE} 不支持 auto 审批模式，将照常逐项请求审批。")"
     fi
   fi
-  rh_ready=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_READY_FILE=//p' | head -1)
+  rh_ready=$(printf '%s\n' "$rh_out" | kv_value RH_READY_FILE)
   # The session launcher records the agent pid for the box-side watcher that cleans up after a
   # dropped connection; it wraps only this final launch, never the opencode readiness probe below.
-  rh_prefix=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_PREFIX=//p' | head -1)
-  REMOTE_SESSION_DIR=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_SESSION_DIR=//p' | head -1)
+  rh_prefix=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_PREFIX)
+  REMOTE_SESSION_DIR=$(printf '%s\n' "$rh_out" | kv_value RH_SESSION_DIR)
   if [ -z "$REMOTE_SESSION_DIR" ]; then
     # Compatibility with older injectors: the directory still has the same mount/session key.
     _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
@@ -1200,8 +1191,8 @@ if [ "$rh_status" = INJECTED ]; then
   fi
   # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
   # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
-  rh_resume=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_AVAILABLE=//p' | head -1)
-  rh_resume_args=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_RESUME_ARGS=//p' | head -1)
+  rh_resume=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_AVAILABLE)
+  rh_resume_args=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_ARGS)
   # The remote watcher cannot record a disconnect that the agent outran by exiting on SIGHUP; the
   # local marker from an interactive ssh that lost its connection covers that case.
   if [ -f "$LOCAL_RESUME_MARKER" ]; then

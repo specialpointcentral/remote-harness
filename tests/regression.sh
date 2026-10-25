@@ -460,17 +460,22 @@ PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$r
 assert_grep "$router_tmp/mux-ssh.args" "-o ControlMaster=no" "overlong control path disables multiplexing"
 
 # --- watched Bash commands: channel EOF stops the whole command tree on the project host ---------
+wait_until() {  # tenths-of-a-second command...: poll until the command succeeds
+  _wu_n=$1; shift
+  while ! "$@"; do
+    [ "$_wu_n" -gt 0 ] || return 1
+    _wu_n=$((_wu_n - 1)); sleep 0.1
+  done
+}
 tree_alive() { ps -A -o args= 2>/dev/null | grep -Eqx "sleep ($1)"; }
+tree_gone() { ! tree_alive "$1"; }
 watch_started=$(date +%s)
 { sleep 1; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
   "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'sleep 47 & sleep 48 & wait')" watch \
   >/dev/null 2>&1 || true
 watch_elapsed=$(( $(date +%s) - watch_started ))
 [ "$watch_elapsed" -lt 15 ] || fail "watched command outlived its closed channel (${watch_elapsed}s)"
-sleep 1
-if tree_alive '47|48'; then
-  fail "watched command left child processes running after its channel closed"
-fi
+wait_until 20 tree_gone '47|48' || fail "watched command left child processes running after its channel closed"
 watch_rc=0
 watch_out=$({ sleep 2; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
   "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'printf watched; exit 7')" watch) || watch_rc=$?
@@ -489,6 +494,16 @@ PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$r
   --alias project-host --project-root "$router_tmp/project" --watch \
   --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
 assert_grep "$router_tmp/mux-ssh.args" "$(b64 true) watch" "client requests watch mode"
+assert_grep "$router_tmp/mux-ssh.args" "remote-harness-exec $(b64 "$router_tmp/project") " "client encodes the project root"
+PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
+  --alias project-host --project-root "$router_tmp/project" --project-root-b64 "$(b64 "$router_tmp/project")" \
+  --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)"
+assert_grep "$router_tmp/mux-ssh.args" "remote-harness-exec $(b64 "$router_tmp/project") " "client sends a pre-encoded project root"
+if PATH="$mux_bin:$PATH" sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/ssh_config" \
+    --alias project-host --project-root "$router_tmp/project" --project-root-b64 'x y' \
+    --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 true)" >/dev/null 2>&1; then
+  fail "client accepted a malformed pre-encoded project root"
+fi
 
 # A killed guard (cancelled tool call, crashed agent) closes the channel and stops the command.
 PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- \
@@ -496,16 +511,10 @@ PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- \
   --alias project-host --project-root "$tool_proj" --watch \
   --cwd-relative-b64 "$(b64 .)" --command-b64 "$(b64 'sleep 49')" >/dev/null 2>&1 &
 guard_pid=$!
-guard_i=0
-until tree_alive 49 || [ "$guard_i" -ge 20 ]; do sleep 0.5; guard_i=$((guard_i + 1)); done
-tree_alive 49 || fail "guarded command never started"
+wait_until 100 tree_alive 49 || fail "guarded command never started"
 kill -KILL "$guard_pid" 2>/dev/null || true
 wait "$guard_pid" 2>/dev/null || true
-guard_i=0
-while tree_alive 49 && [ "$guard_i" -lt 20 ]; do sleep 0.5; guard_i=$((guard_i + 1)); done
-if tree_alive 49; then
-  fail "project-host command kept running after its guard was killed"
-fi
+wait_until 100 tree_gone 49 || fail "project-host command kept running after its guard was killed"
 guard_rc=0
 PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- sh -c 'exit 5' || guard_rc=$?
 assert_eq "channel guard returns the command status" "$guard_rc" "5"
@@ -600,10 +609,8 @@ hb_inject() {  # on|off session-id
     RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" off claude "$hb_mount" "$2" >/dev/null 2>&1 || true
   fi
 }
-wait_gone() {  # pid [tenths of a second]
-  for _ in $(seq 1 "${2:-200}"); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
-  return 1
-}
+pid_gone() { ! kill -0 "$1" 2>/dev/null; }
+wait_gone() { wait_until "${2:-200}" pid_gone "$1"; }  # pid [tenths of a second]
 hb_inject on hb.1 > "$tmp/inject-hb1.out"
 assert_grep "$tmp/inject-hb1.out" "RH_RESUME_AVAILABLE=" "inject reports resume availability"
 assert_grep "$tmp/inject-hb1.out" "RH_RESUME_ARGS=--continue" "inject reports how claude continues"
@@ -928,14 +935,20 @@ cat > "$tmp/bin/sshd" <<'EOS'
 exit 0
 EOS
 chmod +x "$tmp/bin/sudo" "$tmp/bin/systemctl" "$tmp/bin/service" "$tmp/bin/sshd"
+TEST_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test"
+laptop_setup() {  # home args...: laptop-setup.sh with the fake bin PATH, the test key and --yes
+  HOME="$1" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" bash "$ROOT/scripts/laptop-setup.sh" \
+    --pubkey "$TEST_PUBKEY" --box-alias laptop "${@:2}" --yes
+}
+reverse_session() {  # home port project args...: a full codex reverse session against the fake box
+  laptop_setup "$1" --host example.com --port "$2" --via "ssh user@example.com" \
+    --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config --remote-mountpoint /tmp/rh-remote \
+    --project-dir "$3" --launch codex "${@:4}"
+}
 setup_home="$tmp/setup-home"
 mkdir -p "$setup_home"
-HOME="$setup_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32022 \
-    --via "ssh -J jumpbox -i /tmp/key user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --setup-only --yes > "$tmp/setup-only.out"
+laptop_setup "$setup_home" --host example.com --port 32022 \
+  --via "ssh -J jumpbox -i /tmp/key user@example.com" --setup-only > "$tmp/setup-only.out"
 setup_cfg="$(find "$setup_home/.remote-harness/.sessions" -name ssh_config -print -quit 2>/dev/null)"
 [ -n "$setup_cfg" ] || fail "setup-only session ssh config missing"
 assert_grep "$setup_cfg" "Host example.com-remote-harness" "setup-only managed alias"
@@ -978,11 +991,7 @@ Host mybox
     ExitOnForwardFailure yes
     TCPKeepAlive yes
 EOF
-HOME="$alias_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host mybox --port 22022 --via "mybox" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --setup-only --yes > "$tmp/setup-alias.out"
+laptop_setup "$alias_home" --host mybox --port 22022 --via "mybox" --setup-only > "$tmp/setup-alias.out"
 alias_cfg="$(find "$alias_home/.remote-harness/.sessions" -name ssh_config -print -quit 2>/dev/null)"
 [ -n "$alias_cfg" ] || fail "alias setup-only session ssh config missing"
 assert_grep "$alias_cfg" "Host mybox-remote-harness" "dedicated harness alias"
@@ -995,9 +1004,7 @@ refute_grep "$alias_home/.ssh/config" "mybox-remote-harness" "laptop-setup wrote
 
 iap_home="$tmp/iap-home"; mkdir -p "$iap_home/.ssh"; : > "$iap_home/.ssh/google_compute_engine"
 printf 'Host iapbox\n    HostName iapbox\n' > "$iap_home/.ssh/config"
-HOME="$iap_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" bash "$ROOT/scripts/laptop-setup.sh" \
-  --host iapbox --port 22023 --via iapbox --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-  --box-alias laptop --setup-only --yes > "$tmp/setup-iap.out" 2>&1
+laptop_setup "$iap_home" --host iapbox --port 22023 --via iapbox --setup-only > "$tmp/setup-iap.out" 2>&1
 iap_cfg="$(find "$iap_home/.remote-harness/.sessions" -name ssh_config -print -quit)"
 assert_grep "$iap_cfg" "    ProxyCommand gcloud compute start-iap-tunnel iapbox %p --listen-on-stdin --zone=zone-a --project=demo" "session alias keeps the user's ProxyCommand"
 assert_grep "$iap_cfg" "    IdentitiesOnly yes" "session alias keeps IdentitiesOnly"
@@ -1033,11 +1040,8 @@ HOME="$install_home" CODEX_HOME="$codex_home" RH_HOME="$rh_install" \
 [ -f "$codex_home/skills/remote-harness/SKILL.md" ] || fail "copy codex install missing SKILL.md"
 [ ! -L "$codex_home/skills/remote-harness/SKILL.md" ] || fail "copy codex install left SKILL.md symlink"
 
-if HOME="$tmp/launch-home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32022 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --launch "codex --flag" --setup-only --yes \
+if laptop_setup "$tmp/launch-home" --host example.com --port 32022 --via "ssh user@example.com" \
+    --launch "codex --flag" --setup-only \
     >"$tmp/laptop-bad-launch.out" 2>"$tmp/laptop-bad-launch.err"; then
   fail "laptop-setup accepted extra --launch words"
 fi
@@ -1116,12 +1120,18 @@ assert_grep "$tmp/simple-cache.env" "LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remot
 assert_grep "$tmp/simple-cache.env" "LAST_LAUNCH=codex" "simple cache launch"
 assert_grep "$tmp/simple-cache.env" "LAST_APPROVAL=auto" "simple cache approval"
 # A remembered mountpoint is the default only for the project it was chosen for.
-simple_rerun() {  # $1 = project dir; prints the handed-off arguments
+simple_run() {  # cache args...: rerun the wizard under --yes; the handoff lands in simple-laptop.args
   : > "$tmp/simple-laptop.args"
-  HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh" RH_SIMPLE_CACHE="$tmp/simple-cache.env" \
+  HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh" RH_SIMPLE_CACHE="$1" \
     SIMPLE_LAPTOP_ARGS="$tmp/simple-laptop.args" bash "$simple_dir/simple-laptop-setup.sh" \
-    --via "ssh -p 2222 bytepilot@42.121.2.119" --namespace tester --project-dir "$1" --launch codex --yes \
+    --via "ssh -p 2222 bytepilot@42.121.2.119" --namespace tester --launch codex --yes "${@:2}" \
     </dev/null >/dev/null 2>&1 || true
+}
+handoff_after() {  # flag: the value the wizard handed to laptop-setup.sh after that flag
+  awk -F= -v f="$1" 'prev {print substr($0, index($0, "=") + 1); exit} $2==f {prev=1}' "$tmp/simple-laptop.args"
+}
+simple_rerun() {  # $1 = project dir; prints the handed-off arguments
+  simple_run "$tmp/simple-cache.env" --project-dir "$1"
   cat "$tmp/simple-laptop.args"
 }
 assert_grep <(simple_rerun "$simple_project") "=/tmp/rh-simple-remote" "same project reuses its remembered mountpoint"
@@ -1133,27 +1143,20 @@ assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_projec
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ -z "$APPROVAL" ]; then' "explicit approval has a no-reprompt branch"
 # An explicit local sshd choice is handed off last and remembered for later runs.
 simple_sshd_run() {  # extra args...; prints the value handed off after --local-sshd
-  : > "$tmp/simple-laptop.args"
-  HOME="$tmp/simple-home" PATH="$tmp/bin:$PATH" RH_COMMON="$simple_dir/_common.sh" RH_SIMPLE_CACHE="$tmp/simple-sshd-cache.env" \
-    SIMPLE_LAPTOP_ARGS="$tmp/simple-laptop.args" bash "$simple_dir/simple-laptop-setup.sh" \
-    --via "ssh -p 2222 bytepilot@42.121.2.119" --namespace tester --project-dir "$simple_project" --launch codex --yes "$@" \
-    </dev/null >/dev/null 2>&1 || true
-  awk -F= 'prev {print substr($0, index($0, "=") + 1); exit} $2=="--local-sshd" {prev=1}' "$tmp/simple-laptop.args"
+  simple_run "$tmp/simple-sshd-cache.env" --project-dir "$simple_project" "$@"
+  handoff_after --local-sshd
 }
 assert_eq "explicit user-mode sshd handed off" "$(simple_sshd_run --local-sshd user)" "user"
 assert_grep "$tmp/simple-sshd-cache.env" "LAST_LOCAL_SSHD=user" "explicit local sshd choice remembered"
 assert_eq "remembered user-mode sshd reused" "$(simple_sshd_run)" "user"
 assert_eq "RH_LOCAL_SSHD overrides the remembered choice" "$(RH_LOCAL_SSHD=system simple_sshd_run)" "system"
 # An explicit approval mode is handed off unchanged and remembered as the next default.
-simple_approval() {  # prints the value handed off after --approval
-  awk -F= 'prev {print substr($0, index($0, "=") + 1); exit} $2=="--approval" {prev=1}' "$tmp/simple-laptop.args"
-}
 simple_sshd_run --yolo >/dev/null
-assert_eq "explicit yolo handed off" "$(simple_approval)" "yolo"
+assert_eq "explicit yolo handed off" "$(handoff_after --approval)" "yolo"
 simple_sshd_run --approval normal >/dev/null
-assert_eq "explicit normal approval handed off" "$(simple_approval)" "normal"
+assert_eq "explicit normal approval handed off" "$(handoff_after --approval)" "normal"
 simple_sshd_run >/dev/null
-assert_eq "remembered approval mode reused" "$(simple_approval)" "normal"
+assert_eq "remembered approval mode reused" "$(handoff_after --approval)" "normal"
 
 if bash "$ROOT/scripts/simple-local-setup.sh" --launch codex \
     >"$tmp/simple-local.out" 2>"$tmp/simple-local.err"; then
@@ -1174,7 +1177,6 @@ printf 'REVERSE_ARGS=%s\n' "$*" > "${DISPATCH_MARKER:?}"
 EOS
 chmod +x "$dispatch_dir/simple-dispatch.sh" "$dispatch_dir/simple-local-setup.sh" "$dispatch_dir/simple-laptop-setup.sh"
 if HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
-  RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-forward.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --mode "本地开发远程项目" --launch codex --yolo \
     >"$tmp/dispatch-forward.stdout" 2>"$tmp/dispatch-forward.stderr"; then
@@ -1183,17 +1185,22 @@ fi
 assert_grep "$tmp/dispatch-forward.stderr" "remote-only" "dispatch rejects local-agent forward mode"
 [ ! -e "$tmp/dispatch-forward.out" ] || fail "forward dispatcher launched a local-agent helper"
 HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
-  RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-cached.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --launch codex --yolo
-assert_grep "$tmp/dispatch-cached.out" "REVERSE_ARGS=--launch codex" "dispatch ignores cached forward mode"
+assert_grep "$tmp/dispatch-cached.out" "REVERSE_ARGS=--launch codex" "dispatch defaults to reverse"
 assert_grep "$tmp/dispatch-cached.out" "--approval yolo" "dispatch passes --yolo on as the yolo approval"
+# A flag without its value is a usage error, also after _common.sh is sourced.
+na_rc=0
+RH_COMMON="$dispatch_dir/_common.sh" bash "$dispatch_dir/simple-dispatch.sh" --launch >/dev/null 2>&1 || na_rc=$?
+assert_eq "a flag without a value stops the dispatcher" "$na_rc" 2
+assert_eq "kv_value returns the first value" \
+  "$(bash -c '. "$1"; printf "ERROR=x\nERROR=a=b\n" | kv_value ERROR' _ "$ROOT/scripts/_common.sh")" "x"
+assert_eq "kv_value keeps '=' inside a value" \
+  "$(bash -c '. "$1"; printf "ERROR=a=b\n" | kv_value ERROR' _ "$ROOT/scripts/_common.sh")" "a=b"
 HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
-  RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-reverse.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --mode "远程开发本地" --launch codex --source-via sourcebox
 assert_grep "$tmp/dispatch-reverse.out" "REVERSE_ARGS=--launch codex --via sourcebox" "dispatch passes source via only to reverse"
-assert_grep "$tmp/simple-mode-cache.env" "LAST_MODE=reverse" "dispatch caches reverse mode"
 refute_grep "$ROOT/scripts/simple-dispatch.sh" 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "remote-only dispatcher still contains a local-agent launch path"
 
 bash "$ROOT/tests/bootstrap.sh"
@@ -1227,6 +1234,14 @@ assert_grep "$ROOT/AGENTS.cn.md" "紧凑但可复制" "Chinese agents docs carry
 assert_grep "$ROOT/AGENTS.cn.md" "第 1/2 字段是本地客户端数据" "Chinese agents docs protect local/client ssh metadata"
 assert_grep "$ROOT/AGENTS.cn.md" "不得再二次询问" "Chinese agents docs forbid yolo reprompt"
 assert_grep "$ROOT/scripts/inject-rule.sh" "Safe local work is file-oriented" "inject rule allows local file work"
+# The tool verb's allowlist and argument charset are checked in three places on purpose (gateway, both
+# dispatcher sides); the copies must stay identical.
+for tool_check in 'git|rg) ;; *) fail "unsupported project tool"' \
+    '""|*[!A-Za-z0-9+/=,]*) fail "invalid tool argument encoding"'; do
+  assert_eq "gateway tool check: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/project-host-gateway.sh")" 1
+  assert_eq "dispatcher tool checks: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/run-on-project-host.sh")" 2
+done
+assert_grep "$ROOT/scripts/project-host-tool.py" 'choices=("git", "rg")' "tool shim allows the same tools"
 
 install_home="$tmp/install-home"
 mkdir -p "$install_home"
@@ -1276,12 +1291,12 @@ for arg in "$@"; do
 done
 case "$remote_cmd" in
   *'check-tunnel.sh'*) printf 'SSH=up\nLAPTOP_HOSTNAME=other-laptop\nLAPTOP_USER=other-user\n'; exit 0;;
-  *'ssh -G'*) printf 'USER=chenjh\nIDENTITY=\n'; exit 0;;
   *'setup-tunnel.sh'*) printf '%s\n' "$remote_cmd" > "${SETUP_TUNNEL_LOG:?}"; exit 0;;
   *"grep -qx '32026'"*) exit 0;;
   *"grep -qx '32027'"*)
     [ "$(cat "${TUNNEL_STATE:?}" 2>/dev/null || true)" = open ] && exit 0 || exit 1
     ;;
+  *'ss -tlnH'*) printf '32026\n'; exit 0;;  # the bare port list find_next_remote_port scans
   *'mount-project.sh'*) printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
   *'inject-rule.sh'*) printf 'RH_STATUS=ERROR\n'; exit 0;;
 esac
@@ -1294,14 +1309,8 @@ conflict_state="$tmp/tunnel-conflict.state"
 conflict_setup_log="$tmp/tunnel-conflict.setup.log"
 conflict_ssh_log="$tmp/tunnel-conflict.ssh.log"
 mkdir -p "$conflict_home" "$conflict_project"
-if HOME="$conflict_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" \
-  TUNNEL_STATE="$conflict_state" SETUP_TUNNEL_LOG="$conflict_setup_log" SSH_LOG="$conflict_ssh_log" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32026 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-    --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$conflict_project" --launch codex --yes >"$tmp/tunnel-conflict.out" 2>"$tmp/tunnel-conflict.err"; then
+if TUNNEL_STATE="$conflict_state" SETUP_TUNNEL_LOG="$conflict_setup_log" SSH_LOG="$conflict_ssh_log" \
+  reverse_session "$conflict_home" 32026 "$conflict_project" >"$tmp/tunnel-conflict.out" 2>"$tmp/tunnel-conflict.err"; then
   fail "laptop-setup continued after strict rule injection failed"
 fi
 assert_grep "$tmp/tunnel-conflict.err" "refusing to launch" "laptop setup fails closed"
@@ -1393,13 +1402,7 @@ mkdir -p "$launch_dir/.git/refs/heads"
 printf 'ref: refs/heads/main\n' > "$launch_dir/.git/HEAD"
 printf '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n' > "$launch_dir/.git/config"
 project_launch() {  # output file; the caller's environment is passed through
-  HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" LAUNCH_DIR="$launch_dir" \
-    bash "$ROOT/scripts/laptop-setup.sh" \
-      --host example.com --port 32023 --via "ssh user@example.com" \
-      --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-      --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-      --remote-mountpoint /tmp/rh-remote \
-      --project-dir "$valid_project" --launch codex --yes > "$1"
+  LAUNCH_DIR="$launch_dir" reverse_session "$proj_home" 32023 "$valid_project" > "$1"
 }
 SSH_LOG="$ssh_log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" project_launch "$tmp/project-valid.out"
 assert_grep "$tmp/project-valid.out" "authorized_keys: temporarily authorized" "reverse authkey added"
@@ -1567,7 +1570,7 @@ if user_sshd_bin >/dev/null && [ -n "${HOME:-}" ] && user_home=$(mktemp -d "$HOM
   python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); print(s.getsockname()[1], flush=True); time.sleep(60)' \
     > "$user_home/busy" &
   busy_pid=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$user_home/busy" ] && break; sleep 0.2; done
+  wait_until 20 test -s "$user_home/busy" || true
   eval "$(declare -f user_sshd_pick_port | sed '1s/user_sshd_pick_port/real_user_sshd_pick_port/')"
   user_sshd_pick_port() {  # the first pick loses the race
     if [ -e "$user_home/raced" ]; then real_user_sshd_pick_port; else : > "$user_home/raced"; cat "$user_home/busy"; fi
@@ -1591,13 +1594,7 @@ preauth_home="$tmp/preauth-home"
 preauth_project="$tmp/preauth-project"
 mkdir -p "$preauth_home/.ssh" "$preauth_project"
 printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest existing-user-key\n' > "$preauth_home/.ssh/authorized_keys"
-if HOME="$preauth_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32028 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-    --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$preauth_project" --launch codex --yes \
+if SSH_LOG="$ssh_log" reverse_session "$preauth_home" 32028 "$preauth_project" \
     > "$tmp/project-preauth.out" 2> "$tmp/project-preauth.err"; then
   fail "laptop-setup reused an unrestricted existing session key"
 fi
@@ -1605,22 +1602,12 @@ assert_grep "$tmp/project-preauth.out" "refusing unsafe reuse" "existing unrestr
 assert_eq "existing authorized key not duplicated" "$(grep -F "AAAAC3NzaC1lZDI1NTE5AAAAITest" "$preauth_home/.ssh/authorized_keys" | wc -l | tr -d ' ')" "1"
 refute_grep "$preauth_home/.ssh/authorized_keys" "remote-harness:reverse-auth:" "managed authorized_keys block added despite existing user key"
 
-HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32024 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-    --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$created_project" --launch codex --yes >"$tmp/project-create.out" 2>"$tmp/project-create.err"
+SSH_LOG="$ssh_log" reverse_session "$proj_home" 32024 "$created_project" \
+  >"$tmp/project-create.out" 2>"$tmp/project-create.err"
 [ -d "$created_project" ] || fail "laptop-setup did not create missing project dir under --yes"
 assert_grep "$tmp/project-create.err" "Created $created_project" "project-dir create path"
-if HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" SSH_LOG="$ssh_log" \
-  bash "$ROOT/scripts/laptop-setup.sh" \
-    --host example.com --port 32025 --via "ssh user@example.com" \
-    --pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest remote-harness@test" \
-    --box-alias laptop --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
-    --remote-mountpoint /tmp/rh-remote \
-    --project-dir "$file_project" --launch codex --yes >"$tmp/project-file.out" 2>"$tmp/project-file.err"; then
+if SSH_LOG="$ssh_log" reverse_session "$proj_home" 32025 "$file_project" \
+  >"$tmp/project-file.out" 2>"$tmp/project-file.err"; then
   fail "laptop-setup accepted non-directory project path"
 fi
 assert_grep "$tmp/project-file.err" "No valid project directory selected" "project-dir non-directory abort"
@@ -1681,6 +1668,7 @@ st_port="$(printf '%s\n' "$st_out" | awk -F= '/^PORT=/{print $2}')"
 case "$st_port" in *2) ;; *) fail "setup-tunnel hashed port should end in 2 (got '$st_port')";; esac
 { [ "$st_port" -ge 20002 ] && [ "$st_port" -le 29992 ]; } || fail "setup-tunnel hashed port out of [20002,29992] (got '$st_port')"
 assert_grep "$st_cfg_ns" "Host alice-mac" "namespaced managed alias"
+[ ! -e "$st_home/.remote-harness/.tunnel-pubkey" ] || fail "setup-tunnel copied the session key outside .sessions"
 assert_grep "$st_cfg_ns" "    ControlMaster no" "setup-tunnel disables multiplexing"
 assert_grep "$st_cfg_ns" "/runtime/known_hosts_alice-mac" "setup-tunnel separates mutable SSH runtime"
 [ ! -e "$st_home/.ssh/config" ] || fail "setup-tunnel namespace wrote ~/.ssh/config"
@@ -1776,9 +1764,8 @@ python3 -c 'import sys, time; time.sleep(300)' "$rp_sd/bin/rh-run" &
 rp_leftover=$!
 RH_REAP_POLL=1 RH_REAP_GRACE=1 RH_HOME="$rp_rh" "$rp_sd/bin/rh-session" sleep 1
 assert_grep "$rp_sd/owner.env" "OWNER_PID=" "launcher records the agent pid"
-rp_i=0
-while [ -d "$rp_sd" ] && [ "$rp_i" -lt 30 ]; do sleep 1; rp_i=$((rp_i + 1)); done
-[ ! -d "$rp_sd" ] || fail "watcher did not reap the dead session dir"
+rp_reaped() { [ ! -d "$rp_sd" ] && [ ! -e "$rp_cfg" ]; }  # reap removes the dir, then the config
+wait_until 300 rp_reaped || [ ! -d "$rp_sd" ] || fail "watcher did not reap the dead session dir"
 [ ! -e "$rp_cfg" ] || fail "watcher did not remove the session ssh config"
 [ ! -e "$rp_rh/.sessions/simple.rp1/id_ed25519" ] || fail "watcher did not remove the session private key"
 if kill -0 "$rp_leftover" 2>/dev/null; then
@@ -1876,8 +1863,7 @@ if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then
   RH_PROGRESS_FD=3 RH_SSHFS_IDLE_SECONDS=2 ds_unmount 3>"$tmp/ds-progress" | grep -qx STATUS=unmounted || fail "detached sshfs unmount status"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=unmounted" "unmount reports detach progress"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=sshfs-wait" "unmount reports waiting for a lingering sshfs"
-  sleep 0.5
-  ! kill -0 "$ds_idle" 2>/dev/null || fail "idle detached sshfs kept running"
+  wait_gone "$ds_idle" 20 || fail "idle detached sshfs kept running"
   ds_used=$(ds_fake "$ds_title" 0); (cd "$ds_mp" && exec sleep 30) & ds_holder=$!; sleep 0.5
   RH_SSHFS_IDLE_SECONDS=2 ds_unmount >/dev/null
   kill -0 "$ds_used" 2>/dev/null || fail "detached sshfs was stopped while its mount path was in use"
