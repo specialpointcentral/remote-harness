@@ -106,7 +106,7 @@ $remote-harness 中文，远程开发本地，yolo
 ```
 
 Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yolo`。请求里没说清楚的项，Agent 会先用
-选项问你：远端用哪个 Agent（Claude Code / Codex / opencode）、是否 YOLO、本机 SSH 服务用系统 sshd 还是
+选项问你：远端用哪个 Agent（Claude Code / Codex / opencode）、审批模式（auto / 普通 / YOLO）、本机 SSH 服务用系统 sshd 还是
 [用户态 sshd](#用户态-sshdfreeipa-等主机)（FreeIPA 等主机）。然后返回一段已填好选择、在**本地终端**运行的
 命令，并说明每项怎么改。SSH 目标、项目路径和挂载点只在本地终端里填写，不经过聊天。
 
@@ -317,8 +317,10 @@ remote-harness/
 - 多人共用同一个服务器账号时，simple reverse 默认使用会话别名 `rlocal`，别名和 known_hosts 都放在
   远端会话目录中；不会覆盖共享账号的 `~/.ssh/config`。同一台笔记本的多项目会话仍可复用活动隧道，
   最后一个会话退出时清理。
-- `--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow` 只写进**本次会话**
-  的配置，退出即清。
+- 审批模式默认 **auto**：Claude Code 以 `--permission-mode auto`、Codex 以 `--approve-for-me` 启动，由
+  Agent 自动审核审批请求；远端 CLI 不支持时（以及 opencode）退回普通审批并给出提示。`--approval normal`
+  恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow`
+  只写进**本次会话**的配置，退出即清。
 - Claude/Codex hook、opencode plugin、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
   退出删除会话目录。路由器加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
@@ -428,7 +430,7 @@ $remote-harness English, remote dev local project, yolo
 
 Claude Code / opencode use `/remote-harness English, remote dev local project, yolo`. For anything
 the request leaves open, the agent first asks with options: which remote agent (Claude Code / Codex /
-opencode), YOLO or not, and whether the laptop uses its system sshd or the
+opencode), the approval mode (auto / normal / YOLO), and whether the laptop uses its system sshd or the
 [user-mode sshd](#user-mode-sshd-freeipa-style-hosts) (FreeIPA-style hosts). It then returns a command
 for your **local terminal** with those choices filled in and a note on how to change each one. SSH
 targets, project paths, and mountpoints are entered only in the local terminal, never in chat.
@@ -665,8 +667,11 @@ remote-harness/
   keeps alias/known_hosts state in the remote session directory, so one run does not overwrite the
   shared account's `~/.ssh/config`. Multiple projects from the same laptop can reuse a live tunnel;
   the last session out cleans it up.
-- `--yolo` bypasses approvals and is applied **only when you ask**; opencode's `permission:allow`
-  goes into the **per-session** config only and is gone on exit.
+- The approval mode defaults to **auto**: Claude Code starts with `--permission-mode auto` and Codex
+  with `--approve-for-me`, so the agent reviews approval requests itself; a remote CLI without it (and
+  opencode) falls back to normal approvals with a notice. `--approval normal` restores per-action
+  prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode's
+  `permission:allow` goes into the **per-session** config only and is gone on exit.
 - Claude/Codex hooks, the opencode plugin, runners, and instructions are **session-scoped**. Once
   routing is loaded, handler errors deny the call and SSH failures do not fall back to the original
   command.

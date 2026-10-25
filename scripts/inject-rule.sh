@@ -18,10 +18,13 @@
 #              known_hosts there. It never makes ~/.ssh writable.
 #              The project's own AGENTS.md is still read additively; the mounted repo is never touched.
 #
-#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [yolo:0|1] [ssh_config] [session_id]
+#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id]
+#              approval: 0|normal, 1|yolo, or auto = the agent's automatic approval review when this CLI
+#              supports it (claude --permission-mode auto, codex --approve-for-me), else normal.
 #   inject-rule.sh off <agent> <mountpoint> [session_id]
 #
 # 'on'  prints: RH_STATUS=INJECTED  RH_LAUNCH_ENV=<env prefix>  RH_LAUNCH_FLAGS=<trailing flags>
+#               RH_APPROVAL=<normal|auto|yolo> (the approval mode the flags actually select)
 #               RH_RESUME_AVAILABLE=<reason>,<epoch> when the last session of this mountpoint and
 #               agent ended on a lost connection (offered once; the marker is consumed), and
 #               RH_RESUME_ARGS=<agent arguments that continue the last conversation>
@@ -413,8 +416,9 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
 
 case "${1:-}" in
   on)
-    agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; yolo="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
+    agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; approval="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
     case "$agent" in claude|codex|opencode) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
+    case "$approval" in 1|yolo) yolo=1; approval=yolo;; auto) yolo=0;; *) yolo=0; approval=normal;; esac
     [ -n "$lp" ] && [ -n "$ba" ] || { echo "RH_STATUS=ERROR"; exit 2; }
     [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
     SD="$(session_dir "$mp" "$sid")"
@@ -540,6 +544,13 @@ case "${1:-}" in
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
+        if [ "$approval" = auto ]; then
+          if claude --help 2>/dev/null | grep -q '"auto"'; then
+            flags_out="$flags_out --permission-mode auto"
+          else
+            approval=normal
+          fi
+        fi
         ;;
       opencode)
         # OPENCODE_CONFIG is merged ADDITIVELY on top of the user's global + project configs, so we
@@ -552,6 +563,7 @@ case "${1:-}" in
         opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file") \
           || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
         [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
+        [ "$approval" = yolo ] || approval=normal  # opencode has no automatic approval review
         # JSON-escape session paths: escape \ then " (both legal in Unix paths; rare but correct).
         rule_json="$(printf '%s' "$RULE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
         plugin_json="$(printf '%s' "$opencode_plugin" | sed 's/\\/\\\\/g; s/"/\\"/g')"
@@ -580,6 +592,14 @@ case "${1:-}" in
             || { rm -rf "$SD" 2>/dev/null || true; echo "RH_STATUS=ERROR"; exit 1; }
           flags_out="$flags_out -s workspace-write -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
         fi
+        if [ "$approval" = auto ]; then
+          # Automatic review keeps the workspace-write sandbox selected above.
+          if codex --help 2>/dev/null | grep -q -- '--approve-for-me'; then
+            flags_out="$flags_out --approve-for-me"
+          else
+            approval=normal
+          fi
+        fi
         ;;
     esac
     resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
@@ -589,6 +609,7 @@ case "${1:-}" in
     printf 'RH_RESUME_ARGS=%s\n' "$resume_args"
     printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
+    printf 'RH_APPROVAL=%s\n' "$approval"
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"
@@ -613,6 +634,6 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [yolo] [ssh_config] [session_id] | off <agent> <box_mountpoint> [session_id]" >&2
+    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] | off <agent> <box_mountpoint> [session_id]" >&2
     echo "RH_STATUS=ERROR"; exit 2;;
 esac

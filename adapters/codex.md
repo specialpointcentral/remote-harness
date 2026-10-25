@@ -24,7 +24,9 @@ Because this adapter is for Codex, the emitted command must use:
 --launch codex
 ```
 
-If the user asks for yolo / bypass approvals, append `--yolo`.
+If the user asks for yolo / bypass approvals, append `--yolo`. Without it the wizard defaults to auto approvals (`--approval auto`: `--approve-for-me` with the
+workspace-write sandbox, or normal approvals when this Codex lacks it); pass `--approval normal`
+for per-action prompts.
 
 The session prepends its `git`/`rg` shims to the agent PATH and pins that PATH for Codex shell
 subprocesses with `shell_environment_policy.set.PATH`. Login shells and shell-profile loading are

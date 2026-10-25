@@ -651,6 +651,36 @@ hb_inject on hb.6 > "$tmp/inject-hb6.out"
 assert_grep_e "$tmp/inject-hb6.out" "^RH_RESUME_AVAILABLE=exited,[0-9]+$" "an agent exit with an unreachable project host offers resume"
 hb_inject off hb.6
 
+# Auto approval uses the remote CLI's automatic review when it has one and falls back to normal.
+ap_bin="$tmp/approval-bin"
+mkdir -p "$ap_bin" "$tmp/mount-approval"
+ap_inject() {  # agent approval session-id; output in $tmp/approval-<session-id>.out
+  PATH="$ap_bin:$PATH" RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" on "$1" \
+    "$tmp/code" laptop "$tmp/mount-approval" "$2" "$basic_ssh_cfg" "$3" > "$tmp/approval-$3.out"
+  RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" off "$1" "$tmp/mount-approval" "$3" >/dev/null
+}
+printf '#!/bin/sh\necho "  --permission-mode <mode>  (choices: \\"auto\\", \\"manual\\")"\n' > "$ap_bin/claude"
+printf '#!/bin/sh\necho "      --approve-for-me"\n' > "$ap_bin/codex"
+chmod +x "$ap_bin/claude" "$ap_bin/codex"
+ap_inject claude auto ap.c1
+assert_grep "$tmp/approval-ap.c1.out" "--permission-mode auto" "auto approval starts claude in auto mode"
+assert_grep "$tmp/approval-ap.c1.out" "RH_APPROVAL=auto" "inject reports claude auto approval"
+ap_inject codex auto ap.x1
+assert_grep "$tmp/approval-ap.x1.out" "--approve-for-me" "auto approval routes codex approvals to automatic review"
+assert_grep "$tmp/approval-ap.x1.out" "-s workspace-write" "codex automatic review keeps the workspace-write sandbox"
+ap_inject codex yolo ap.x2
+assert_grep "$tmp/approval-ap.x2.out" "RH_APPROVAL=yolo" "inject accepts the yolo approval name"
+refute_grep "$tmp/approval-ap.x2.out" "--approve-for-me" "yolo codex also requested automatic review"
+printf '#!/bin/sh\necho usage\n' > "$ap_bin/claude"
+cp "$ap_bin/claude" "$ap_bin/codex"
+ap_inject claude auto ap.c2
+assert_grep "$tmp/approval-ap.c2.out" "RH_APPROVAL=normal" "a claude without auto mode falls back to normal approvals"
+refute_grep "$tmp/approval-ap.c2.out" "--permission-mode" "a claude without auto mode got --permission-mode"
+ap_inject codex auto ap.x3
+refute_grep "$tmp/approval-ap.x3.out" "--approve-for-me" "a codex without automatic review got --approve-for-me"
+ap_inject opencode auto ap.o1
+assert_grep "$tmp/approval-ap.o1.out" "RH_APPROVAL=normal" "opencode auto approval falls back to normal"
+
 ssh_cfg="$tmp/session_ssh_config"
 printf 'Host rlocal\n    HostName 127.0.0.1\n' > "$ssh_cfg"
 session_key_wrapped="$(printf '%s' "$tmp/mount-wrapped" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -1075,7 +1105,8 @@ assert_grep "$tmp/simple-laptop.args" "ARG_11=$simple_project_real" "simple hand
 assert_grep "$tmp/simple-laptop.args" "ARG_13=codex" "simple handoff launch"
 assert_grep "$tmp/simple-laptop.args" "ARG_15=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISimple remote-harness@test" "simple handoff pubkey"
 assert_grep "$tmp/simple-laptop.args" "ARG_17=/tmp/rh-simple-remote" "simple handoff mountpoint"
-assert_grep "$tmp/simple-laptop.args" "ARG_18=--yolo" "simple handoff yolo default accepted under --yes"
+assert_grep "$tmp/simple-laptop.args" "ARG_18=--approval" "simple handoff approval flag"
+assert_grep "$tmp/simple-laptop.args" "ARG_19=auto" "simple handoff approval defaults to auto under --yes"
 assert_grep "$tmp/simple-cache.env" "LAST_VIA=-p 2222 bytepilot@42.121.2.119" "simple cache via"
 if grep -q '^LAST_NAMESPACE=' "$tmp/simple-cache.env"; then
   fail "simple cache should not persist the hidden namespace override"
@@ -1083,7 +1114,7 @@ fi
 assert_grep "$tmp/simple-cache.env" "LAST_PROJECT_DIR=$simple_project_real" "simple cache project"
 assert_grep "$tmp/simple-cache.env" "LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remote" "simple cache mountpoint"
 assert_grep "$tmp/simple-cache.env" "LAST_LAUNCH=codex" "simple cache launch"
-assert_grep "$tmp/simple-cache.env" "LAST_YOLO=1" "simple cache yolo"
+assert_grep "$tmp/simple-cache.env" "LAST_APPROVAL=auto" "simple cache approval"
 # A remembered mountpoint is the default only for the project it was chosen for.
 simple_rerun() {  # $1 = project dir; prints the handed-off arguments
   : > "$tmp/simple-laptop.args"
@@ -1099,8 +1130,7 @@ case "$(simple_rerun "$tmp/simple-other-project")" in *rh-simple-remote*) fail "
 sed -i.bak '/^LAST_MOUNT_PROJECT=/d; s#^LAST_REMOTE_MOUNTPOINT=.*#LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remote#' "$tmp/simple-cache.env"
 case "$(simple_rerun "$simple_project")" in *rh-simple-remote*) fail "a cache without the mount's project still forced its mountpoint";; esac
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_project_dir "$cached_project" 1)"' "simple cached project prompts for confirmation"
-assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ "$YOLO_REQUESTED" = 1 ]; then' "explicit yolo has a no-reprompt branch"
-assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'YOLO=1' "explicit yolo locks yolo on"
+assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ -z "$APPROVAL" ]; then' "explicit approval has a no-reprompt branch"
 # An explicit local sshd choice is handed off last and remembered for later runs.
 simple_sshd_run() {  # extra args...; prints the value handed off after --local-sshd
   : > "$tmp/simple-laptop.args"
@@ -1114,6 +1144,16 @@ assert_eq "explicit user-mode sshd handed off" "$(simple_sshd_run --local-sshd u
 assert_grep "$tmp/simple-sshd-cache.env" "LAST_LOCAL_SSHD=user" "explicit local sshd choice remembered"
 assert_eq "remembered user-mode sshd reused" "$(simple_sshd_run)" "user"
 assert_eq "RH_LOCAL_SSHD overrides the remembered choice" "$(RH_LOCAL_SSHD=system simple_sshd_run)" "system"
+# An explicit approval mode is handed off unchanged and remembered as the next default.
+simple_approval() {  # prints the value handed off after --approval
+  awk -F= 'prev {print substr($0, index($0, "=") + 1); exit} $2=="--approval" {prev=1}' "$tmp/simple-laptop.args"
+}
+simple_sshd_run --yolo >/dev/null
+assert_eq "explicit yolo handed off" "$(simple_approval)" "yolo"
+simple_sshd_run --approval normal >/dev/null
+assert_eq "explicit normal approval handed off" "$(simple_approval)" "normal"
+simple_sshd_run >/dev/null
+assert_eq "remembered approval mode reused" "$(simple_approval)" "normal"
 
 if bash "$ROOT/scripts/simple-local-setup.sh" --launch codex \
     >"$tmp/simple-local.out" 2>"$tmp/simple-local.err"; then
@@ -1147,6 +1187,7 @@ HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   DISPATCH_MARKER="$tmp/dispatch-cached.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --launch codex --yolo
 assert_grep "$tmp/dispatch-cached.out" "REVERSE_ARGS=--launch codex" "dispatch ignores cached forward mode"
+assert_grep "$tmp/dispatch-cached.out" "--approval yolo" "dispatch passes --yolo on as the yolo approval"
 HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   RH_SIMPLE_MODE_CACHE="$tmp/simple-mode-cache.env" \
   DISPATCH_MARKER="$tmp/dispatch-reverse.out" \
@@ -1179,7 +1220,7 @@ assert_grep "$ROOT/SKILL.md" "OS account" "skill requires a dedicated runner acc
 assert_grep "$ROOT/AGENTS.md" "Simple Reverse Rules" "agents docs carry simple reverse rules"
 assert_grep "$ROOT/AGENTS.md" "compact but copyable" "agents docs carry bootstrap command shape"
 assert_grep "$ROOT/AGENTS.md" "fields 1 and 2 are local/client data" "agents docs protect local/client ssh metadata"
-assert_grep "$ROOT/AGENTS.md" "must not ask for YOLO confirmation again" "agents docs forbid yolo reprompt"
+assert_grep "$ROOT/AGENTS.md" "not ask for it again" "agents docs forbid an approval-mode reprompt"
 assert_grep "$ROOT/AGENTS.md" "script may live remotely" "agents docs forbid assuming local script install"
 assert_grep "$ROOT/AGENTS.cn.md" "Simple Reverse 规则" "Chinese agents docs carry simple reverse rules"
 assert_grep "$ROOT/AGENTS.cn.md" "紧凑但可复制" "Chinese agents docs carry bootstrap command shape"
@@ -1334,7 +1375,7 @@ PY
     *'mount-project.sh'*)
       [ -z "${MOUNT_FAIL:-}" ] || { printf 'STATUS=failed\nERROR=read: Connection reset by peer\n'; exit 0; }
       printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
-    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\n'; exit 0;;
+    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\nRH_APPROVAL=auto\n'; exit 0;;
   esac
 done
 exit 0
@@ -1378,6 +1419,8 @@ refute_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -tt " "the interactive ag
 assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
 assert_grep_e "$ssh_log" "RH_LANG=[^ ]*en[^ ]* [^ ]*inject-rule\.sh" "setup passes the interface language to the rule injector"
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
+assert_grep_e "$ssh_log" "inject-rule\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*auto[^ ]* " "setup passes the default auto approval to the injector"
+assert_grep "$tmp/project-valid.out" "Approvals: codex automatic review" "setup reports the auto approval mode"
 # An interactive ssh that lost its connection (exit 255) makes the next launch of the same remote,
 # mountpoint and agent offer to continue, once.
 refute_grep "$tmp/project-valid.out" "ended on a lost connection" "a first launch offered resume"

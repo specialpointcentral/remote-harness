@@ -30,7 +30,9 @@
 - 命令在本机运行，但 script may live remotely；fetch 形式必须紧凑但可复制，并取得全部 reverse helper。
 - 具体 SSH target、本机路径、挂载点和审批只在本机终端收集。
 - 若从 `SSH_CONNECTION` 推导默认值，第 1/2 字段是本地客户端数据，绝不能输出；只可使用第 3/4 字段。
-- 用户明确要求 YOLO 后，不得再二次询问确认。
+- 用户明确指定审批模式（`--approval auto|normal|yolo` 或 `--yolo`）后，不得再二次询问确认。未指定时
+  向导会询问，默认沿用上次的选择，否则为 auto；auto 使用远端 CLI 的自动审核（`claude --permission-mode
+  auto`、`codex --approve-for-me`），CLI 不支持时退回普通审批。
 - `laptop-setup.sh` 必须可与下载到同目录的 sibling helper 独立运行。
 - 主 Agent 只能通过 `ssh -tt <远端> ... <claude|codex|opencode>` 在远端启动。
 - Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。

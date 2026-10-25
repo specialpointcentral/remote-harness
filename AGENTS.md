@@ -31,7 +31,10 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Concrete SSH targets, local paths, mountpoints, and approvals are collected in the local terminal.
 - If deriving an SSH default from `SSH_CONNECTION`, fields 1 and 2 are local/client data and must
   never be emitted; only server fields 3 and 4 are allowed.
-- Explicit YOLO is final: the wizard must not ask for YOLO confirmation again.
+- An explicit approval mode (`--approval auto|normal|yolo`, or `--yolo`) is final: the wizard must
+  not ask for it again. Otherwise it asks, defaulting to the last choice or auto; auto uses the
+  remote CLI's automatic review (`claude --permission-mode auto`, `codex --approve-for-me`) and falls
+  back to normal approvals where the CLI lacks it.
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
 - The main agent starts only through `ssh -tt <remote> ... <claude|codex|opencode>`.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.

@@ -26,7 +26,7 @@ description: >-
 - Claude Code：`--launch claude`
 - opencode：`--launch opencode`
 
-仅当用户明确要求免审批模式时追加 `--yolo`。中文使用 `RH_LANG=zh`，其他情况使用 `RH_LANG=en`。
+按确定的审批模式追加 `--approval auto`、`--approval normal`，或 `--yolo`（仅当用户明确要求免审批模式时）。中文使用 `RH_LANG=zh`，其他情况使用 `RH_LANG=en`。
 
 reverse 请求可先尝试获得服务器侧 SSH 建议：
 
@@ -40,19 +40,21 @@ bash "${RH_HOME:-$HOME/.remote-harness}/scripts/suggest-via.sh"
 
 ## 引导式选择
 
-返回命令前先确定以下选择。请求中已经明确的内容（Agent CLI、"yolo"/免审批、FreeIPA 或用户态 sshd）
+返回命令前先确定以下选择。请求中已经明确的内容（Agent CLI、auto 或 "yolo"/免审批等审批模式、FreeIPA 或用户态 sshd）
 视为最终决定，不再重复询问。其余项一次性询问：宿主有选择题工具时使用它（例如 Claude Code 的
 AskUserQuestion）；否则列出编号选项并等待回复。
 
 1. 远端 Agent CLI：Claude Code（`--launch claude`）、Codex（`--launch codex`）或 opencode
    （`--launch opencode`）。推荐当前处理请求的 Agent。
-2. 审批模式：正常（推荐）或 YOLO（`--yolo`，仅在用户明确选择时）。
+2. 审批模式：auto（推荐，`--approval auto`：由远端 CLI 自动审核，即 `claude --permission-mode auto`
+   或 `codex --approve-for-me`；opencode 和不支持的 CLI 退回普通审批）、普通（`--approval normal`：
+   Agent 逐项询问）或 YOLO（`--yolo`，仅在用户明确选择时）。
 3. 本机 SSH 服务：系统 sshd（`:22`，推荐）；用户态 sshd（`RH_LOCAL_SSHD=user`），适用于 FreeIPA/sssd
    等 sshd 不读取 `~/.ssh/authorized_keys` 的主机，或没有 SSH 服务也没有 root 的情况；或不确定（按系统
    sshd 处理，本地向导会检测 FreeIPA 类主机并询问是否改用用户态）。
 
 不要在聊天中询问 SSH target、本机路径、挂载点或本机主机名；这些由本地向导收集。随后返回已填好选择的
-最终命令，并为每项选择附一行简短的修改说明（换 `--launch`、加 `--yolo` 或加 `RH_LOCAL_SSHD=user`）。
+最终命令，并为每项选择附一行简短的修改说明（换 `--launch`、改 `--approval` 或用 `--yolo`、加 `RH_LOCAL_SSHD=user`）。
 
 ## 返回给用户的命令
 
@@ -64,7 +66,7 @@ RH_LANG=<lang> bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.
 ```
 
 若 skill 只安装在远端服务器，返回 fetch 形式。填入 `<source_prompt>`、`<default_via>`、
-`<lang>` 和 `<launch>`；只有用户明确要求时才追加 `--yolo`。
+`<lang>` 和 `<launch>`；追加审批参数（`--approval <模式>`；只有用户明确要求时才用 `--yolo`）。
 
 ```bash
 (

@@ -33,6 +33,9 @@
 #   --project-dir <d>     laptop project dir to mount (validated; prompts again if invalid)
 #   --launch <cmd>        coding-agent CLI to start on the remote (default: claude;
 #                         Codex passes 'codex', opencode passes 'opencode')
+#   --approval <mode>     approvals on the launched agent: 'auto' (default; claude
+#                         --permission-mode auto, codex --approve-for-me, normal where the CLI
+#                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
 #   --yolo                bypass approvals on the launched agent — claude/codex get their
 #                         bypass flag; opencode gets a temporary permission=allow config (restored)
 #   --local-sshd <mode>   SSH server the tunnel reaches on this laptop: 'system' (default; the
@@ -53,7 +56,7 @@ need_arg() {
 # ---- argument parsing -----------------------------------------------------
 HOST="" PORT="" PUBKEY="" VIA="" BOX_ALIAS="" BOX_SSH_CONFIG="" ASSUME_YES=0 SETUP_ONLY=0
 BOX_USER="" REMOTE_MP="" LAUNCH="claude" PROJ_DIR_ARG=""
-YOLO=0; EFF_LAUNCH=""; LAUNCH_BASE="claude"
+APPROVAL=auto; EFF_LAUNCH=""; LAUNCH_BASE="claude"
 LOCAL_SSHD_MODE="${RH_LOCAL_SSHD:-system}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,7 +65,8 @@ while [ $# -gt 0 ]; do
     --pubkey)        need_arg "$1" "${2-}"; PUBKEY="$2";         shift 2;;
     --via)           need_arg "$1" "${2-}"; VIA="$2";            shift 2;;
     --launch)        need_arg "$1" "${2-}"; LAUNCH="$2";         shift 2;;   # CLI to start on the remote (claude/codex/opencode)
-    --yolo)          YOLO=1;              shift;;     # bypass approvals on the launched agent
+    --approval)      need_arg "$1" "${2-}"; APPROVAL="$2";       shift 2;;   # normal|auto|yolo
+    --yolo)          APPROVAL=yolo;       shift;;     # bypass approvals on the launched agent
     --box-alias)     need_arg "$1" "${2-}"; BOX_ALIAS="$2";      shift 2;;
     --box-ssh-config) need_arg "$1" "${2-}"; BOX_SSH_CONFIG="$2"; shift 2;;
     --box-user)      need_arg "$1" "${2-}"; BOX_USER="$2";       shift 2;;
@@ -77,6 +81,10 @@ done
 [ -n "$PORT" ] || { printf 'need --port\n' >&2; exit 2; }
 printf '%s' "$PORT" | grep -qE '^[0-9]+$' || { printf 'port must be numeric: %s\n' "$PORT" >&2; exit 2; }
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || { printf 'port out of range: %s\n' "$PORT" >&2; exit 2; }
+case "$APPROVAL" in
+  normal|auto|yolo) ;;
+  *) printf 'unsupported --approval %s (expected normal|auto|yolo)\n' "$APPROVAL" >&2; exit 2;;
+esac
 case "$LOCAL_SSHD_MODE" in
   system|auto|"") LOCAL_SSHD_MODE=system;;
   user) [ "$SETUP_ONLY" = 0 ] || { printf -- '--local-sshd user needs a full session (not --setup-only)\n' >&2; exit 2; };;
@@ -565,7 +573,7 @@ case "$LAUNCH" in
 esac
 EFF_LAUNCH="$LAUNCH"
 LAUNCH_BASE="$LAUNCH"
-if [ "$YOLO" = 1 ]; then
+if [ "$APPROVAL" = yolo ]; then
   case "$LAUNCH_BASE" in
     claude)   EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex)    EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
@@ -1157,7 +1165,7 @@ step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "�
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
 # RH_LANG travels with it so a Chinese session's rule asks the agent to reply in Chinese.
-inject_remote_cmd="RH_LANG=$(is_zh && echo zh || echo en) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$YOLO") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+inject_remote_cmd="RH_LANG=$(is_zh && echo zh || echo en) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
 # Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
@@ -1172,6 +1180,14 @@ if [ "$rh_status" = INJECTED ]; then
   RULE_INJECTED=1
   rh_env=$(printf  '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_ENV=//p'   | head -1)
   rh_flags=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_LAUNCH_FLAGS=//p' | head -1)
+  if [ "$APPROVAL" = auto ]; then
+    if [ "$(printf '%s\n' "$rh_out" | sed -n 's/^RH_APPROVAL=//p' | head -1)" = auto ]; then
+      ok "$(tr2 "Approvals: ${LAUNCH_BASE} automatic review (auto mode)" "审批模式：${LAUNCH_BASE} 自动审核（auto 模式）")"
+    else
+      warn "$(tr2 "This remote ${LAUNCH_BASE} has no auto approval mode; it will ask for approvals as usual." \
+                  "远端 ${LAUNCH_BASE} 不支持 auto 审批模式，将照常逐项请求审批。")"
+    fi
+  fi
   rh_ready=$(printf '%s\n' "$rh_out" | sed -n 's/^RH_READY_FILE=//p' | head -1)
   # The session launcher records the agent pid for the box-side watcher that cleans up after a
   # dropped connection; it wraps only this final launch, never the opencode readiness probe below.

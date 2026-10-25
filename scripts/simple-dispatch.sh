@@ -61,13 +61,14 @@ normalize_mode() {
   esac
 }
 
-MODE="" SOURCE_VIA="" LAUNCH="codex" YOLO=0
+MODE="" SOURCE_VIA="" LAUNCH="codex" APPROVAL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode)       need_arg "$1" "${2-}"; MODE="$2"; shift 2;;
     --source-via) need_arg "$1" "${2-}"; SOURCE_VIA="$2"; shift 2;;
     --launch)     need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
-    --yolo)       YOLO=1; shift;;
+    --approval)   need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
+    --yolo)       APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
 done
@@ -96,7 +97,7 @@ case "$MODE" in
     [ -x "$SCRIPT_DIR/simple-laptop-setup.sh" ] || { err "missing simple-laptop-setup.sh in $SCRIPT_DIR"; exit 2; }
     args=(--launch "$LAUNCH")
     [ -n "$SOURCE_VIA" ] && args+=(--via "$SOURCE_VIA")
-    [ "$YOLO" = 1 ] && args+=(--yolo)
+    [ -n "$APPROVAL" ] && args+=(--approval "$APPROVAL")
     exec bash "$SCRIPT_DIR/simple-laptop-setup.sh" "${args[@]}"
     ;;
 esac

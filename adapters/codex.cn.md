@@ -21,7 +21,9 @@ setup 脚本使用 `~/.remote-harness` 下的会话级 SSH config 和 wrapper。
 --launch codex
 ```
 
-如果用户要求 yolo / bypass approvals，则追加 `--yolo`。
+如果用户要求 yolo / bypass approvals，则追加 `--yolo`。未指定时向导默认 auto 审批（`--approval auto`：
+`--approve-for-me` 并保留 workspace-write 沙箱；该 Codex 不支持时退回普通审批）；需要逐项确认时传
+`--approval normal`。
 
 会话把 `git`/`rg` 垫片目录放在 Agent PATH 最前面，并通过 `shell_environment_policy.set.PATH`
 固定 Codex shell 子进程的 PATH。这些子进程禁用 login shell 和 shell profile 加载，避免垫片

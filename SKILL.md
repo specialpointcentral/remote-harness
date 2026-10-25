@@ -28,8 +28,9 @@ Select the remote agent CLI:
 - Claude Code: `--launch claude`
 - opencode: `--launch opencode`
 
-Append `--yolo` only when the user explicitly requests bypass/no-approval mode. Use `RH_LANG=zh`
-for Chinese and `RH_LANG=en` otherwise.
+Append the settled approval mode: `--approval auto`, `--approval normal`, or `--yolo` (only when the
+user explicitly requests bypass/no-approval mode). Use `RH_LANG=zh` for Chinese and `RH_LANG=en`
+otherwise.
 
 For reverse requests, obtain a server-side SSH suggestion when possible:
 
@@ -45,13 +46,16 @@ instead; never ask for it.
 ## Guided Choices
 
 Before returning the command, settle these choices. Treat anything the request already states (the
-agent CLI, "yolo"/no approvals, FreeIPA or user-mode sshd) as final and do not ask about it again.
+agent CLI, an approval mode such as auto or "yolo"/no approvals, FreeIPA or user-mode sshd) as final and do not ask about it again.
 Ask about the rest in a single round, using the host's multiple-choice question tool when it has one
 (for example Claude Code's AskUserQuestion); otherwise list numbered options and wait for the reply.
 
 1. Remote agent CLI: Claude Code (`--launch claude`), Codex (`--launch codex`), or opencode
    (`--launch opencode`). Recommend the agent handling this request.
-2. Approval mode: normal (recommended) or YOLO (`--yolo`, only on an explicit choice).
+2. Approval mode: auto (recommended, `--approval auto`: the remote CLI reviews approvals itself via
+   `claude --permission-mode auto` or `codex --approve-for-me`; opencode and CLIs without it fall back
+   to normal), normal (`--approval normal`: the agent asks), or YOLO (`--yolo`, only on an explicit
+   choice).
 3. Local SSH server: system sshd on `:22` (recommended); user-mode sshd (`RH_LOCAL_SSHD=user`) for
    FreeIPA/sssd or other hosts whose sshd ignores `~/.ssh/authorized_keys`, or when there is no SSH
    server and no root; or not sure (system; the local wizard detects FreeIPA-style hosts and offers
@@ -59,7 +63,7 @@ Ask about the rest in a single round, using the host's multiple-choice question 
 
 Never ask in chat for SSH targets, local paths, mountpoints, or local host names; the local wizard
 collects those. Then return the final command with the choices filled in, followed by one short line
-per choice saying how to change it (swap `--launch`, add `--yolo`, or add `RH_LOCAL_SSHD=user`).
+per choice saying how to change it (swap `--launch`, change `--approval` or use `--yolo`, or add `RH_LOCAL_SSHD=user`).
 
 ## Command To Return
 
@@ -71,7 +75,8 @@ RH_LANG=<lang> bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.
 ```
 
 If the skill is installed only on the remote server, return this fetch form. Fill
-`<source_prompt>`, `<default_via>`, `<lang>`, and `<launch>`; append `--yolo` only when requested.
+`<source_prompt>`, `<default_via>`, `<lang>`, and `<launch>`; append the approval flag
+(`--approval <mode>`, or `--yolo` only when requested).
 
 ```bash
 (

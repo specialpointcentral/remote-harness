@@ -81,7 +81,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    和 SHA-256 清单；文件名、类型、摘要、bootstrap 一致性和 Bash 语法均通过后才启动本地向导。
    包校验详见 `docs/simple-flow.cn.md`。
 2. `simple-dispatch.sh --mode reverse` 移交给 `simple-laptop-setup.sh`。
-3. `simple-laptop-setup.sh` 在本地提示远端 SSH target、本地项目目录、可选远端挂载点，以及调用中未明确指定时的 YOLO 偏好。
+3. `simple-laptop-setup.sh` 在本地提示远端 SSH target、本地项目目录、可选远端挂载点，以及调用中未明确指定时的审批模式（默认 auto，可选普通/YOLO）。
 4. 它准备远端会话 config 路径，并调用远端
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`。
 5. 它用 `--box-ssh-config <remote-session-config>` 调用 `laptop-setup.sh`。

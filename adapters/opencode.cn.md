@@ -16,4 +16,5 @@ setup 脚本使用 `~/.remote-harness` 下的会话级 SSH config 和 wrapper。
 --launch opencode
 ```
 
-如果用户要求 yolo / bypass approvals，则追加 `--yolo`。
+如果用户要求 yolo / bypass approvals，则追加 `--yolo`。opencode 没有自动审核，因此 `--approval auto`
+（向导默认值）会以普通审批运行。

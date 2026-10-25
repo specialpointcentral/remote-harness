@@ -73,13 +73,14 @@ case "${BASH_SOURCE[0]:-}" in
   */*) self_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || self_dir="";;
 esac
 
-VIA="${RH_VIA:-}" MODE="" LAUNCH="codex" YOLO=0
+VIA="${RH_VIA:-}" MODE="" LAUNCH="codex" APPROVAL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode)   need_arg "$1" "${2-}"; MODE="$2"; shift 2;;
     --via)    need_arg "$1" "${2-}"; VIA="$2"; shift 2;;
     --launch) need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
-    --yolo)   YOLO=1; shift;;
+    --approval) need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
+    --yolo)   APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
 done
@@ -87,7 +88,7 @@ case "$LAUNCH" in claude|codex|opencode) ;; *) printf 'unsupported --launch %s\n
 
 dispatch_args=(--launch "$LAUNCH")
 [ -n "$MODE" ] && dispatch_args=(--mode "$MODE" "${dispatch_args[@]}")
-[ "$YOLO" = 1 ] && dispatch_args+=(--yolo)
+[ -n "$APPROVAL" ] && dispatch_args+=(--approval "$APPROVAL")
 
 if [ -n "$self_dir" ] && [ -f "$self_dir/simple-dispatch.sh" ]; then
   [ -n "$VIA" ] && dispatch_args+=(--source-via "$VIA")

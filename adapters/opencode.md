@@ -18,4 +18,5 @@ Because this adapter is for opencode, the emitted command must use:
 --launch opencode
 ```
 
-If the user asks for yolo / bypass approvals, append `--yolo`.
+If the user asks for yolo / bypass approvals, append `--yolo`. opencode has no automatic approval review, so `--approval auto` (the wizard default) runs it with
+normal approvals.

@@ -145,7 +145,7 @@ cache_save() {
   mkdir -p "$(dirname "$_cache")" 2>/dev/null || true
   _tmp="$(mktemp "${_cache}.XXXXXX" 2>/dev/null)" || return 0
   if [ -f "$_cache" ]; then
-    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_MOUNT_PROJECT|LAST_LAUNCH|LAST_YOLO|LAST_LOCAL_SSHD)=' "$_cache" 2>/dev/null > "$_tmp" || true
+    grep -v -E '^(LAST_VIA|LAST_PROJECT_DIR|LAST_REMOTE_MOUNTPOINT|LAST_MOUNT_PROJECT|LAST_LAUNCH|LAST_YOLO|LAST_APPROVAL|LAST_LOCAL_SSHD)=' "$_cache" 2>/dev/null > "$_tmp" || true
   fi
   for _kv in \
     "LAST_VIA=$VIA" \
@@ -153,7 +153,7 @@ cache_save() {
     "LAST_REMOTE_MOUNTPOINT=$REMOTE_MP" \
     "LAST_MOUNT_PROJECT=$PROJECT_DIR" \
     "LAST_LAUNCH=$LAUNCH" \
-    "LAST_YOLO=$YOLO" \
+    "LAST_APPROVAL=$APPROVAL" \
     "LAST_LOCAL_SSHD=$LOCAL_SSHD"; do
     case "$_kv" in *'
 '*|LAST_LOCAL_SSHD=auto) continue;; esac
@@ -162,14 +162,15 @@ cache_save() {
   mv "$_tmp" "$_cache" 2>/dev/null && chmod 600 "$_cache" 2>/dev/null || true
 }
 
-VIA="" LAUNCH="codex" YOLO=0 YOLO_REQUESTED=0
+VIA="" LAUNCH="codex" APPROVAL=""
 NAMESPACE="" PROJECT_DIR="" REMOTE_MP="" ASSUME_YES=0
 LOCAL_SSHD="${RH_LOCAL_SSHD:-auto}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --via)               need_arg "$1" "${2-}"; VIA="$2"; shift 2;;
     --launch)            need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
-    --yolo)              YOLO=1; YOLO_REQUESTED=1; shift;;
+    --approval)          need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
+    --yolo)              APPROVAL=yolo; shift;;
     --namespace)         need_arg "$1" "${2-}"; NAMESPACE="$2"; shift 2;;
     --project-dir)       need_arg "$1" "${2-}"; PROJECT_DIR="$2"; shift 2;;
     --remote-mountpoint) need_arg "$1" "${2-}"; REMOTE_MP="$2"; shift 2;;
@@ -181,6 +182,10 @@ done
 case "$LAUNCH" in
   claude|codex|opencode) ;;
   *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
+esac
+case "$APPROVAL" in
+  ""|normal|auto|yolo) ;;
+  *) printf 'unsupported --approval %s (expected normal|auto|yolo)\n' "$APPROVAL" >&2; exit 2;;
 esac
 case "$LOCAL_SSHD" in
   auto|"") LOCAL_SSHD=auto;;
@@ -251,19 +256,24 @@ fi
 REMOTE_MP="${REMOTE_MP%/}"
 case "$REMOTE_MP" in auto|AUTO|-) REMOTE_MP="";; esac
 
-if [ "$YOLO_REQUESTED" = 1 ]; then
-  YOLO=1
-else
-  cached_yolo="$(cache_get LAST_YOLO)"
-  if [ "$cached_yolo" = 0 ]; then
-    default_yolo=n
-  else
-    default_yolo=y
-  fi
-  if is_zh; then
-    if prompt_yes_no "启动 ${LAUNCH} 时开启 YOLO/免审批模式？" "$default_yolo"; then YOLO=1; else YOLO=0; fi
-  else
-    if prompt_yes_no "Launch ${LAUNCH} with YOLO/bypass approvals?" "$default_yolo"; then YOLO=1; else YOLO=0; fi
+# An explicit --approval/--yolo is final; otherwise ask, defaulting to the last choice or auto.
+if [ -z "$APPROVAL" ]; then
+  APPROVAL="$(cache_get LAST_APPROVAL)"
+  case "$APPROVAL" in normal|auto|yolo) ;; *) APPROVAL=auto;; esac
+  if [ "$ASSUME_YES" != 1 ]; then
+    say "$(tr2 "Approval mode for ${LAUNCH}:" "${LAUNCH} 的审批模式：")"
+    say "  1) auto   $(tr2 "the agent reviews approvals automatically (recommended)" "由 Agent 自动审核审批请求（推荐）")"
+    say "  2) normal $(tr2 "the agent asks you before risky actions" "高风险操作前逐项询问你")"
+    say "  3) yolo   $(tr2 "bypass all approvals" "跳过所有审批")"
+    while :; do
+      _approval="$(prompt_line "$(tr2 "Choose 1-3 or a name" "输入 1-3 或模式名")" "$APPROVAL")"
+      case "$_approval" in
+        1|auto) APPROVAL=auto; break;;
+        2|normal) APPROVAL=normal; break;;
+        3|yolo|YOLO) APPROVAL=yolo; break;;
+        *) warn "$(tr2 "Please answer 1, 2 or 3." "请输入 1、2 或 3。")";;
+      esac
+    done
   fi
 fi
 
@@ -306,11 +316,7 @@ if [ -n "$REMOTE_MP" ]; then
 else
   if is_zh; then say "远端挂载点：     远端 ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; else say "Remote mountpoint: remote ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; fi
 fi
-if [ "$YOLO" = 1 ]; then
-  if is_zh; then say "启动命令：       ${LAUNCH} --yolo"; else say "Launch:           ${LAUNCH} --yolo"; fi
-else
-  if is_zh; then say "启动命令：       ${LAUNCH}"; else say "Launch:           ${LAUNCH}"; fi
-fi
+if is_zh; then say "启动命令：       ${LAUNCH}（审批模式 ${APPROVAL}）"; else say "Launch:           ${LAUNCH} (approval: ${APPROVAL})"; fi
 if [ "$LOCAL_SSHD" = user ]; then
   say "$(tr2 "Local SSH server: per-session user-mode sshd (RH_LOCAL_SSHD=system switches back)" "本机 SSH 服务：   会话级用户态 sshd（RH_LOCAL_SSHD=system 可改回）")"
 else
@@ -375,7 +381,7 @@ cmd=(bash "$SCRIPT_DIR/laptop-setup.sh"
   --launch "$LAUNCH")
 [ -n "$PUBKEY" ] && cmd+=(--pubkey "$PUBKEY")
 [ -n "$REMOTE_MP" ] && cmd+=(--remote-mountpoint "$REMOTE_MP")
-[ "$YOLO" = 1 ] && cmd+=(--yolo)
+cmd+=(--approval "$APPROVAL")
 cmd+=(--local-sshd "$LOCAL_SSHD")
 
 export RH_STEP_BASE="$STEP_N"

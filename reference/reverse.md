@@ -86,7 +86,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    must pass before the local wizard starts. See `docs/simple-flow.md` for the bundle checks.
 2. `simple-dispatch.sh --mode reverse` hands off to `simple-laptop-setup.sh`.
 3. `simple-laptop-setup.sh` prompts locally for the remote SSH target, local project dir, optional
-   remote mountpoint, and YOLO preference when not already explicit.
+   remote mountpoint, and approval mode (auto by default, or normal/YOLO) when not already explicit.
 4. It prepares a remote session config path and runs remote
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`.
 5. It calls `laptop-setup.sh` with `--box-ssh-config <remote-session-config>`.
