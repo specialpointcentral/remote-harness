@@ -17,6 +17,10 @@
 #              default sandbox blocks network and otherwise prevents ssh from writing its temp
 #              known_hosts there. It never makes ~/.ssh writable.
 #              The project's own AGENTS.md is still read additively; the mounted repo is never touched.
+#   The rule asks for replies in the language of the user's latest message, and every user turn
+#   repeats that as a one-line note (claude/codex: UserPromptSubmit hook; opencode:
+#   experimental.chat.messages.transform plugin hook), because the rule alone sits at the start of the
+#   context and loses to long tool output in another language.
 #
 #   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id]
 #              approval: 0|normal, 1|yolo, or auto = the agent's automatic approval review when this CLI
@@ -60,6 +64,9 @@ valid_session_id() {
     *) return 0;;
   esac
 }
+
+# Added to every user turn, so it stays short; the rule carries the details.
+REPLY_LANGUAGE_NOTE="remote-harness: reply in the language of the user's latest message, not of tool output."
 
 session_dir() {  # $1 = mountpoint, $2 = optional session id -> box-side per-session dir
   key="$(printf '%s' "${1:-default}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -275,12 +282,13 @@ write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project r
   chmod +x "$_wts_shim" 2>/dev/null || return 1
 }
 
-write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker
+write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker $5=reply language note
   _wop_dir="$1/plugins"
   _wop_file="$_wop_dir/remote-harness.js"
   _wop_runner_b64="$(printf '%s' "$2" | base64 | tr -d '\n')" || return 1
   _wop_mount_b64="$(printf '%s' "$3" | base64 | tr -d '\n')" || return 1
   _wop_ready_b64="$(printf '%s' "$4" | base64 | tr -d '\n')" || return 1
+  _wop_note_b64="$(printf '%s' "$5" | base64 | tr -d '\n')" || return 1
   mkdir -p "$_wop_dir" 2>/dev/null || return 1
   cat > "$_wop_file" <<EOF
 import fs from "node:fs"
@@ -289,6 +297,7 @@ import path from "node:path"
 const runner = Buffer.from("$_wop_runner_b64", "base64").toString("utf8")
 const configuredMount = Buffer.from("$_wop_mount_b64", "base64").toString("utf8")
 const readyFile = Buffer.from("$_wop_ready_b64", "base64").toString("utf8")
+const replyNote = Buffer.from("$_wop_note_b64", "base64").toString("utf8")
 const mountRoot = fs.realpathSync(configuredMount)
 
 const encode = (value) => Buffer.from(value, "utf8").toString("base64")
@@ -327,6 +336,20 @@ export const RemoteHarness = async ({ directory }) => {
         .join(" ")
       output.args.workdir = mountRoot
     },
+    // opencode reloads the history before every model step and adds its own reminders the same way:
+    // an in-memory synthetic part on the latest user message that is never saved or displayed.
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const user = output.messages.findLast((message) => message.info.role === "user")
+      if (!user || user.parts.some((part) => part.text === replyNote)) return
+      user.parts.push({
+        id: "prt_remote_harness_reply_language",
+        messageID: user.info.id,
+        sessionID: user.info.sessionID,
+        type: "text",
+        text: replyNote,
+        synthetic: true,
+      })
+    },
   }
 }
 EOF
@@ -346,15 +369,35 @@ write_claude_worktree_blocker() {  # $1=session dir
   printf '%s' "$_wcw_blocker"
 }
 
-write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker
+# Claude and Codex share the UserPromptSubmit output format; the hook only replays a fixed answer.
+write_reply_language_hook() {  # $1=session dir $2=note -> prints the hook command
+  _wrl_file="$1/reply-language.json"
+  "$PYTHON3" -c 'import json,sys; print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": sys.argv[1]}}))' "$2" \
+    > "$_wrl_file" || return 1
+  printf 'cat >/dev/null; cat %s' "$(sq "$_wrl_file")"
+}
+
+write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker $4=reply language hook command
   _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
   _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
+  _wcs_prompt=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4") || return 1
   cat > "$1" <<EOF
 {
   "permissions": {
     "deny": ["EnterWorktree", "ExitWorktree"]
   },
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_prompt,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Agent",
@@ -387,38 +430,22 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
   cmds="$(detect_cmds "$4")"
   {
     printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
-    # laptop-setup.sh passes RH_LANG=zh for a Chinese session (normalized by _common.sh is_zh).
-    if [ "${RH_LANG:-}" = zh ]; then
-      printf 'Always reply to the user in Simplified Chinese (简体中文), even though these instructions,\n'
-      printf 'tool output, and project files are in English. Keep code, commands, paths, identifiers, and\n'
-      printf 'quoted output unchanged.\n\n'
-    fi
-    printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools operate on the\n' "$2" "$3"
-    printf 'mount, while a session router sends every Bash command to `%s`.\n\n' "$3"
-    printf 'Run ordinary relative commands. Do not wrap them in `ssh`, and do not replace the routing\n'
-    printf 'runner. The router maps the current mount-relative directory to the project host. Examples:\n\n'
+    printf "Reply in the language of the user's latest message, not that of these instructions, tool output, or files.\n\n"
+    printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools edit the mount;\n' "$2" "$3"
+    printf 'every Bash command is routed to `%s`, in the matching directory. Run ordinary relative commands;\n' "$3"
+    printf 'do not wrap them in `ssh` or bypass the router. For example:\n\n'
     printf '%s\n' "$cmds" | while IFS= read -r c; do
       [ -n "$c" ] && printf '    %s\n' "$c"
     done
     printf '\n'
-    printf 'Git commands you run through the Bash tool are routed with the rest of the command. Git\n'
-    printf 'and ripgrep calls that the agent makes internally (status snapshots, file search) go through\n'
-    printf 'session shims: work-tree scans and read-only lookups such as `git rev-parse` run on `%s`;\n' "$3"
-    printf 'git calls that write stay on this host. If such a call reports that the project host is\n'
-    printf 'unreachable, do not retry it against the mount with another tool; report the connection\n'
-    printf 'problem instead.\n'
-    printf 'Use relative project paths in Bash commands; absolute mount paths name the agent host and\n'
-    printf 'are not portable to `%s`. Interactive PTY commands are not supported by strict routing.\n' "$3"
-    printf 'Commands read stdin from /dev/null. Stopping a command, its timeout, or the end of this\n'
-    printf 'session stops its whole process tree on `%s`, including background tasks.\n\n' "$3"
-    printf 'Safe local work is file-oriented: use the agent read/edit/write/patch tools on the mount.\n'
-    printf 'If routing is unavailable or the cwd is outside the mount, the Bash call is denied. Never\n'
-    printf 'work around that failure by executing the project command on this machine.\n'
+    printf 'Use relative paths in Bash: absolute mount paths do not exist on `%s`. Commands get no stdin and\n' "$3"
+    printf 'no PTY; stopping a command or ending the session kills its process tree on `%s`.\n' "$3"
+    printf 'Internal git and ripgrep calls also run on `%s`. If one reports the project host is unreachable,\n' "$3"
+    printf 'report the connection problem; do not retry against the mount. If a Bash call is denied, never work\n'
+    printf 'around it by running the project command on this machine.\n'
     if [ "${5:-}" = claude ]; then
-      printf '\nClaude ordinary and nested subagents are supported and inherit this session hook.\n'
-      printf 'Agent Teams are disabled because independent teammate sessions do not have a documented\n'
-      printf 'guarantee that temporary `--settings` hooks are inherited. Do not request Agent\n'
-      printf '`isolation: worktree`; use a separate remote-harness session for isolated parallel work.\n'
+      printf '\nOrdinary and nested subagents work. Do not use Agent Teams or Agent `isolation: worktree`; use a\n'
+      printf 'separate remote-harness session for isolated parallel work.\n'
     fi
   } > "$1"
 }
@@ -538,13 +565,15 @@ case "${1:-}" in
       [ -x "$SCRIPT_DIR/route-command.py" ] \
         || abort_session
       hook_command="$(sq "$PYTHON3") $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
+      reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
+        || abort_session
     fi
     case "$agent" in
       claude)
         CLAUDE_SETTINGS="$SD/claude-settings.json"
         worktree_blocker=$(write_claude_worktree_blocker "$SD") \
           || abort_session
-        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" \
+        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" \
           || abort_session
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
@@ -566,7 +595,7 @@ case "${1:-}" in
         CFG="$SD/opencode.json"
         ready_file="$SD/opencode-plugin.ready"
         rm -f "$ready_file" 2>/dev/null || true
-        opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file") \
+        opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file" "$REPLY_LANGUAGE_NOTE") \
           || abort_session
         [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
         [ "$approval" = yolo ] || approval=normal  # opencode has no automatic approval review
@@ -580,7 +609,8 @@ case "${1:-}" in
       codex)
         dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
         hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=5,statusMessage=\"Routing command to project host\"}]}]"
-        flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") --dangerously-bypass-hook-trust"
+        prompt_cfg="hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"$(toml_escape_value "$reply_hook")\",timeout=5}]}]"
+        flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") -c $(sq "$prompt_cfg") --dangerously-bypass-hook-trust"
         # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile
         # initialization could otherwise move a bundled rg or system git ahead of the shims.
         tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""

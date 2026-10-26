@@ -28,7 +28,10 @@
   opencode 还会返回启动前必须出现的 readiness marker 路径。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
   不会删除其它仍在运行的会话的 hook 或 runner。
-  `RH_LANG=zh` 时（由 `laptop-setup.sh` 转发），规则还会要求 Agent 用简体中文回复。
+  规则要求 Agent 按用户最近一条消息的语言回复，而不是按指令、工具输出或项目文件的语言回复，
+  并在每一轮用户消息上重复一行提醒：Claude 和 Codex 用 `UserPromptSubmit` hook，opencode 用
+  `experimental.chat.messages.transform` 插件钩子，只在内存中附加到最新一条用户消息上。只靠规则时，
+  它位于上下文开头，大量英文工具输出会让回复逐渐变成英文。
 - `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。
 - `run-on-project-host.sh`：校验并执行本机项目命令（watch 模式下 stdin 为 `/dev/null`、使用独立
   进程组和通道 EOF 看门狗），或直接运行白名单内的 `git`/`rg`（不经 shell、

@@ -698,7 +698,7 @@ assert_grep "$tmp/inject-wrapped.out" "RH_LAUNCH_ENV=PATH='" "inject wrapper exp
 [ -x "$wrapped_dir/bin/ssh" ] || fail "inject wrapper ssh missing"
 assert_grep "$wrapped_dir/bin/ssh" "cfg='$ssh_cfg'" "inject wrapper stores temp ssh config"
 assert_grep "$wrapped_dir/bin/ssh" '-F "$cfg"' "inject wrapper uses temp ssh config"
-assert_grep "$wrapped_dir/rule.md" 'session router sends every Bash command to `rlocal`' "inject rule documents automatic routing"
+assert_grep "$wrapped_dir/rule.md" 'every Bash command is routed to `rlocal`' "inject rule documents automatic routing"
 refute_grep "$wrapped_dir/rule.md" "ssh rlocal 'cd" "strict inject rule still tells Codex to wrap commands in ssh"
 assert_grep "$tmp/inject-wrapped.out" "sandbox_workspace_write.writable_roots=[" "inject wrapper writable roots present"
 assert_grep "$tmp/inject-wrapped.out" "$(dirname "$ssh_cfg")" "inject wrapper writable roots include session config dir"
@@ -845,8 +845,8 @@ if "$claude_worktree_blocker" >/dev/null 2>"$tmp/claude-worktree.err"; then
 fi
 assert_grep "$tmp/claude-worktree.err" "separate remote-harness session" "claude worktree blocker guidance"
 claude_rule="$rh_home/.sessions/$claude_session_key/rule.md"
-assert_grep "$claude_rule" "ordinary and nested subagents" "claude rule documents supported subagents"
-assert_grep "$claude_rule" "Agent Teams are disabled" "claude rule documents team boundary"
+assert_grep "$claude_rule" "Ordinary and nested subagents work" "claude rule documents supported subagents"
+assert_grep "$claude_rule" "Do not use Agent Teams" "claude rule documents team boundary"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
@@ -1233,7 +1233,7 @@ assert_grep "$ROOT/AGENTS.cn.md" "Simple Reverse 规则" "Chinese agents docs ca
 assert_grep "$ROOT/AGENTS.cn.md" "紧凑但可复制" "Chinese agents docs carry bootstrap command shape"
 assert_grep "$ROOT/AGENTS.cn.md" "第 1/2 字段是本地客户端数据" "Chinese agents docs protect local/client ssh metadata"
 assert_grep "$ROOT/AGENTS.cn.md" "不得再二次询问" "Chinese agents docs forbid yolo reprompt"
-assert_grep "$ROOT/scripts/inject-rule.sh" "Safe local work is file-oriented" "inject rule allows local file work"
+assert_grep "$ROOT/scripts/inject-rule.sh" "File tools edit the mount" "inject rule allows local file work"
 # The tool verb's allowlist and argument charset are checked in three places on purpose (gateway, both
 # dispatcher sides); the copies must stay identical.
 for tool_check in 'git|rg) ;; *) fail "unsupported project tool"' \
@@ -1420,7 +1420,6 @@ assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
 assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -n " "setup calls reuse the multiplexing master"
 refute_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -tt " "the interactive agent session must keep its own connection"
 assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
-assert_grep_e "$ssh_log" "RH_LANG=[^ ]*en[^ ]* [^ ]*inject-rule\.sh" "setup passes the interface language to the rule injector"
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
 assert_grep_e "$ssh_log" "inject-rule\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*auto[^ ]* " "setup passes the default auto approval to the injector"
 assert_grep "$tmp/project-valid.out" "Approvals: codex automatic review" "setup reports the auto approval mode"
@@ -1724,10 +1723,6 @@ assert_grep "$tmp/ir-b.out" "$ir_sd.rev.b/claude-settings.json" "inject-rule key
 ir off claude "$ir_mp" rev.a >/dev/null
 [ ! -d "$ir_sd.rev.a" ] && [ -x "$ir_sd.rev.b/bin/rh-run" ] || fail "inject-rule: off did not remove exactly its own session"
 ir off claude "$ir_mp" rev.b >/dev/null
-RH_LANG=zh ir on codex "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.zh > "$tmp/ir-zh.out"
-assert_grep "$ir_sd.rev.zh/rule.md" "Always reply to the user in Simplified Chinese (简体中文)" "a Chinese session rule asks for Chinese replies"
-assert_grep "$tmp/ir-zh.out" "Simplified Chinese (简体中文)" "codex developer instructions carry the reply language"
-ir off codex "$ir_mp" rev.zh >/dev/null
 for ir_bad in .. 'a/b' 'a b'; do
   { ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" "$ir_bad" || true; } | grep -qx RH_STATUS=ERROR \
     || fail "inject-rule accepted unsafe session id '$ir_bad'"
@@ -1755,7 +1750,7 @@ fi
 if [ -x "$rp_sd/bin/rg" ]; then
   assert_grep "$tmp/rp-inject.out" "USE_BUILTIN_RIPGREP=0" "claude uses the rg shim when one is installed"
 fi
-assert_grep "$rp_sd/rule.md" "Git commands you run through the Bash tool are routed" "rule describes Bash git routing"
+assert_grep "$rp_sd/rule.md" "Internal git and ripgrep calls also run on" "rule describes internal git routing"
 refute_grep "$rp_sd/rule.md" "Simplified Chinese" "an English session rule asks for Chinese replies"
 refute_grep "$rp_sd/rule.md" "All Git commands are routed too" "rule still claims every Git command is routed"
 

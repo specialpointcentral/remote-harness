@@ -30,8 +30,11 @@
   remote runner. opencode emits a readiness marker path that must be observed before launch.
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
   project or cleaning up a dead launch never removes another live session's hook or runner.
-  With `RH_LANG=zh` (forwarded by `laptop-setup.sh`) the rule also tells the agent to reply in
-  Simplified Chinese.
+  The rule tells the agent to reply in the language of the user's latest message, not that of the
+  instructions, tool output, or project files, and every user turn repeats that as a one-line note: a
+  `UserPromptSubmit` hook for Claude and Codex, and an `experimental.chat.messages.transform` plugin
+  hook for opencode that adds it to the latest user message in memory only. The rule alone sits at
+  the start of the context, so long English tool output used to pull replies into English.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
 - `run-on-project-host.sh`: validates and executes the local project command (in `watch` mode with
   `/dev/null` stdin, its own process group, and a channel-EOF watchdog), or runs an allowlisted

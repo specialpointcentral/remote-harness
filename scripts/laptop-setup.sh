@@ -1155,8 +1155,7 @@ LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
-# RH_LANG travels with it so a Chinese session's rule asks the agent to reply in Chinese.
-inject_remote_cmd="RH_LANG=$(is_zh && echo zh || echo en) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
 # Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
