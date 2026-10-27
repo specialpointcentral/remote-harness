@@ -993,7 +993,7 @@ set_box_alias() {  # port [--if-user-differs]
     user=\$(printf '%s\n' \"\$cfg\" | awk 'tolower(\$1)==\"user\"{print \$2; exit}')
     [ $_only = 0 ] || [ \"\$user\" != $(sq "$LAPTOP_USER") ] || { printf 'UNCHANGED=1\n'; exit 0; }
     identity=\$(printf '%s\n' \"\$cfg\" | awk 'tolower(\$1)==\"identityfile\"{print \$2; exit}')
-    case \"\$identity\" in \"~/\"*) identity=\"\$HOME/\${identity#~/}\";; esac
+    case \"\$identity\" in \"~/\"*) identity=\"\$HOME/\${identity#??}\";; esac
     set --
     [ ! -f \"\$identity\" ] || set -- --identity \"\$identity\"
     \"\$rh/scripts/setup-tunnel.sh\"$(box_setup_config_arg) --alias $(sq "$BOX_ALIAS") --port $(sq "$1") --user $(sq "$LAPTOP_USER") \"\$@\"

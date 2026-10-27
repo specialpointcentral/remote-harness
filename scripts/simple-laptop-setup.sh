@@ -19,20 +19,27 @@ else
   exit 2
 fi
 
-prompt_line() {
+prompt_line() {  # $1=label $2=default $3=required [$4=path: Tab completes local file names]
   _label="$1"
   _default="${2:-}"
   _required="${3:-0}"
   _answer=""
   while :; do
     if [ -n "$_default" ]; then
-      printf '%s [%s]: ' "$_label" "$_default" >/dev/tty
+      _shown=$(printf '%s [%s]: ' "$_label" "$_default")
     else
-      printf '%s: ' "$_label" >/dev/tty
+      _shown=$(printf '%s: ' "$_label")
     fi
-    if [ -r /dev/tty ]; then
+    if [ "${4:-}" = path ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+      # readline (read -e): Tab completes file names and the arrow keys edit. It draws the prompt and
+      # the echo itself, so both go to the terminal. The default is shown, never prefilled: with -i a
+      # pasted absolute path would be appended to it.
+      IFS= read -r -e -p "$_shown" _answer </dev/tty 2>/dev/tty || _answer=""
+    elif [ -r /dev/tty ]; then
+      printf '%s' "$_shown" >/dev/tty
       IFS= read -r _answer </dev/tty || _answer=""
     else
+      printf '%s' "$_shown" >/dev/tty
       IFS= read -r _answer || _answer=""
     fi
     [ -n "$_answer" ] || _answer="$_default"
@@ -40,7 +47,7 @@ prompt_line() {
       printf '%s' "$_answer"
       return 0
     fi
-    if is_zh; then warn "该值必填。"; else warn "This value is required."; fi
+    if is_zh; then warn "该值必填。" >&2; else warn "This value is required." >&2; fi
   done
 }
 
@@ -64,7 +71,7 @@ prompt_yes_no() {
     case "$_answer" in
       y|Y|yes|YES|Yes|是|好) return 0;;
       n|N|no|NO|No|否|不) return 1;;
-      *) if is_zh; then warn "请输入 y 或 n。"; else warn "Please answer y or n."; fi;;
+      *) if is_zh; then warn "请输入 y 或 n。" >&2; else warn "Please answer y or n." >&2; fi;;
     esac
   done
 }
@@ -84,11 +91,31 @@ sanitize_namespace() {
   printf '%s' "$_v"
 }
 
+# The prompts run inside $(...), so their warnings go to stderr: on stdout they would become part of
+# the answer.
+# Blanks around a typed path are a typo, not part of it: ASCII ones, and those that input methods and
+# copy-paste bring along (no-break, ideographic and zero-width spaces, a byte-order mark).
+trim_blanks() {
+  _tb=$1
+  while :; do
+    _tb_before=$_tb
+    _tb="${_tb#"${_tb%%[![:space:]]*}"}"
+    _tb="${_tb%"${_tb##*[![:space:]]}"}"
+    for _tb_blank in $'\xc2\xa0' $'\xe3\x80\x80' $'\xe2\x80\x8b' $'\xef\xbb\xbf'; do
+      _tb="${_tb#"$_tb_blank"}"
+      _tb="${_tb%"$_tb_blank"}"
+    done
+    [ "$_tb" != "$_tb_before" ] || break
+  done
+  printf '%s' "$_tb"
+}
+
 expand_project_dir() {
-  _v="$1"
+  # `${_v#??}` drops the "~/": an unquoted ~ in a pattern is itself tilde-expanded and never matches.
+  _v=$(trim_blanks "$1")
   case "$_v" in
     "~") _v="$HOME";;
-    "~/"*) _v="$HOME/${_v#~/}";;
+    "~/"*) _v="$HOME/${_v#??}";;
   esac
   printf '%s' "${_v%/}"
 }
@@ -100,9 +127,9 @@ choose_project_dir() {
     if [ "$_prompt" = 1 ] || [ -z "$_candidate" ]; then
       _default="${_candidate:-$PWD}"
       if is_zh; then
-        _candidate="$(prompt_line '本地项目目录' "$_default" 1)"
+        _candidate="$(prompt_line '本地项目目录' "$_default" 1 path)"
       else
-        _candidate="$(prompt_line 'Local project directory' "$_default" 1)"
+        _candidate="$(prompt_line 'Local project directory' "$_default" 1 path)"
       fi
       _prompt=0
     fi
@@ -111,7 +138,7 @@ choose_project_dir() {
       (cd "$_candidate" 2>/dev/null && pwd -P) || printf '%s' "$_candidate"
       return 0
     fi
-    if is_zh; then warn "项目目录不存在：$_candidate"; else warn "Project directory does not exist: $_candidate"; fi
+    if is_zh; then warn "项目目录不存在：'$_candidate'" >&2; else warn "Project directory does not exist: '$_candidate'" >&2; fi
     _candidate=""
   done
 }
