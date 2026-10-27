@@ -19,6 +19,8 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
 - `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
+- `scripts/warm_pool.py`: per-session pool of channels opened ahead of time on the gateway's wait
+  verb (`serve`), and the client half channel-guard and the tool shim use.
 - `reference/` and `docs/`: English Markdown has matching `.cn.md` documentation.
 
 ## Simple Reverse Rules
@@ -51,10 +53,16 @@ it provides files over SSHFS and executes project commands through a forced gate
   forwarding, or TTY. It is for FreeIPA/sssd-style hosts whose sshd ignores `~/.ssh/authorized_keys`,
   and it stops with the tunnel's resource record.
 - The gateway accepts only standard SFTP, `remote-harness-health`,
-  `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`, and
-  `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`; the tool verb execs the binary
-  directly (no shell, fixed PATH). Watched exec and the tool verb give the command `/dev/null`
-  stdin and stop its process group and tree when the SSH channel closes.
+  `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`,
+  `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`, and `remote-harness-wait`; the tool
+  verb execs the binary directly (no shell, fixed PATH). Watched exec and the tool verb give the
+  command `/dev/null` stdin and stop its process group and tree when the SSH channel closes.
+- `remote-harness-wait` (the agent host's warm channel pool, `warm_pool.py`) prints
+  `RH_WAIT_READY`, reads exactly one complete line that must itself be an exec or tool request,
+  acknowledges it with `RH_WAIT_GOT` before anything runs, and handles it through the same checks
+  and dispatcher. It never accepts health, SFTP, or another wait. Clients send a request on the
+  ordinary path only when it was provably not delivered (not written, or not acknowledged); a Bash
+  request that was acknowledged is never retried.
 - The registered physical project root must match every exec request.
 - Reject direct local launches of `claude`, `codex`, and `opencode` in both hook and dispatcher;
   scrub common AI credentials and shadow those binaries in the local command PATH.
@@ -106,7 +114,7 @@ it provides files over SSHFS and executes project commands through a forced gate
 
 ```bash
 bash -n manage.sh tests/regression.sh scripts/*.sh
-python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py tests/codex_tui_e2e.py
+python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py scripts/warm_pool.py tests/codex_tui_e2e.py
 bash tests/regression.sh
 git diff --check
 ```

@@ -49,6 +49,21 @@ require_session_root() {  # $1 = requested project root (base64)
   [ -x "$dispatcher" ] || fail "project-host dispatcher is unavailable"
 }
 
+# A waiting channel, opened ahead of use by the agent host's warm pool (warm_pool.py): say it is ready,
+# then take exactly one request line from the channel and handle it as the same exec or tool request
+# sent as the SSH command. Only a complete line counts. RH_WAIT_GOT acknowledges it before anything
+# runs, so a client whose channel fails without it knows the request never arrived. The rest of the
+# channel stays the request's stdin, so closing it still cancels the command.
+if [ "$original" = remote-harness-wait ]; then
+  printf 'RH_WAIT_READY\n'
+  IFS= read -r original || fail "incomplete request on a waiting channel"
+  case "$original" in
+    remote-harness-exec\ *|remote-harness-tool\ *) ;;
+    *) fail "a waiting channel accepts only exec and tool requests" ;;
+  esac
+  printf 'RH_WAIT_GOT\n'
+fi
+
 case "$original" in
   remote-harness-health)
     printf 'RH_OK %s %s' "$(hostname 2>/dev/null || printf unknown)" "$(id -un 2>/dev/null || printf unknown)"

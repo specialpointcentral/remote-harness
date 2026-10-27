@@ -37,7 +37,9 @@ gateway accepts only:
 - `remote-harness-health`;
 - `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`;
 - `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`, where each argument is
-  `base64("x" + arg)` joined by commas.
+  `base64("x" + arg)` joined by commas;
+- `remote-harness-wait`, a channel opened ahead of use that takes one exec or tool request line
+  (see Warm Channels).
 
 The gateway rejects arbitrary SSH shell commands and verifies that the requested project root
 matches the root registered by the local bootstrap. A matching unrestricted user key is a fatal
@@ -116,6 +118,35 @@ Routed commands and tool calls pass, on the command line only, `ServerAliveInter
 The master is skipped when that path is too long for a Unix socket. A dead tunnel ends the master
 in about 30 seconds, an idle master exits after five minutes, a stale socket is replaced
 automatically, and SSHFS keeps its own unshared connection.
+
+## Warm Channels
+
+Opening a new SSH channel costs two to three round trips before its command runs (240 ms on an
+80 ms link). With python3 on the agent host, `rh-session` starts `warm_pool.py serve`, which keeps
+channels already open on the gateway's `remote-harness-wait` verb over its own multiplexed
+connection (`runtime/wm.<session id>`), so a routed Bash or git/rg call pays about one round trip:
+
+1. The client (channel-guard for Bash, the tool shim for git/rg) asks the pool's private Unix socket
+   (`runtime/warm.<session id>`) for a ready channel and receives its stdin, stdout, and stderr as
+   file descriptors; the pool keeps none of them.
+2. It writes the same request line it would send as the SSH command. The gateway acknowledges it
+   with `RH_WAIT_GOT` before anything runs and handles it through the same checks and dispatcher.
+3. The client relays the output; the pool reports the exit status when the channel's ssh exits and
+   opens a replacement. Each channel serves one request, so streams, exit status, and "closing
+   stdin stops the command" are unchanged.
+
+Delivery is exactly once. A request that could not be written, or that the project host never
+acknowledged, did not run and takes the ordinary path. An acknowledged Bash request is never sent
+again; read-only git/rg calls keep their existing retry. No pool, no ready channel, or an old gateway
+without the wait verb also means the ordinary path, so the pool never makes a command fail.
+
+The pool starts with `RH_WARM_MIN` ready channels (1), adds one whenever a client finds it empty,
+holds at most `RH_WARM_MAX` channels on its connection (8, below sshd's default `MaxSessions 10`),
+closes channels idle for `RH_WARM_IDLE` seconds (90) down to the minimum, and renews a ready channel
+after `RH_WARM_MAX_AGE` seconds (600). Channels that fail to open back off up to 30 seconds and a
+dead connection is rebuilt. The pool exits with its agent (also an unreaped one) or its session dir,
+removes only the sockets it created, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0`
+turns it off.
 
 ## Abnormal Disconnects
 

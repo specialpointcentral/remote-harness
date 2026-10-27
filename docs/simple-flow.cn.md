@@ -87,7 +87,8 @@ SSHFS 的查找缓存（同时在后台执行一条空的转发命令，提前�
 
 - SSHFS 所需的标准 SFTP 请求；
 - `remote-harness-health`；
-- 固定的 `remote-harness-exec` 请求。
+- 固定的 `remote-harness-exec` 和 `remote-harness-tool` 请求：作为 SSH 命令发送，或作为预先打开的
+  `remote-harness-wait` 通道上唯一的一行请求发送。
 
 任意 SSH 命令都会被拒绝。如果同一 key 已在托管 forced gateway 块之外获得授权，也会拒绝继续，
 因为该授权能够绕过 gateway。

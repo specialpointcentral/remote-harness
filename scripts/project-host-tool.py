@@ -133,6 +133,7 @@ GIT_LOCAL_ARGS = ("--batch", "--open-files-in-pager", "--output", "--pathspec-fr
 GIT_SSHFS_CONFIG = ["-c", "core.checkStat=minimal", "-c", "core.trustctime=false"]
 
 current_proc: subprocess.Popen | None = None
+current_claim = None  # a warm channel in use (warm_pool.Claim)
 
 
 class StayLocal(Exception):
@@ -468,6 +469,55 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
     return status, emitted, stderr
 
 
+def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewriter) -> tuple[int, bool, bytes] | None:
+    """The call on a channel the session's warm pool opened ahead of time (warm_pool.py), or None when
+    there is none or the project host never acknowledged the request, so nothing ran."""
+    global current_claim
+    args = ctx.args
+    if not args.warm_socket:
+        return None
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # warm_pool.py sits beside us
+    import warm_pool
+
+    held = warm_pool.claim(args.warm_socket)
+    if held is None:
+        return None
+    current_claim = held
+    request = " ".join(("remote-harness-tool", base64.b64encode(os.fsencode(args.project_root)).decode("ascii"),
+                        base64.b64encode(os.fsencode(relative)).decode("ascii"), args.tool, spec))
+    errors: list[bytes] = []
+    emitted = False
+    out = sys.stdout.buffer
+
+    def on_stdout(chunk: bytes) -> None:
+        nonlocal emitted
+        data = rewriter.feed(chunk)
+        if data:
+            out.write(data)
+            out.flush()
+            emitted = True
+
+    try:
+        status = warm_pool.run(held, request, on_stdout, errors.append)
+        tail = rewriter.flush()
+        if tail:
+            out.write(tail)
+            out.flush()
+            emitted = True
+    except warm_pool.NotDelivered:
+        return None
+    except BrokenPipeError:
+        held.close()
+        os._exit(141)
+    finally:
+        held.close()
+        current_claim = None
+    stderr = b"".join(errors)
+    if ctx.root != ctx.used_mount:
+        stderr = stderr.replace(os.fsencode(ctx.root), os.fsencode(ctx.used_mount))
+    return status, emitted, stderr
+
+
 def route(ctx: Context, effective: str, routed: list[str]) -> int:
     args = ctx.args
     relative = os.path.relpath(os.path.realpath(effective), ctx.mount_real)
@@ -490,14 +540,17 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
         sys.stderr.write(f"remote-harness: too many concurrent project-host {args.tool} calls\n")
         return TRANSPORT_FAILURE
     try:
-        status, emitted, stderr = run_attempt(runner_command(args, relative, spec, True), rewriter(), ctx)
-        if status == TRANSPORT_FAILURE and not emitted and args.control_path:
-            # The shared master may be dead, wedged on a dropped tunnel, or out of sessions. The call
-            # is read-only, so retire the master and retry once on a fresh direct connection.
-            stop_master(args)
-            status, emitted, stderr = run_attempt(
-                runner_command(args, relative, spec, False), rewriter(), ctx
-            )
+        # A warm channel first. The call is read-only, so one that failed on its transport without
+        # output is safe to run again on a new channel.
+        result = warm_attempt(ctx, relative, spec, rewriter())
+        if result is None or (result[0] == TRANSPORT_FAILURE and not result[1]):
+            result = run_attempt(runner_command(args, relative, spec, True), rewriter(), ctx)
+            if result[0] == TRANSPORT_FAILURE and not result[1] and args.control_path:
+                # The shared master may be dead, wedged on a dropped tunnel, or out of sessions:
+                # retire it and retry once on a fresh direct connection.
+                stop_master(args)
+                result = run_attempt(runner_command(args, relative, spec, False), rewriter(), ctx)
+        status, emitted, stderr = result
     finally:
         os.close(slot)
     if status == 127 and not emitted and missing_message(args.tool) in stderr:
@@ -539,6 +592,8 @@ def run_local(ctx: Context, argv: list[str]) -> int:
 
 
 def handle_signal(signum: int, _frame: object) -> None:
+    if current_claim is not None:
+        current_claim.close()  # closing the channel's stdin stops the tool on the project host
     proc = current_proc
     if proc is not None and proc.poll() is None:
         proc.terminate()
@@ -556,7 +611,8 @@ class Args:
     """The shim's options as inject-rule.sh writes them: `--name value` pairs, no argparse needed."""
 
     OPTIONS = ("--tool", "--real", "--real-argv0", "--runner", "--ssh-config", "--alias",
-               "--project-root", "--mount-root", "--control-path", "--slots-dir", "--concurrency")
+               "--project-root", "--mount-root", "--control-path", "--slots-dir", "--concurrency",
+               "--warm-socket")
     REQUIRED = ("tool", "runner", "ssh_config", "alias", "project_root", "mount_root", "slots_dir")
 
     def __init__(self, argv: list[str]) -> None:
@@ -564,6 +620,7 @@ class Args:
         self.real_argv0 = ""  # e.g. a native Claude binary serving `rg`
         self.control_path = ""
         self.concurrency = "6"
+        self.warm_socket = ""  # the session's warm pool, when it has one
         if len(argv) % 2:
             raise ValueError("every option needs a value")
         for flag, value in zip(argv[::2], argv[1::2]):

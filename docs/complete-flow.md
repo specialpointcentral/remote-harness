@@ -20,7 +20,8 @@
 12. The selected agent starts through `ssh -tt` on the remote server.
 13. File tools use SSHFS. Bash uses `remote-harness-exec` and runs in the mapped local project cwd
     with the login shell's environment (a per-session snapshot for bash/zsh). Agent-internal `git`/`rg`
-    scans use `remote-harness-tool`.
+    scans use `remote-harness-tool`. Both are sent on a warm channel (`remote-harness-wait`, opened
+    ahead of time by the session's `warm_pool.py`) when one is ready.
 14. Agent/Spawn tools create remote subagents; they are not routed locally.
 15. Cleanup releases this session's lease under the resource lock. The final user releases the
     mount and its transport; shared keys/configs/runtime/mux remain. Local records retain the

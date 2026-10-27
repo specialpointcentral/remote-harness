@@ -52,14 +52,25 @@
   运行时快照加载失败，则拒绝这一条命令（状态 125）并丢弃快照。启动时设置 `RH_SHELL_SNAPSHOT=off`
   可关闭。两种方式都会在 profile 之后再次清除 AI 凭据。不会带过来的：未导出的 shell 变量和 zsh 的 alias
   （bash 本来就不在命令里展开 alias）。
-- `project-host-gateway.sh`：只接受 SFTP、health、固定 exec 协议和 `git`/`rg` 工具动词的
-  forced SSH command。它把自己的会话目录传给 exec dispatcher，覆盖客户端可能带来的同名值。
+- `project-host-gateway.sh`：只接受 SFTP、health、固定 exec 协议、`git`/`rg` 工具动词和
+  `remote-harness-wait` 的 forced SSH command。`remote-harness-wait` 先输出 `RH_WAIT_READY`，从通道读一行
+  完整的 exec 或 tool 请求，以 `RH_WAIT_GOT` 确认，然后按同样的 SSH 命令处理。它把自己的会话目录传给
+  exec dispatcher，覆盖客户端可能带来的同名值。
 - `channel-guard.py`：远端有 python3 时包装会话 Bash runner，命令运行期间一直持有 SSH 通道，
-  使项目主机在取消或断线时终止命令树。
+  使项目主机在取消或断线时终止命令树。带 `--warm SOCKET --warm-request LINE`（由 `rh-run` 写入）时，
+  先在预热通道上发送请求并转发输出；没写进去或没有被确认的请求改走普通路径，保证只执行一次。
+- `warm_pool.py`：`serve`（由 `rh-session` 启动，每会话一个）通过自己的复用连接
+  （`runtime/wm.<会话 ID>`）在 gateway 的 wait 动词上保持已打开的通道，经 `runtime/warm.<会话 ID>`
+  以文件描述符的形式交给客户端，并报告退出码。通道数在 `RH_WARM_MIN`（1）到 `RH_WARM_MAX`（8）之间：
+  客户端遇到池空时增加，空闲 `RH_WARM_IDLE`（90 秒）后收缩，就绪通道每 `RH_WARM_MAX_AGE`（600 秒）
+  更新；打不开的通道退避，断开的连接重建，遇到不支持 wait 的 gateway 就停用，随 Agent 或会话目录退出，
+  日志写在会话目录的 `warm.log`。`RH_WARM_MAX=0` 关闭。模块的客户端部分（`claim`、`run`）只导入
+  os、socket、array 和 select。
 - `project-host-tool.py`：远端会话的 `git`、`rg` PATH 垫片。挂载点内的工作区扫描在项目主机执行，
   只读发现命令（`rev-parse`、`config --get` 等）也在项目主机执行，路径双向翻译；会写入的 git 调用和挂载点外的
   调用使用远端真实工具。路由调用共享并发上限
-  （`RH_TOOL_CONCURRENCY`，默认 6），传输失败时不经复用 master 重试一次，否则以非零退出。
+  （`RH_TOOL_CONCURRENCY`，默认 6），先尝试预热通道（`--warm-socket`）；传输失败且没有输出时改走普通
+  路径，再不经复用 master 重试一次，否则以非零退出。
 - `session-reaper.sh`：远端每会话 watcher 加启动时 GC。Agent 进程消失（或其终端已挂断）时，
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录
   以及会话 SSH config 和 private key。经隧道的心跳检查连续失败满 `RH_HEARTBEAT_TIMEOUT` 秒后结束 Agent；

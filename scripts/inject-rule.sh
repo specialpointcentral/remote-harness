@@ -178,15 +178,18 @@ write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
 # and keeps the script dir and user site off sys.path, -S skips importing site (about 3 ms a start).
 PY_FLAGS="-I -S"
 
-write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config $5=control path $6=python3
+write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config $5=control path $6=python3 [$7=warm pool socket]
   _wsr_runner="$1/bin/rh-run"
   _wsr_mux=""
   [ -z "${5:-}" ] || _wsr_mux=" --control-path $(sq "$5")"
   # With python3, channel-guard.py holds the SSH channel open for the command's lifetime so the
-  # project host stops the command tree when this call is cancelled or the connection drops.
+  # project host stops the command tree when this call is cancelled or the connection drops. With a
+  # warm pool it first sends the same request on a channel opened ahead of time (warm_pool.py).
   _wsr_guard=""
   if [ -n "${6:-}" ] && [ -f "$SCRIPT_DIR/channel-guard.py" ]; then
-    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") -- "
+    _wsr_warm=""
+    [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") $_wsr_warm-- "
     _wsr_mux="$_wsr_mux --watch"
   fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
@@ -215,6 +218,18 @@ session_control_path() {  # $1=ssh config
   printf '%s' "$_scp_path"
 }
 
+# The warm pool's Unix socket and its connection's control socket, beside the session mux socket. Both
+# stay empty (no pool) without a session id or when a path would be too long for a Unix socket.
+session_warm_paths() {  # $1=ssh config $2=session id -> sets warm_socket, warm_control
+  warm_socket="" warm_control=""
+  _swp_mux=$(session_control_path "$1")
+  [ -n "$_swp_mux" ] && [ -n "${2:-}" ] || return 0
+  _swp_dir=$(dirname "$_swp_mux")
+  [ "${#_swp_dir}" -le $((86 - 4 - ${#2})) ] || return 0
+  warm_socket="$_swp_dir/warm.$2"
+  warm_control="$_swp_dir/wm.$2"
+}
+
 # Session metadata for session-reaper.sh (values base64-encoded; never sourced or evaluated).
 write_session_meta() {  # $1=session dir $2=agent $3=mountpoint $4=alias $5=ssh config $6=control path
   {
@@ -237,7 +252,7 @@ write_session_meta() {  # $1=session dir $2=agent $3=mountpoint $4=alias $5=ssh 
 
 # Session launcher: records the agent's pid/start time/terminal, starts the detached server-side
 # watcher, then execs the agent (same pid). Used only for the final interactive launch.
-write_session_launcher() {  # $1=session dir
+write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm control $5=ssh config $6=alias]
   _wsl_launcher="$1/bin/rh-session"
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
@@ -246,6 +261,9 @@ write_session_launcher() {  # $1=session dir
     printf 'reaper=%s\n' "$(sq "$SCRIPT_DIR/session-reaper.sh")"
     printf 'rh_home=%s\n' "$(sq "${RH_HOME:-$HOME/.remote-harness}")"
     printf 'lease=%s\n' "$(sq "${SESSION_LEASE:-}")"
+    printf 'warm_python=%s warm_socket=%s warm_control=%s warm_config=%s warm_alias=%s\n' \
+      "$(sq "${2:-}")" "$(sq "${3:-}")" "$(sq "${4:-}")" "$(sq "${5:-}")" "$(sq "${6:-}")"
+    printf 'warm_pool=%s\n' "$(sq "$SCRIPT_DIR/warm_pool.py")"
     cat <<'EOS'
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
@@ -263,6 +281,15 @@ if [ -d "$sd" ]; then
       RH_HOME="$rh_home" nohup "$reaper" watch "$sd" </dev/null >/dev/null 2>&1 &
     fi
   fi
+  # The warm pool lives as long as this agent (its pid is ours after exec); see warm_pool.py. "$@" is
+  # the agent command, so the pool's arguments are spelled out rather than built with set --.
+  if [ -n "$warm_socket" ] && [ -x "$warm_python" ] && [ -f "$warm_pool" ]; then
+    detach=nohup
+    command -v setsid >/dev/null 2>&1 && detach=setsid
+    "$detach" "$warm_python" -I -S "$warm_pool" serve --socket "$warm_socket" --control-path "$warm_control" \
+      --ssh-config "$warm_config" --alias "$warm_alias" --owner-pid "$$" --session-dir "$sd" \
+      --log "$sd/warm.log" </dev/null >/dev/null 2>&1 &
+  fi
 fi
 exec "$@"
 EOS
@@ -271,17 +298,18 @@ EOS
   printf '%s' "$_wsl_launcher"
 }
 
-# PATH shims that send IO-heavy git/rg work-tree scans to the project host (project-host-tool.py).
+# PATH shims that send IO-heavy git/rg work-tree scans to the project host (project-host-tool.py),
+# through the session's warm pool when session_warm_paths set warm_socket.
 write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project root $6=mountpoint $7=ssh config $8=control path [$9=real argv0]
   _wts_shim="$1/bin/$2"
   _wts_slots="$(dirname "$7" 2>/dev/null)/runtime/tool-slots"
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
-    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s -- "$@"\n' \
+    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s --warm-socket %s -- "$@"\n' \
       "$(sq "$PYTHON3")" "$PY_FLAGS" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
       "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$7")" "$(sq "$4")" "$(sq "$5")" \
-      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")"
+      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")" "$(sq "${warm_socket:-}")"
   } > "$_wts_shim" || return 1
   chmod +x "$_wts_shim" 2>/dev/null || return 1
 }
@@ -484,7 +512,7 @@ case "${1:-}" in
     # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
     source_scripts="$SCRIPT_DIR"
     mkdir "$SD/impl" || abort_session
-    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
+    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
       cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || abort_session
       chmod 500 "$SD/impl/$impl_file" || abort_session
     done
@@ -518,9 +546,14 @@ case "${1:-}" in
     # Command guard and tool shims need python3 on this host; without it, routed commands are not
     # watched and git/rg simply keep their SSHFS behavior.
     PYTHON3=$(command -v python3 2>/dev/null || true)
-    runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3") \
+    # RH_WARM_MAX=0 turns the warm channel pool off; it also needs python3 here.
+    warm_socket="" warm_control=""
+    if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-8}" != 0 ]; then
+      session_warm_paths "$ssh_config" "$sid"
+    fi
+    runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3" "$warm_socket") \
       || abort_session
-    launcher=$(write_session_launcher "$SD") \
+    launcher=$(write_session_launcher "$SD" "$PYTHON3" "$warm_socket" "$warm_control" "$ssh_config" "$ba") \
       || abort_session
     prefix_out="$(sq "$launcher")"
     rg_shim=0

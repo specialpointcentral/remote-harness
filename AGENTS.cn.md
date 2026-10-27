@@ -21,6 +21,8 @@
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
 - `scripts/channel-guard.py`：在路由 Bash 命令存续期间持有其 SSH 通道。
+- `scripts/warm_pool.py`：每会话一个、在 gateway 的 wait 动词上预先打开通道的通道池（`serve`），以及
+  channel-guard 和工具垫片使用的客户端部分。
 - `reference/`、`docs/`：英文 Markdown 必须有 `.cn.md` 对应版本。
 
 ## Simple Reverse 规则
@@ -47,10 +49,14 @@
   `AuthorizedKeysCommand none`、只允许公钥、不走 PAM、无转发和 TTY。用于 sshd 不读取
   `~/.ssh/authorized_keys` 的 FreeIPA/sssd 类主机，随隧道的资源记录一起停止。
 - gateway 只接受标准 SFTP、`remote-harness-health`、
-  `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`，以及
-  `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`；工具动词直接 exec 二进制
-  （不经 shell、固定 PATH）。watch 模式的 exec 和工具动词让命令的 stdin 来自 `/dev/null`，并在 SSH
-  通道关闭时终止命令的进程组和进程树。
+  `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`、
+  `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`，以及 `remote-harness-wait`；工具动词
+  直接 exec 二进制（不经 shell、固定 PATH）。watch 模式的 exec 和工具动词让命令的 stdin 来自
+  `/dev/null`，并在 SSH 通道关闭时终止命令的进程组和进程树。
+- `remote-harness-wait`（Agent 主机的预热通道池 `warm_pool.py`）先输出 `RH_WAIT_READY`，只读取一行
+  完整请求，这一行本身必须是 exec 或 tool 请求；在执行任何东西之前先以 `RH_WAIT_GOT` 确认，然后走同样
+  的校验和 dispatcher。它绝不接受 health、SFTP 或嵌套的 wait。客户端只在请求确定没有送达（没写进去，
+  或没有收到确认）时才改走普通路径；已确认的 Bash 请求绝不重试。
 - 每次 exec 的项目根必须与本机会话登记的物理根一致。
 - hook 和 dispatcher 都拒绝直接在本机启动 `claude`、`codex`、`opencode`；清除常见 AI 凭据，
   并在本机命令 PATH 中屏蔽这些二进制。
@@ -95,7 +101,7 @@
 
 ```bash
 bash -n manage.sh tests/regression.sh scripts/*.sh
-python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py tests/codex_tui_e2e.py
+python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py scripts/warm_pool.py tests/codex_tui_e2e.py
 bash tests/regression.sh
 git diff --check
 ```

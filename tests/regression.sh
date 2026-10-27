@@ -259,6 +259,32 @@ if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='internal-sftp -h' \
 fi
 refute_grep "$router_tmp/gateway-sftp.err" "unsupported SSH command" "forced-command gateway rejected the standard internal-sftp request"
 
+# A waiting channel takes one complete exec/tool request line from stdin and nothing else.
+gw_wait() {  # $1 = stdin bytes
+  printf '%s' "$1" | HOME="$gateway_home" SSH_ORIGINAL_COMMAND=remote-harness-wait \
+    sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag"
+}
+wait_marker="$router_tmp/wait-ran"
+wait_out=$(gw_wait "remote-harness-exec $(b64 "$router_tmp/project") $(b64 packages/api) $(b64 'printf wait-ok')
+")
+assert_eq "waiting channel acknowledges and runs one exec request" "$wait_out" "$(printf 'RH_WAIT_READY\nRH_WAIT_GOT\nwait-ok')"
+for wait_bad in \
+    "remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 ": > $wait_marker")" \
+    "remote-harness-health
+" \
+    "remote-harness-wait
+" \
+    "internal-sftp
+" \
+    "remote-harness-exec $(b64 /elsewhere) $(b64 .) $(b64 ": > $wait_marker")
+"; do
+  if gw_wait "$wait_bad" >"$router_tmp/wait-bad.out" 2>"$router_tmp/wait-bad.err"; then
+    fail "waiting channel accepted: $(printf '%s' "$wait_bad" | head -c 40)"
+  fi
+done
+[ ! -e "$wait_marker" ] || fail "waiting channel ran a rejected or incomplete request"
+assert_grep "$router_tmp/wait-bad.err" "project root does not match" "waiting channel checks the project root"
+
 # --- direct project-host tools: gateway verb, dispatcher, agent-host shim -----------------------
 tool_proj="$router_tmp/tool-project"
 tool_mount="$router_tmp/tool-mount"
@@ -518,6 +544,20 @@ wait_until 100 tree_gone 49 || fail "project-host command kept running after its
 guard_rc=0
 PATH="$shim_bin:$PATH" python3 -I "$ROOT/scripts/channel-guard.py" -- sh -c 'exit 5' || guard_rc=$?
 assert_eq "channel guard returns the command status" "$guard_rc" "5"
+# Warm channel problems leave the guard on the ordinary path: no pool, or a request it will not send.
+guard_out=$(python3 -I -S "$ROOT/scripts/channel-guard.py" --warm "$tmp/no-pool" \
+  --warm-request "remote-harness-exec $(b64 /p) $(b64 .) $(b64 true) watch" -- sh -c 'printf cold')
+assert_eq "guard without a warm pool runs the ordinary path" "$guard_out" "cold"
+guard_out=$(python3 -I -S "$ROOT/scripts/channel-guard.py" --warm "$tmp/no-pool" --warm-request "uname -a" \
+  -- sh -c 'printf cold2')
+assert_eq "guard never sends a malformed warm request" "$guard_out" "cold2"
+RH_WARM_MAX=0 python3 -I -S "$ROOT/scripts/warm_pool.py" serve --socket "$tmp/p" --control-path "$tmp/c" \
+  --ssh-config /dev/null --alias a --owner-pid $$ --session-dir "$tmp" --log "$tmp/warm-off.log" \
+  || fail "warm pool with RH_WARM_MAX=0 did not exit cleanly"
+[ ! -e "$tmp/p" ] || fail "warm pool with RH_WARM_MAX=0 created its socket"
+if python3 -I -S "$ROOT/scripts/warm_pool.py" serve --socket "$tmp/p" 2>/dev/null; then
+  fail "warm pool accepted incomplete arguments"
+fi
 
 parse_via "ssh -J jump -p 2222 -i /tmp/key dev@example.com"
 assert_eq "host" "$V_HOST" "example.com"
@@ -1811,6 +1851,21 @@ wr_nopy_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-nopy" | LC_ALL=C tr -c
 refute_grep_e "$wr_nopy_sd/bin/rh-run" 'channel-guard|--watch' "runner requires python3 that is not installed"
 [ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount" >/dev/null
+# With a session id and python3 the runner, launcher and shims use the session's warm pool.
+mkdir -p "$tmp/wr-mount-warm"
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount-warm" 0 "$basic_ssh_cfg" rev.warm > /dev/null
+wr_warm_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-warm" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').rev.warm"
+assert_grep "$wr_warm_sd/bin/rh-run" "--warm '$tmp/runtime/warm.rev.warm'" "runner tries the session's warm pool"
+assert_grep "$wr_warm_sd/bin/rh-run" "remote-harness-exec " "runner hands the guard the request line"
+assert_grep "$wr_warm_sd/bin/rh-session" "warm_pool.py" "launcher starts the warm pool"
+assert_grep "$wr_warm_sd/bin/git" "--warm-socket '$tmp/runtime/warm.rev.warm'" "git shim uses the warm pool"
+[ -f "$wr_warm_sd/impl/warm_pool.py" ] || fail "session implementation lacks warm_pool.py"
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount-warm" rev.warm >/dev/null
+RH_WARM_MAX=0 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount-warm" 0 "$basic_ssh_cfg" rev.cold > /dev/null
+wr_cold_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-warm" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').rev.cold"
+refute_grep "$wr_cold_sd/bin/rh-run" "--warm" "RH_WARM_MAX=0 leaves the warm pool out of the runner"
+assert_grep "$wr_cold_sd/bin/git" "--warm-socket ''" "RH_WARM_MAX=0 leaves the warm pool out of the shims"
+RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount-warm" rev.cold >/dev/null
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/wr-mount-nopy" >/dev/null
 
 bash "$ROOT/tests/resources.sh"

@@ -108,7 +108,8 @@ The forced local gateway accepts only:
 
 - standard SFTP requests needed by SSHFS;
 - `remote-harness-health`;
-- the fixed `remote-harness-exec` request.
+- the fixed `remote-harness-exec` and `remote-harness-tool` requests, sent as the SSH command or
+  as the one request line on a `remote-harness-wait` channel opened ahead of time.
 
 Arbitrary SSH commands are rejected. A matching key already authorized outside the managed forced
 gateway block is also rejected, because that authorization would bypass the gateway.

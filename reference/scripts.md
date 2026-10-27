@@ -62,15 +62,28 @@
   again after the profile. Not carried over: non-exported shell variables and zsh aliases (bash does
   not expand aliases in commands anyway).
 - `project-host-gateway.sh`: forced SSH command accepting only SFTP, health, the fixed exec protocol,
-  and the `git`/`rg` tool verb. It passes its session directory to the exec dispatcher, overriding any
+  the `git`/`rg` tool verb, and `remote-harness-wait`, which prints `RH_WAIT_READY`, reads one complete
+  exec or tool request line from the channel, acknowledges it with `RH_WAIT_GOT`, and handles it like
+  the same SSH command. It passes its session directory to the exec dispatcher, overriding any
   client-supplied value.
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
   open while the command runs so the project host stops the command tree on cancel or disconnect.
+  With `--warm SOCKET --warm-request LINE` (written by `rh-run`) it first sends the request on a warm
+  channel and relays its output; a request that was not written or not acknowledged runs on the
+  ordinary path instead, so it runs exactly once.
+- `warm_pool.py`: `serve` (started by `rh-session`, one per session) keeps channels open on the
+  gateway's wait verb over its own multiplexed connection (`runtime/wm.<session id>`) and hands one
+  to a client over `runtime/warm.<session id>` as file descriptors, then reports its exit status. The
+  pool holds `RH_WARM_MIN` (1) to `RH_WARM_MAX` (8) channels, grows when a client finds it empty,
+  shrinks after `RH_WARM_IDLE` (90 s) idle, renews a channel after `RH_WARM_MAX_AGE` (600 s), backs off
+  channels that fail to open, rebuilds a dead connection, stops for a gateway without the wait verb,
+  exits with its agent or session dir, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0`
+  turns it off. The module's client half (`claim`, `run`) imports only os, socket, array and select.
 - `project-host-tool.py`: remote session PATH shim for `git` and `rg`. Work-tree scans inside the
   mount and read-only discovery (`rev-parse`, `config --get`, ...) run on the project host with paths
   translated both ways; git calls that write and calls outside the mount run the real remote tool. Routed calls share a concurrency cap (`RH_TOOL_CONCURRENCY`,
-  default 6), retry once without the multiplexing master on a transport failure, and otherwise fail
-  non-zero.
+  default 6), try a warm channel first (`--warm-socket`), retry on the ordinary path after a transport
+  failure without output, once more without the multiplexing master, and otherwise fail non-zero.
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is
   gone (or its terminal was hung up), it stops the multiplexing master and leftover routed processes,
   unmounts the session mount unless another live session uses it, and removes the session dir and the

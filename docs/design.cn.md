@@ -35,7 +35,8 @@ port、X11 和 agent forwarding。gateway 只接受：
 - `remote-harness-health`；
 - `remote-harness-exec <root-b64> <cwd-b64> <command-b64> [watch]`；
 - `remote-harness-tool <root-b64> <cwd-b64> <git|rg> <args>`，每个参数编码为
-  `base64("x" + arg)`，以逗号连接。
+  `base64("x" + arg)`，以逗号连接；
+- `remote-harness-wait`：预先打开、接收一行 exec 或 tool 请求的通道（见"预热通道"）。
 
 gateway 拒绝任意 SSH shell，并验证请求项目根与本地 bootstrap 登记的根一致。同一 key 若存在无限制
 用户授权，会作为致命配置错误拒绝，而不是复用。
@@ -100,6 +101,31 @@ PATH 垫片（`project-host-tool.py`）。在 SSHFS 上，这类扫描的每次 
 `ControlPersist=300`），其 socket 位于会话 `runtime/` 目录。该路径超过 Unix socket 长度限制时不启用
 复用。隧道断开后 master 约 30 秒内退出，空闲 master 五分钟后退出，失效 socket 会被自动替换，
 SSHFS 使用自己独立的连接。
+
+## 预热通道
+
+新开一条 SSH 通道，要 2 到 3 个往返才能执行命令（80ms 的线路上约 240ms）。Agent 主机有 python3 时，
+`rh-session` 会启动 `warm_pool.py serve`：它通过自己的复用连接（`runtime/wm.<会话 ID>`）在 gateway
+的 `remote-harness-wait` 动词上保持若干已经打开的通道，于是一次路由的 Bash 或 git/rg 调用只需约 1 个
+往返：
+
+1. 客户端（Bash 用 channel-guard，git/rg 用工具垫片）向通道池的私有 Unix socket
+   （`runtime/warm.<会话 ID>`）要一条就绪通道，以文件描述符的形式拿到它的 stdin、stdout、stderr；
+   通道池自己不再保留任何一个。
+2. 客户端写入与作为 SSH 命令发送时完全相同的请求行。gateway 在执行任何东西之前先用 `RH_WAIT_GOT`
+   确认，然后走同样的校验和 dispatcher。
+3. 客户端转发输出；通道的 ssh 退出时，通道池报告退出码并补开一条。每条通道只服务一次请求，所以
+   输出流、退出码和"关闭 stdin 即停止命令"都不变。
+
+请求只执行一次。没能写进去、或项目主机没有确认的请求并没有执行，改走普通路径；已确认的 Bash 请求
+绝不重发，只读的 git/rg 调用保持原有的重试。没有通道池、没有就绪通道、或旧版 gateway 不支持 wait
+动词，也都走普通路径，所以通道池不会让任何命令失败。
+
+通道池启动时保持 `RH_WARM_MIN` 条就绪通道（1）；客户端每遇到一次池空就加一条；连接上最多
+`RH_WARM_MAX` 条（8，低于 sshd 默认的 `MaxSessions 10`）；空闲超过 `RH_WARM_IDLE` 秒（90）的通道
+关闭到下限；就绪通道每 `RH_WARM_MAX_AGE` 秒（600）更新一次。打不开的通道按最长 30 秒退避，断开的
+连接会重建。Agent 退出（包括尚未被回收的僵尸进程）或会话目录消失时通道池随之退出，只删除自己创建的
+socket，日志写在会话目录的 `warm.log`。`RH_WARM_MAX=0` 可关闭。
 
 ## 异常断开
 

@@ -160,7 +160,8 @@ OpenSSH multiplexing。唯一的 `~/.ssh` 写入例外是在笔记本
 [用户态 sshd](#用户态-sshdfreeipa-等主机) 模式下连这一处也不写。
 
 远端 key 在本机 `authorized_keys` 中绑定 forced command，只允许标准 SFTP、health、
-`remote-harness-exec`，以及只针对 `git`/`rg` 的 `remote-harness-tool`。任意本机 SSH shell 命令会被
+`remote-harness-exec`、只针对 `git`/`rg` 的 `remote-harness-tool`，以及接收一行这类请求的
+`remote-harness-wait`。任意本机 SSH shell 命令会被
 gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PATH 垫片在本机执行，不再在 SSHFS 上
 逐个 lstat 和读文件；生成的 SSH config 仍关闭 multiplexing，只有路由命令在命令行上使用会话级复用
 连接。连接被强制断开、本机来不及清理时，远端会话 watcher 会自行回收挂载、会话目录和临时 key。
@@ -169,6 +170,9 @@ gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PAT
 登录 shell 快照：第一条命令抓取 profile 设置的 PATH、环境变量、函数等，校验通过后启用，满 10 分钟或
 `~/.profile`、`~/.zprofile` 等启动文件变化后自动刷新。快照不含 AI 凭据，任何异常都回退到登录 shell。
 `RH_SHELL_SNAPSHOT=off` 可关闭。
+
+远端会话还会预先打开几条到本机的 SSH 通道（预热通道池），Bash 和 git/rg 调用直接使用，省去每次新开
+通道的 2 到 3 个往返；用不上时自动走原来的路径，请求只执行一次。`RH_WARM_MAX=0` 可关闭。
 
 ### 用户态 sshd（FreeIPA 等主机）
 
@@ -354,6 +358,8 @@ remote-harness/
 - 刚切换的工具版本（如 `nvm alias default`）在项目命令里没生效 → 登录 shell 快照最多 10 分钟后刷新；
   修改启动文件会立即触发刷新。不能接受时加 `RH_SHELL_SNAPSHOT=off` 重新启动。快照为什么没启用，见本机
   `~/.remote-harness/.sessions/gateways/*/shell-snapshot.failed`。
+- 怀疑预热通道有问题（命令偶尔变慢或报 SSH 错误）→ 看远端 `~/.remote-harness/.sessions/*.rev.*/warm.log`；
+  加 `RH_WARM_MAX=0` 重新启动可以对比。
 
 ---
 
@@ -499,7 +505,8 @@ exception is that the laptop may get a tagged temporary `authorized_keys` block 
 removed on exit; [user-mode sshd](#user-mode-sshd-freeipa-style-hosts) does not write even that.
 
 The per-session reverse key is bound to a forced SSH command. Only standard SFTP, health checks,
-`remote-harness-exec`, and the `git`/`rg`-only `remote-harness-tool` verb are accepted; arbitrary
+`remote-harness-exec`, the `git`/`rg`-only `remote-harness-tool` verb, and `remote-harness-wait`, which
+takes one such request line, are accepted; arbitrary
 local SSH shell commands are rejected. Agent-internal Git status scans and file search run on the
 laptop through session PATH shims instead of lstat-ing and reading files over SSHFS; generated SSH
 configs still disable multiplexing, and only routed commands use a session-scoped master passed on
@@ -512,6 +519,11 @@ captures the PATH, variables, functions, and so on that the profile sets, the sn
 passes validation, and it refreshes after 10 minutes or when a startup file such as `~/.profile` or
 `~/.zprofile` changes. It never holds AI credentials, and anything unexpected falls back to a login
 shell. Set `RH_SHELL_SNAPSHOT=off` to disable it.
+
+The remote session also keeps a few SSH channels to the laptop open ahead of time (a warm channel
+pool) for Bash and git/rg calls, saving the two to three round trips of opening one per call; when
+none is usable the call takes the ordinary path, and every request runs exactly once. Set
+`RH_WARM_MAX=0` to disable it.
 
 ### User-mode sshd (FreeIPA-style hosts)
 
@@ -731,3 +743,5 @@ Common issues:
   the login shell snapshot refreshes within 10 minutes, and editing a startup file refreshes it at
   once. If that is not acceptable, relaunch with `RH_SHELL_SNAPSHOT=off`. Why a snapshot is not in
   use is recorded on the laptop in `~/.remote-harness/.sessions/gateways/*/shell-snapshot.failed`.
+- Suspect the warm channel pool (calls occasionally slow, or SSH errors) → read
+  `~/.remote-harness/.sessions/*.rev.*/warm.log` on the remote; relaunch with `RH_WARM_MAX=0` to compare.
