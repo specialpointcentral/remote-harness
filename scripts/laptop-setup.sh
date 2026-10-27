@@ -1421,13 +1421,14 @@ remote_launch_prelude() {
   _warm=$(tr2 "Prewarmed project metadata (.git, settings files)" "预热项目元数据（.git、设置文件）")
   _start=$(tr2 "Starting ${LAUNCH_BASE} (a folder used for the first time asks whether you trust it)..." \
                "启动 ${LAUNCH_BASE}（第一次进入的目录会先询问是否信任）…")
+  # The marks take this terminal's colors (empty when it has none), like ok() and the local steps.
   cat <<EOF
-printf '  \342\234\223 %s\n' $(sq "$_conn")
+printf '  %s\342\234\223%s %s\n' $(sq "$_G") $(sq "$_0") $(sq "$_conn")
 rh_t0=\$(date +%s)
 rh_spin() {
   set -- ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
   while :; do for rh_c in "\$@"; do
-    printf "\\r\\033[K  \$rh_c %s...  %ss" $(sq "$_warming") "\$((\$(date +%s) - rh_t0))"; sleep 0.15
+    printf "\\r\\033[K  %s\$rh_c%s %s...  %ss" $(sq "$_C") $(sq "$_0") $(sq "$_warming") "\$((\$(date +%s) - rh_t0))"; sleep 0.15
   done; done
 }
 rh_sp=""
@@ -1445,8 +1446,8 @@ rh_b=\$(sed -n 's#^ref: refs/heads/##p' .git/HEAD 2>/dev/null)
 rh_up=\$(awk -v b="\$rh_b" '/^\[/ { s = (\$0 == "[branch \"" b "\"]") } s && \$1 == "remote" { r = \$3 } s && \$1 == "merge" { m = \$3; sub("^refs/heads/", "", m) } END { if (r != "" && m != "") print r "/" m }' .git/config 2>/dev/null)
 rh_warm ".git/refs/heads/\$rh_b" ".git/refs/remotes/origin/\$rh_b" ".git/refs/remotes/\$rh_up" .git/refs/remotes/origin/HEAD
 if [ -n "\$rh_sp" ]; then kill -9 "\$rh_sp" 2>/dev/null; wait "\$rh_sp" 2>/dev/null; printf '\r\033[K'; fi
-printf '  \342\234\223 %s  %ss\n' $(sq "$_warm") "\$((\$(date +%s) - rh_t0))"
-printf '  \342\213\257 %s\n' $(sq "$_start")
+printf '  %s\342\234\223%s %s  %ss\n' $(sq "$_G") $(sq "$_0") $(sq "$_warm") "\$((\$(date +%s) - rh_t0))"
+printf '  %s\342\213\257%s %s\n' $(sq "$_C") $(sq "$_0") $(sq "$_start")
 EOF
 }
 launch_remote_agent() {
