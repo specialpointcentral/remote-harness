@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Rewrite a Bash tool call to the remote-harness project-host runner."""
+"""Rewrite a Bash tool call to the remote-harness project-host runner.
+
+It runs before every Bash and Agent call, so it imports only what it uses (no argparse or typing).
+"""
 
 from __future__ import annotations
 
-import argparse
 import base64
 import json
 import os
 import shlex
 import sys
-from typing import Any
 
 
 AGENT_BINARIES = {"claude", "codex", "opencode"}
@@ -21,7 +22,7 @@ def encode(value: str) -> str:
     return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
-def decision(kind: str, **values: Any) -> dict[str, Any]:
+def decision(kind: str, **values: object) -> dict[str, object]:
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -31,7 +32,7 @@ def decision(kind: str, **values: Any) -> dict[str, Any]:
     }
 
 
-def deny(reason: str) -> dict[str, Any]:
+def deny(reason: str) -> dict[str, object]:
     return decision("deny", permissionDecisionReason=reason)
 
 
@@ -58,7 +59,7 @@ def launches_agent(command: str) -> bool:
     return False
 
 
-def route(args: argparse.Namespace) -> dict[str, Any]:
+def route(runner_arg: str, mount_root_arg: str) -> dict[str, object]:
     try:
         event = json.load(sys.stdin)
     except (OSError, json.JSONDecodeError) as error:
@@ -90,11 +91,11 @@ def route(args: argparse.Namespace) -> dict[str, Any]:
     except ValueError as error:
         return deny(f"remote-harness could not safely parse the Bash command: {error}")
 
-    runner = os.path.realpath(os.path.expanduser(args.runner))
+    runner = os.path.realpath(os.path.expanduser(runner_arg))
     if not os.path.isfile(runner) or not os.access(runner, os.X_OK):
         return deny("remote-harness session runner is missing or not executable")
 
-    mount_root = os.path.realpath(os.path.expanduser(args.mount_root))
+    mount_root = os.path.realpath(os.path.expanduser(mount_root_arg))
     requested_cwd = tool_input.get("workdir") or event.get("cwd")
     if not isinstance(requested_cwd, str) or not requested_cwd:
         return deny("remote-harness hook input has no working directory")
@@ -114,14 +115,20 @@ def route(args: argparse.Namespace) -> dict[str, Any]:
     return decision("allow", updatedInput=updated_input)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--runner", required=True)
-    parser.add_argument("--mount-root", required=True)
-    args = parser.parse_args()
+def parse_args(argv: list[str]) -> dict[str, str]:
+    """The fixed `--runner PATH --mount-root PATH` pair that inject-rule.sh writes."""
+    if len(argv) % 2:
+        raise ValueError("options need values")
+    values = dict(zip(argv[::2], argv[1::2]))
+    if sorted(values) != ["--mount-root", "--runner"] or len(argv) != 4:
+        raise ValueError("expected --runner PATH --mount-root PATH")
+    return values
 
+
+def main() -> int:
     try:
-        result = route(args)
+        args = parse_args(sys.argv[1:])
+        result = route(args["--runner"], args["--mount-root"])
     except Exception as error:  # Keep hook execution fail-closed after Python starts.
         result = deny(f"remote-harness command routing failed: {error}")
     json.dump(result, sys.stdout)

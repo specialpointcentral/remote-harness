@@ -14,19 +14,21 @@ fails with a non-zero status; it never falls back to a silent success, a clean s
 
 from __future__ import annotations
 
-import argparse
-import base64
-import fcntl
 import os
-import random
-import re
-import shlex
-import signal
-import subprocess
 import sys
-import threading
-import time
-from typing import Optional
+
+# Every agent-internal git/rg call starts this shim. Modules only a routed call needs are imported once
+# the call is known to route, so one that stays on the agent host does not pay ~14 ms for them.
+def load_routing_modules() -> None:
+    global base64, fcntl, random, re, signal, subprocess, threading, time
+    import base64
+    import fcntl
+    import random
+    import re
+    import signal
+    import subprocess
+    import threading
+    import time
 
 TRANSPORT_FAILURE = 255
 
@@ -130,7 +132,7 @@ GIT_LOCAL_ARGS = ("--batch", "--open-files-in-pager", "--output", "--pathspec-fr
 # host and would otherwise force a content re-read of every tracked file.
 GIT_SSHFS_CONFIG = ["-c", "core.checkStat=minimal", "-c", "core.trustctime=false"]
 
-current_proc: Optional[subprocess.Popen] = None
+current_proc: subprocess.Popen | None = None
 
 
 class StayLocal(Exception):
@@ -142,7 +144,7 @@ class ToolMissing(Exception):
 
 
 class Context:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: Args) -> None:
         self.args = args
         self.mount_real = os.path.realpath(args.mount_root)
         variants = {self.mount_real, os.path.normpath(os.path.abspath(args.mount_root))}
@@ -159,7 +161,7 @@ class Context:
         except ValueError:
             return False
 
-    def mount_prefix(self, path: str) -> Optional[str]:
+    def mount_prefix(self, path: str) -> str | None:
         for mount in self.mounts:
             if path == mount or path.startswith(mount.rstrip("/") + "/"):
                 return mount
@@ -212,6 +214,8 @@ def git_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
     # session start would otherwise scan the whole work tree over SSHFS and stall the agent.
     params = os.environ.get("GIT_CONFIG_PARAMETERS", "")
     if params.strip():
+        import shlex  # here: only calls that carry config entries need it
+
         try:
             entries = shlex.split(params)
         except ValueError:
@@ -360,7 +364,7 @@ class OutputRewriter:
         return self._record(data) if data else b""
 
 
-def acquire_slot(directory: str, limit: int, wait_seconds: float) -> Optional[int]:
+def acquire_slot(directory: str, limit: int, wait_seconds: float) -> int | None:
     os.makedirs(directory, mode=0o700, exist_ok=True)
     deadline = time.monotonic() + wait_seconds
     order = list(range(limit))
@@ -378,7 +382,7 @@ def acquire_slot(directory: str, limit: int, wait_seconds: float) -> Optional[in
         time.sleep(0.05)
 
 
-def runner_command(args: argparse.Namespace, relative: str, spec: str, mux: bool) -> list[str]:
+def runner_command(args: Args, relative: str, spec: str, mux: bool) -> list[str]:
     command = [
         args.runner,
         "--ssh-config", args.ssh_config,
@@ -396,7 +400,7 @@ def runner_command(args: argparse.Namespace, relative: str, spec: str, mux: bool
     return command
 
 
-def stop_master(args: argparse.Namespace) -> None:
+def stop_master(args: Args) -> None:
     """Ask a possibly wedged master to stop accepting sessions; running sessions finish normally."""
     if not args.control_path or not os.path.exists(args.control_path):
         return
@@ -512,7 +516,7 @@ def missing_message(tool: str) -> bytes:
     return f"remote-harness: {tool} is not installed on the project host".encode()
 
 
-def missing_marker(args: argparse.Namespace) -> str:
+def missing_marker(args: Args) -> str:
     """Session-scoped record that the project host has no such tool (it sits beside the slots)."""
     return os.path.join(os.path.dirname(args.slots_dir.rstrip("/")), f"tool-missing.{args.tool}")
 
@@ -545,25 +549,45 @@ def handle_signal(signum: int, _frame: object) -> None:
     os._exit(128 + signum)
 
 
+TOOLS = ("git", "rg")
+
+
+class Args:
+    """The shim's options as inject-rule.sh writes them: `--name value` pairs, no argparse needed."""
+
+    OPTIONS = ("--tool", "--real", "--real-argv0", "--runner", "--ssh-config", "--alias",
+               "--project-root", "--mount-root", "--control-path", "--slots-dir", "--concurrency")
+    REQUIRED = ("tool", "runner", "ssh_config", "alias", "project_root", "mount_root", "slots_dir")
+
+    def __init__(self, argv: list[str]) -> None:
+        self.real = ""
+        self.real_argv0 = ""  # e.g. a native Claude binary serving `rg`
+        self.control_path = ""
+        self.concurrency = "6"
+        if len(argv) % 2:
+            raise ValueError("every option needs a value")
+        for flag, value in zip(argv[::2], argv[1::2]):
+            if flag not in self.OPTIONS:
+                raise ValueError(f"unknown option {flag}")
+            setattr(self, flag[2:].replace("-", "_"), value)
+        missing = [name for name in self.REQUIRED if not hasattr(self, name)]
+        if missing:
+            raise ValueError("missing --" + ", --".join(name.replace("_", "-") for name in missing))
+        if self.tool not in TOOLS:
+            raise ValueError(f"unsupported tool {self.tool}")
+
+
 def main() -> int:
     raw = sys.argv[1:]
     if "--" not in raw:
         sys.stderr.write("remote-harness: project-host-tool needs '--' before tool arguments\n")
         return 2
     split = raw.index("--")
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tool", choices=("git", "rg"), required=True)
-    parser.add_argument("--real", default="")
-    parser.add_argument("--real-argv0", default="")  # e.g. a native Claude binary serving `rg`
-    parser.add_argument("--runner", required=True)
-    parser.add_argument("--ssh-config", required=True)
-    parser.add_argument("--alias", required=True)
-    parser.add_argument("--project-root", required=True)
-    parser.add_argument("--mount-root", required=True)
-    parser.add_argument("--control-path", default="")
-    parser.add_argument("--slots-dir", required=True)
-    parser.add_argument("--concurrency", default="6")
-    args = parser.parse_args(raw[:split])
+    try:
+        args = Args(raw[:split])
+    except ValueError as error:
+        sys.stderr.write(f"remote-harness: project-host-tool: {error}\n")
+        return 2
     argv = raw[split + 1:]
     ctx = Context(args)
 
@@ -584,6 +608,7 @@ def main() -> int:
     if os.path.exists(missing_marker(args)):
         return run_local(ctx, argv)
 
+    load_routing_modules()
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, handle_signal)
     try:

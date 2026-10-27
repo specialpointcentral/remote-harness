@@ -1241,7 +1241,7 @@ for tool_check in 'git|rg) ;; *) fail "unsupported project tool"' \
   assert_eq "gateway tool check: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/project-host-gateway.sh")" 1
   assert_eq "dispatcher tool checks: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/run-on-project-host.sh")" 2
 done
-assert_grep "$ROOT/scripts/project-host-tool.py" 'choices=("git", "rg")' "tool shim allows the same tools"
+assert_grep "$ROOT/scripts/project-host-tool.py" 'TOOLS = ("git", "rg")' "tool shim allows the same tools"
 
 install_home="$tmp/install-home"
 mkdir -p "$install_home"

@@ -174,6 +174,10 @@ write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
   return 0
 }
 
+# The Python helpers run per tool call and use only the standard library: -I ignores PYTHON* variables
+# and keeps the script dir and user site off sys.path, -S skips importing site (about 3 ms a start).
+PY_FLAGS="-I -S"
+
 write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config $5=control path $6=python3
   _wsr_runner="$1/bin/rh-run"
   _wsr_mux=""
@@ -182,7 +186,7 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
   # project host stops the command tree when this call is cancelled or the connection drops.
   _wsr_guard=""
   if [ -n "${6:-}" ] && [ -f "$SCRIPT_DIR/channel-guard.py" ]; then
-    _wsr_guard="$(sq "$6") -I $(sq "$SCRIPT_DIR/channel-guard.py") -- "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") -- "
     _wsr_mux="$_wsr_mux --watch"
   fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
@@ -274,8 +278,8 @@ write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project r
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
-    printf 'exec %s -I %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s -- "$@"\n' \
-      "$(sq "$PYTHON3")" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
+    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s -- "$@"\n' \
+      "$(sq "$PYTHON3")" "$PY_FLAGS" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
       "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$7")" "$(sq "$4")" "$(sq "$5")" \
       "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")"
   } > "$_wts_shim" || return 1
@@ -564,7 +568,7 @@ case "${1:-}" in
         || abort_session
       [ -x "$SCRIPT_DIR/route-command.py" ] \
         || abort_session
-      hook_command="$(sq "$PYTHON3") $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
+      hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
       reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
         || abort_session
     fi
