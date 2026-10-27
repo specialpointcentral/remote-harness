@@ -465,7 +465,8 @@ Then:
    from there and then runs it locally.
 2. You run that command in your local terminal and enter the SSH target, project directory, and
    optional mountpoint.
-3. The bootstrap opens the reverse tunnel and exposes only the forced SFTP/health/exec gateway.
+3. The bootstrap opens the reverse tunnel and exposes only the forced gateway (SFTP, health, exec,
+   and the `git`/`rg` tool verb).
 4. It launches the chosen agent only on the remote server; Bash is routed to the local project host.
 5. **Auto-unmounts on exit.** Start remote-harness again anytime to reconnect; stale mounts are
    detected and replaced.
