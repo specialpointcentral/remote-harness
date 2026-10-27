@@ -48,7 +48,13 @@ configuration error rather than a reusable credential.
 `route-command.py` handles Claude/Codex. A generated opencode `tool.execute.before` plugin performs
 the equivalent Bash and cwd rewrite for opencode. `run-on-project-host.sh` validates the physical
 local cwd, rejects direct Agent CLI launches, removes common AI credential variables, shadows the
-agent binaries in `PATH`, and executes with the project host's login shell.
+agent binaries in `PATH`, and executes with the environment of the project host's login shell. For
+bash and zsh that environment comes from a per-session snapshot instead of a new login shell per
+command: the first command captures what the profile leaves behind (exported variables except the AI
+credentials and per-connection values, functions, shell options, umask, soft limits), the snapshot
+is used only once it loads silently and completely, and it is recaptured after 10 minutes or when a
+startup file changes. Any failure (unsupported shell, timeout, unsafe permissions, a capture running
+for another command) runs that command as a login shell instead.
 
 When python3 is available on the remote host, `rh-run` runs through `channel-guard.py`, which holds
 the SSH channel's stdin open for exactly as long as the call lives, and requests

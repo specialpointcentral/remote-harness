@@ -38,8 +38,17 @@
   固定 PATH），SSH 通道关闭时终止该工具。客户端一侧设置每连接 keepalive 和可选的复用 master。
   `--find-tool <git|rg>` 报告工具动词会在哪里找到该工具；`laptop-setup.sh` 在启动前用它打印 ✓，
   或打印 ⚠ 和安装命令，因为缺少工具时 Agent 会通过 SSHFS 扫描项目。
+  `$SHELL` 是 bash 或 zsh 时，项目命令加载登录 shell 快照，不再每次新开登录 shell（profile 较重的主机上
+  每次 200ms 以上）。第一条命令把 profile 执行后的结果（导出变量、函数、shell 选项、umask、软资源限制；
+  从不包含 AI 凭据和 `SSH_CONNECTION` 这类单次连接相关的值）抓取到 gateway 会话目录的 `shell-snapshot.sh`，
+  确认能静默且完整加载后才启用。满 10 分钟或启动文件（`~/.profile`、`~/.zprofile`、`/etc/profile.d`
+  等）变化后重新抓取。抓取失败或超过 30 秒记入 `shell-snapshot.failed`，10 分钟后或启动文件变化后再试；
+  在此之前，以及快照不可用时（其它 shell、权限不安全、另一条命令正在抓取），命令用登录 shell 执行。
+  运行时快照加载失败，则拒绝这一条命令（状态 125）并丢弃快照。启动时设置 `RH_SHELL_SNAPSHOT=off`
+  可关闭。两种方式都会在 profile 之后再次清除 AI 凭据。不会带过来的：未导出的 shell 变量和 zsh 的 alias
+  （bash 本来就不在命令里展开 alias）。
 - `project-host-gateway.sh`：只接受 SFTP、health、固定 exec 协议和 `git`/`rg` 工具动词的
-  forced SSH command。
+  forced SSH command。它把自己的会话目录传给 exec dispatcher，覆盖客户端可能带来的同名值。
 - `channel-guard.py`：远端有 python3 时包装会话 Bash runner，命令运行期间一直持有 SSH 通道，
   使项目主机在取消或断线时终止命令树。
 - `project-host-tool.py`：远端会话的 `git`、`rg` PATH 垫片。挂载点内的工作区扫描在项目主机执行，

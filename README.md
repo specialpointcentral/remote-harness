@@ -165,6 +165,11 @@ gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PAT
 逐个 lstat 和读文件；生成的 SSH config 仍关闭 multiplexing，只有路由命令在命令行上使用会话级复用
 连接。连接被强制断开、本机来不及清理时，远端会话 watcher 会自行回收挂载、会话目录和临时 key。
 
+本机登录 shell 是 bash 或 zsh 时，项目命令不再每次都新开登录 shell 重新执行 profile，而是加载会话级
+登录 shell 快照：第一条命令抓取 profile 设置的 PATH、环境变量、函数等，校验通过后启用，满 10 分钟或
+`~/.profile`、`~/.zprofile` 等启动文件变化后自动刷新。快照不含 AI 凭据，任何异常都回退到登录 shell。
+`RH_SHELL_SNAPSHOT=off` 可关闭。
+
 ### 用户态 sshd（FreeIPA 等主机）
 
 默认情况下，隧道连到本机 `:22` 上的系统 sshd，remote-harness 往 `~/.ssh/authorized_keys` 写一个
@@ -340,6 +345,9 @@ remote-harness/
 - 挂载失败（如 `read: Connection reset by peer`、`Permission denied`），且本机 sshd 由 FreeIPA/sssd
   管理、不读取 `~/.ssh/authorized_keys` → 加 `RH_LOCAL_SSHD=user` 重新运行，见
   [用户态 sshd](#用户态-sshdfreeipa-等主机)。
+- 刚切换的工具版本（如 `nvm alias default`）在项目命令里没生效 → 登录 shell 快照最多 10 分钟后刷新；
+  修改启动文件会立即触发刷新。不能接受时加 `RH_SHELL_SNAPSHOT=off` 重新启动。快照为什么没启用，见本机
+  `~/.remote-harness/.sessions/gateways/*/shell-snapshot.failed`。
 
 ---
 
@@ -490,6 +498,13 @@ laptop through session PATH shims instead of lstat-ing and reading files over SS
 configs still disable multiplexing, and only routed commands use a session-scoped master passed on
 the command line. If the connection is force-closed before the laptop can clean up, a remote session
 watcher reclaims the mount, session dir, and temporary key itself.
+
+When the laptop's login shell is bash or zsh, project commands load a per-session login shell
+snapshot instead of starting a login shell that re-runs the profile every time: the first command
+captures the PATH, variables, functions, and so on that the profile sets, the snapshot is used once it
+passes validation, and it refreshes after 10 minutes or when a startup file such as `~/.profile` or
+`~/.zprofile` changes. It never holds AI credentials, and anything unexpected falls back to a login
+shell. Set `RH_SHELL_SNAPSHOT=off` to disable it.
 
 ### User-mode sshd (FreeIPA-style hosts)
 
@@ -695,3 +710,7 @@ Common issues:
 - The mount fails (e.g. `read: Connection reset by peer`, `Permission denied`) on a laptop whose sshd
   is managed by FreeIPA/sssd and ignores `~/.ssh/authorized_keys` → rerun with `RH_LOCAL_SSHD=user`;
   see [User-mode sshd](#user-mode-sshd-freeipa-style-hosts).
+- A tool version you just switched (e.g. `nvm alias default`) is not used by project commands yet →
+  the login shell snapshot refreshes within 10 minutes, and editing a startup file refreshes it at
+  once. If that is not acceptable, relaunch with `RH_SHELL_SNAPSHOT=off`. Why a snapshot is not in
+  use is recorded on the laptop in `~/.remote-harness/.sessions/gateways/*/shell-snapshot.failed`.

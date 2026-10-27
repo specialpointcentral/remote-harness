@@ -54,6 +54,8 @@
 - 每次 exec 的项目根必须与本机会话登记的物理根一致。
 - hook 和 dispatcher 都拒绝直接在本机启动 `claude`、`codex`、`opencode`；清除常见 AI 凭据，
   并在本机命令 PATH 中屏蔽这些二进制。
+- 路由的 bash/zsh 命令加载会话的登录 shell 快照（位于 gateway 会话目录，私有，使用前校验，从不包含
+  AI 凭据），不再启动登录 shell；任何失败路径都回退到 `$SHELL -lc`。两种方式都会在 profile 之后再次清除凭据。
 - 任意项目 shell 是图灵完备的；绝对隔离需要无 AI 凭据和 Agent 安装的独立本机 OS 账号。
 
 ## 内部 Git 与搜索

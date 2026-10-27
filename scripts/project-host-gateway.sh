@@ -63,6 +63,10 @@ case "$original" in
     fi
     safe_b64 "$2" && safe_b64 "$3" && safe_b64 "$4" || fail "invalid execution encoding"
     require_session_root "$2"
+    # The dispatcher keeps this session's login shell snapshot here; set it unconditionally so a
+    # value from the client environment never counts.
+    RH_GATEWAY_SESSION_DIR=$session_dir
+    export RH_GATEWAY_SESSION_DIR
     exec "$dispatcher" --dispatch "$2" "$3" "$4" ${5:+"$5"}
     ;;
   remote-harness-tool\ *)

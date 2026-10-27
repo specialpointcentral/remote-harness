@@ -69,7 +69,8 @@ not migrated while running. See [design.md](design.md) for lifecycle details.
     through the forced gateway.
 12. The local dispatcher verifies the project root and physical cwd, removes common AI credential
     variables, shadows `claude`, `codex`, and `opencode` in `PATH`, then executes the project command
-    with the local login shell.
+    with the environment of the local login shell (for bash and zsh, a validated per-session snapshot
+    of it; otherwise, or when the snapshot is unavailable, a login shell).
 13. Exit cleanup releases this session's lease. Resources still referenced by another session are
     retained together; final release removes the mount, implementation, key/config/runtime, gateway
     and authorization. Unverifiable local release is recorded for a later retry.

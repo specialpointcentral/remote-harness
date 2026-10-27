@@ -55,7 +55,8 @@ SSH 传输从暂存目录打包的八个 helper、bootstrap 副本和 SHA-256 �
     runner。runner 只通过 forced gateway 发送
     `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`。
 12. 本机 dispatcher 验证项目根和物理 cwd，清除常见 AI 凭据环境变量，在 `PATH` 中屏蔽
-    `claude`、`codex`、`opencode`，再用本机登录 shell 执行项目命令。
+    `claude`、`codex`、`opencode`，再用本机登录 shell 的环境执行项目命令（bash 和 zsh 使用经过校验的
+    会话级快照；其它 shell 或快照不可用时使用登录 shell）。
 13. 退出清理释放本会话 lease。其他会话仍引用的资源一起保留；最后释放挂载、实现、密钥、
     config/runtime、gateway 和授权。本地释放无法验证时保存记录，供后续重试。
 

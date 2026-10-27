@@ -58,6 +58,9 @@ it provides files over SSHFS and executes project commands through a forced gate
 - The registered physical project root must match every exec request.
 - Reject direct local launches of `claude`, `codex`, and `opencode` in both hook and dispatcher;
   scrub common AI credentials and shadow those binaries in the local command PATH.
+- Routed bash/zsh commands load the session's login shell snapshot (gateway session dir, private,
+  validated before use, never holding AI credentials) instead of starting a login shell; every
+  failure path falls back to `$SHELL -lc`. Credentials are unset again after the profile either way.
 - Arbitrary project shell is Turing-complete. Absolute isolation requires a dedicated local OS
   account without AI credentials or agent installations.
 

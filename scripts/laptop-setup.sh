@@ -410,6 +410,12 @@ register_gateway_project() {
   printf '%s' "$_rgp_root" > "$GATEWAY_SESSION_DIR/project-root.b64" \
     || return 1
   chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" 2>/dev/null || true
+  # RH_SHELL_SNAPSHOT=off makes every routed command start a login shell instead of loading the
+  # session's login shell snapshot (run-on-project-host.sh).
+  case "${RH_SHELL_SNAPSHOT:-on}" in
+    0|off|no|false) : > "$GATEWAY_SESSION_DIR/shell-snapshot.off" || return 1 ;;
+    *) rm -f "$GATEWAY_SESSION_DIR/shell-snapshot.off" ;;
+  esac
 }
 
 append_managed_authorized_key() {

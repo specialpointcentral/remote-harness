@@ -42,8 +42,22 @@
   side sets per-connection keepalives and the optional multiplexing master. `--find-tool <git|rg>`
   reports where the tool verb finds a tool; `laptop-setup.sh` uses it before launch to print ✓ or a ⚠
   with an install hint, because a missing tool makes the agent scan the project over SSHFS.
+  For a bash or zsh `$SHELL`, project commands load a login shell snapshot instead of starting a login
+  shell each time (200+ ms on hosts with a heavy profile). The first command captures what the profile
+  leaves behind (exported variables, functions, shell options, umask, soft limits; never the AI
+  credentials or per-connection values such as `SSH_CONNECTION`) into `shell-snapshot.sh` in the
+  gateway session directory, and installs it only after it loads silently and completely. It is
+  recaptured after 10 minutes or when a startup file (`~/.profile`, `~/.zprofile`, `/etc/profile.d`,
+  ...) changes. A capture that fails or exceeds 30 s is recorded in `shell-snapshot.failed` and
+  retried after 10 minutes or a startup file change; until then, and whenever the snapshot is
+  unusable (another shell, unsafe permissions, another command capturing), the command runs as a
+  login shell. A snapshot that fails to load at run time refuses that one command (status 125) and is
+  discarded. `RH_SHELL_SNAPSHOT=off` at launch disables it. Either way the AI credentials are unset
+  again after the profile. Not carried over: non-exported shell variables and zsh aliases (bash does
+  not expand aliases in commands anyway).
 - `project-host-gateway.sh`: forced SSH command accepting only SFTP, health, the fixed exec protocol,
-  and the `git`/`rg` tool verb.
+  and the `git`/`rg` tool verb. It passes its session directory to the exec dispatcher, overriding any
+  client-supplied value.
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
   open while the command runs so the project host stops the command tree on cancel or disconnect.
 - `project-host-tool.py`: remote session PATH shim for `git` and `rg`. Work-tree scans inside the

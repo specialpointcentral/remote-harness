@@ -44,7 +44,11 @@ gateway 拒绝任意 SSH shell，并验证请求项目根与本地 bootstrap 登
 
 `route-command.py` 处理 Claude/Codex。生成的 opencode `tool.execute.before` plugin 为 opencode 执行
 等价的 Bash 和 cwd 改写。`run-on-project-host.sh` 校验本机物理 cwd，拒绝直接启动 Agent CLI，清除
-常见 AI 凭据环境变量，在 `PATH` 中屏蔽 Agent 二进制，然后使用项目主机登录 shell 执行。
+常见 AI 凭据环境变量，在 `PATH` 中屏蔽 Agent 二进制，然后用项目主机登录 shell 的环境执行。对 bash
+和 zsh，这个环境来自会话级快照，而不是每条命令新开一个登录 shell：第一条命令抓取 profile 执行后的结果
+（除 AI 凭据和单次连接相关值以外的导出变量、函数、shell 选项、umask、软资源限制），确认能静默且完整加载
+后才启用，满 10 分钟或启动文件变化后重新抓取。任何失败（不支持的 shell、超时、权限不安全、另一条命令
+正在抓取）都让这条命令改用登录 shell 执行。
 
 远端有 python3 时，`rh-run` 经过 `channel-guard.py` 执行：它在调用存续期间一直持有 SSH 通道的
 stdin，并请求 `remote-harness-exec ... watch`。项目主机随后让命令的 stdin 来自 `/dev/null`，把命令放进
