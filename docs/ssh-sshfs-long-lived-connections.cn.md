@@ -19,6 +19,8 @@ remote-harness 的脚本已经内置以下行为：
 - 生成的会话级 SSH config 关闭 OpenSSH multiplexing（`ControlMaster no`），避免 macOS/FUSE-T 下
   `ControlPath` socket 路径长度和复用连接卡死问题。
 - `mount-project.sh` 使用 `sshfs` 的 `reconnect`、`ServerAliveInterval` 和 `ServerAliveCountMax`。
+- 本机的隧道和 Agent 终端最多等待 `RH_KEEPALIVE_TIMEOUT` 秒（默认 300，即下文推荐的
+  `ClientAliveInterval 60` × `ClientAliveCountMax 5`）无响应的服务器；会话期间单独断开的隧道会自动重建。
 - `mount-project.sh` 不只相信 `sshfs` 退出码，还会确认挂载点真的 live；这能规避部分 FUSE-T
   “返回成功但实际未挂载”的场景。
 - reverse 模式会在退出时清理远端挂载、会话规则、临时 SSH config 和本地托管授权引用；本地一侧先

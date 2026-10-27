@@ -13,6 +13,11 @@
   清理都复用它，省去每次 SSH 握手；反向隧道和交互式 Agent 会话仍使用独立连接，启动前还会把本机终端
   尺寸设置到远端 pty 上。`--local-sshd user` 时以当前用户身份启动会话级回环 sshd（`_common.sh` 中的
   `user_sshd_*` 辅助函数），隧道转发到它。
+  Agent 会话期间，后台守护进程每 5 秒检查一次本次创建的隧道，隧道 ssh 退出时在同一端口重建
+  （`ExitOnForwardFailure`；失败之间按 5、10、20、30、60 秒退避），资源记录始终指向当前的 ssh；它只写
+  `tunnel.log`（ssh 的报错写入 `tunnel.log.ssh`），启动器不在了就自行退出，清理时先停止它并接管它最后
+  启动的隧道。复用其它启动建立的隧道时不做守护。会话 Host 的 keepalive 能容忍 `RH_KEEPALIVE_TIMEOUT` 秒
+  （默认 300）无响应。
 - `simple-local-setup.sh`、`local-setup.sh`：拒绝本机 Agent 的兼容 stub。
 - `setup-tunnel.sh`：创建远端会话 SSH config 和每会话 key。
 - `check-tunnel.sh`：通过 `remote-harness-health` 检查 forced gateway。

@@ -97,6 +97,8 @@ it provides files over SSHFS and executes project commands through a forced gate
    mount another live session uses. The watcher ends an agent only after the tunnel heartbeat has
    failed for the whole `RH_HEARTBEAT_TIMEOUT`, and local cleanup stops a tunnel without a remote
    answer only when this launch created it and the remote stayed unreachable through the retries.
+   During the session the launcher's supervisor restarts only a tunnel this launch created, on the
+   same port, records each restart, and is stopped (its tunnel adopted) before any cleanup step.
 5. Programmatically consumed scripts retain `KEY=VALUE` stdout.
 6. Keep bilingual Markdown pairs synchronized.
 

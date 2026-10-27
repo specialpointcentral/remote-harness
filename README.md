@@ -213,6 +213,12 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
   断线时进行中的写会报错而不是悄悄丢失。为提速，远端会缓存目录项、属性和"文件不存在"结果 20 秒
   （`RH_SSHFS_CACHE_SECONDS`），所以本机侧新建或修改的文件最多 20 秒后在远端可见。短暂断网由 sshfs
   `reconnect` 自动恢复。
+- **隧道自动重连与断开判定**：会话期间，若本次启动建立的反向隧道单独断开（隧道进程被杀，或服务器关掉了
+  这条连接而终端仍在），本机会在同一端口上自动重建，失败时按 5、10、20、30、60 秒退避，一直重试到会话结束；
+  sshfs、路由命令和远端心跳随后自行恢复。隧道和 Agent 终端最多等 5 分钟无响应才判定断开
+  （`RH_KEEPALIVE_TIMEOUT`，秒，与推荐的服务器 `ClientAliveInterval 60` × `ClientAliveCountMax 5` 一致），
+  所以几分钟内恢复的网络抖动不会断开会话。断开时间更长或更换网络时，终端同样会断开，会话结束，按下面的
+  "会话恢复"继续。重连记录在本机 `~/.remote-harness/.sessions/rev.*/tunnel.log`，会话结束时汇总显示。
 - **远端心跳**：远端 watcher 每 30 秒经反向隧道向本机 gateway 做一次健康检查；只有连续失败超过
   10 分钟（期间任何一次成功都会重新计时）才判定本机已断开，随后结束 Agent、清理远端会话，并留下恢复
   标记。可在远端登录环境中用 `RH_HEARTBEAT_INTERVAL`（秒）和 `RH_HEARTBEAT_TIMEOUT`（秒，`0` 关闭）调整。
@@ -556,6 +562,16 @@ Notes:
   fail instead of being lost silently. For speed the remote caches directory entries, attributes, and
   "no such file" answers for 20 seconds (`RH_SSHFS_CACHE_SECONDS`), so files created or changed on the
   laptop can take up to 20 seconds to appear remotely. Short drops recover through sshfs `reconnect`.
+- **Tunnel reconnect and disconnect detection**: during the session, when the reverse tunnel this
+  launch created drops on its own (its ssh was killed, or the server closed that connection while the
+  terminal stayed up), the laptop rebuilds it on the same port, backing off 5, 10, 20, 30, and 60
+  seconds between failed tries until the session ends; sshfs, routed commands, and the remote
+  heartbeat then recover by themselves. The tunnel and the agent terminal wait up to 5 minutes for an
+  unresponsive server before giving up (`RH_KEEPALIVE_TIMEOUT`, seconds, matching the recommended server
+  `ClientAliveInterval 60` × `ClientAliveCountMax 5`), so a network blip that recovers within minutes
+  keeps the session. A longer outage or a network change drops the terminal too, which ends the
+  session; continue it as described under "Resuming". Reconnects are logged on the laptop in
+  `~/.remote-harness/.sessions/rev.*/tunnel.log` and summarized when the session ends.
 - **Remote heartbeat**: the remote watcher runs a health check through the reverse tunnel to the
   laptop gateway every 30 seconds. Only when every check fails for 10 minutes (any success restarts the
   count) does it treat the laptop as gone: it ends the agent, cleans up the remote session, and leaves

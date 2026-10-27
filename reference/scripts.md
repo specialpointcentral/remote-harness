@@ -12,6 +12,12 @@
   reverse tunnel and the interactive agent session keep their own connections, and the agent's remote
   pty is given the local terminal size before launch. With `--local-sshd user` it starts a per-session
   loopback sshd as the current user (helpers `user_sshd_*` in `_common.sh`) and forwards the tunnel to it.
+  While the agent session runs, a background supervisor checks the tunnel it created every 5 s and
+  restarts it on the same port when its ssh exits (`ExitOnForwardFailure`; backoff 5, 10, 20, 30, 60 s
+  between failed tries), keeping the resource record on the current ssh; it writes only `tunnel.log`
+  (ssh errors in `tunnel.log.ssh`), stops by itself when the launcher is gone, and cleanup stops it
+  first and adopts the tunnel it last started. A tunnel reused from another launch is not supervised.
+  The session Host's keepalives tolerate `RH_KEEPALIVE_TIMEOUT` seconds (default 300) of silence.
 - `simple-local-setup.sh`, `local-setup.sh`: compatibility stubs that reject local-agent execution.
 - `setup-tunnel.sh`: creates remote session SSH config and a per-session key.
 - `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`.

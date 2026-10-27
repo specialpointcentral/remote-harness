@@ -19,6 +19,9 @@ remote-harness already:
 - disables OpenSSH multiplexing (`ControlMaster no`) in generated session configs to avoid
   macOS/FUSE-T `ControlPath` socket path limits and stuck reused connections;
 - passes `reconnect`, `ServerAliveInterval`, and `ServerAliveCountMax` to `sshfs`;
+- lets the laptop's tunnel and agent terminal wait up to `RH_KEEPALIVE_TIMEOUT` (default 300 s, the
+  `ClientAliveInterval 60` × `ClientAliveCountMax 5` recommended below) for an unresponsive server, and
+  rebuilds a tunnel that drops on its own during the session;
 - verifies that a mount actually becomes live instead of trusting only the `sshfs` exit code;
 - cleans up reverse mounts, session rules, temporary SSH configs, and managed auth references on
   exit where possible, and runs a remote session watcher plus launch-time GC that perform the remote

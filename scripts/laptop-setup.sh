@@ -167,8 +167,11 @@ ssh() {
 }
 start_setup_mux() {  # in the background, overlapping the local authorization work
   SETUP_MUX_DIR=$(mktemp -d /tmp/rh.XXXXXX 2>/dev/null) || { SETUP_MUX_DIR=""; return 0; }
-  # No forwards on the master: the separate tunnel connection owns the RemoteForward port.
+  # No forwards on the master: the separate tunnel connection owns the RemoteForward port. It gives
+  # up on a dead server after 90 s, not the session Host's longer keepalive, so calls through it fail
+  # fast and fall back to new connections.
   command ssh -F "$LOCAL_SSH_CONFIG" -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
     -o ControlMaster=yes -o "ControlPath=$SETUP_MUX_DIR/m" -o ControlPersist=300 -fN "$TARGET" \
     >/dev/null 2>&1 </dev/null &
 }
@@ -518,10 +521,112 @@ release_authorized_key_locked() {
   [ -z "$GATEWAY_SESSION_DIR" ] || rm -rf "$GATEWAY_SESSION_DIR" 2>/dev/null || true
 }
 
+# -- reverse tunnel supervisor ------------------------------------------------
+# While the agent session runs, restart this launch's tunnel when its ssh exits (killed, or closed by
+# the server while the agent terminal stayed up), on the same remote port: sshfs `reconnect`, the
+# routed-command master, and the remote heartbeat then recover by themselves. Connection loss that
+# also drops the agent terminal still ends the session. The agent owns the terminal, so the
+# supervisor writes only tunnel.log, summarized after the session.
+TUNNEL_SUPERVISOR_PID=""
+TUNNEL_LOG=""
+tunnel_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$TUNNEL_LOG" 2>/dev/null || true; }
+tunnel_alive() { [ -n "$TUNNEL_PID" ] && [ -n "$TUNNEL_START" ] && [ "$(proc_start "$TUNNEL_PID")" = "$TUNNEL_START" ]; }
+
+tunnel_supervisor() {
+  local _owner_start _stop=0 _nap="" _wait=5 _delay=0 _i _sshd_warned=0
+  _owner_start=$(proc_start "$$")
+  # The launcher stops it with TERM; the flag lets a restart in progress record its ssh first.
+  # Terminal signals are the launcher's, whose cleanup sends that TERM.
+  trap '_stop=1' TERM
+  trap '' HUP INT
+  nap() { sleep "$1" & _nap=$!; wait "$_nap" 2>/dev/null; kill "$_nap" 2>/dev/null; return 0; }
+  while [ "$_stop" = 0 ]; do
+    nap "$_wait"  # 5 s between checks, or the backoff after a failed reconnect
+    [ "$_stop" = 0 ] || break
+    # A launcher killed without cleanup: stop; the next launch's sweep releases its records.
+    [ "$(proc_start "$$")" = "$_owner_start" ] || { tunnel_log "launcher is gone; supervisor stops"; break; }
+    if [ -n "$LOCAL_SSHD_PID" ] && [ "$_sshd_warned" = 0 ] \
+        && [ "$(proc_start "$LOCAL_SSHD_PID")" != "$LOCAL_SSHD_START" ]; then
+      tunnel_log "user-mode sshd (pid $LOCAL_SSHD_PID) exited; the tunnel can no longer reach this laptop"
+      _sshd_warned=1
+    fi
+    if tunnel_alive; then _wait=5 _delay=0; continue; fi
+    [ "$_delay" != 0 ] || tunnel_log "tunnel ssh (pid $TUNNEL_PID) exited; reconnecting RemoteForward $PORT"
+    command ssh -F "$LOCAL_SSH_CONFIG" -o ConnectTimeout=15 -N "$TARGET" </dev/null >/dev/null \
+      2>>"$TUNNEL_LOG.ssh" &
+    TUNNEL_PID=$!
+    TUNNEL_START=$(proc_start "$TUNNEL_PID")
+    write_local_resource_record
+    # With ExitOnForwardFailure=yes, an ssh that is still running once the remote port listens holds
+    # the forward; one that exits failed to connect, or found the port still held by the old one.
+    _i=0
+    while [ "$_i" -lt 10 ] && [ "$_stop" = 0 ] && tunnel_alive; do
+      nap 3
+      if tunnel_alive && remote_port_listening "$PORT"; then break; fi
+      _i=$((_i + 1))
+    done
+    if tunnel_alive && [ "$_i" -lt 10 ]; then
+      tunnel_log "tunnel restored (pid $TUNNEL_PID)"
+      _wait=5 _delay=0
+    elif tunnel_alive; then
+      tunnel_log "tunnel ssh (pid $TUNNEL_PID) is running but remote port $PORT is not confirmed yet"
+      _wait=5 _delay=0
+    else
+      case "$_delay" in 0) _delay=5;; 5) _delay=10;; 10) _delay=20;; 20) _delay=30;; *) _delay=60;; esac
+      _wait=$_delay
+      tunnel_log "reconnect failed; retrying in ${_delay}s"
+    fi
+  done
+}
+
+start_tunnel_supervisor() {
+  [ -n "$TUNNEL_PID" ] && [ -n "$LOCAL_SESSION_DIR" ] || return 0  # a reused tunnel is not ours
+  TUNNEL_LOG="$LOCAL_SESSION_DIR/tunnel.log"
+  : > "$TUNNEL_LOG" 2>/dev/null || return 0
+  tunnel_supervisor </dev/null >/dev/null 2>&1 &
+  TUNNEL_SUPERVISOR_PID=$!
+}
+
+# Stop the supervisor and adopt the tunnel it may have started (its record holds the current one).
+# It finishes within seconds (every wait in it is bounded); KILL after 20 s is only a backstop, and
+# leaves at worst a check of the remote port running out its own timeout.
+stop_tunnel_supervisor() {
+  local _i=0
+  [ -n "$TUNNEL_SUPERVISOR_PID" ] || return 0
+  kill -TERM "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+  while kill -0 "$TUNNEL_SUPERVISOR_PID" 2>/dev/null && [ "$_i" -lt 200 ]; do
+    sleep 0.1
+    _i=$((_i + 1))
+  done
+  kill -KILL "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+  wait "$TUNNEL_SUPERVISOR_PID" 2>/dev/null || true
+  TUNNEL_SUPERVISOR_PID=""
+  [ -f "$LOCAL_SESSION_DIR/resources.env" ] || return 0
+  TUNNEL_PID=$(resource_value "$LOCAL_SESSION_DIR/resources.env" TUNNEL_PID)
+  TUNNEL_START=$(resource_value "$LOCAL_SESSION_DIR/resources.env" TUNNEL_START)
+}
+
+# After the session: how often the tunnel came back, and whether it was down at the end.
+report_tunnel_supervisor() {
+  local _restored
+  [ -n "$TUNNEL_LOG" ] && [ -s "$TUNNEL_LOG" ] || return 0
+  _restored=$(grep -c 'tunnel restored' "$TUNNEL_LOG" 2>/dev/null) || _restored=0
+  if [ "$_restored" -gt 0 ]; then
+    ok "$(tr2 "The reverse tunnel dropped and was reconnected ${_restored} time(s)" "反向隧道断开过，已自动重连 ${_restored} 次")"
+  fi
+  if grep -q 'exited; reconnecting' "$TUNNEL_LOG" 2>/dev/null && ! tunnel_alive; then
+    warn "$(tr2 "The reverse tunnel was down when the session ended; see $TUNNEL_LOG" "会话结束时反向隧道处于断开状态，详见 $TUNNEL_LOG")"
+  fi
+  if grep -q 'user-mode sshd .* exited' "$TUNNEL_LOG" 2>/dev/null; then
+    warn "$(tr2 "The user-mode sshd exited during the session" "会话期间用户态 sshd 退出了")"
+  fi
+}
+
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0
   CLEANED=1
   [ -z "$STEP_LABEL" ] || step_end fail
+  stop_tunnel_supervisor
   write_local_resource_record
   local _total=0 _line _rc=""
   [ "$MOUNTED" = 1 ] && _total=2
@@ -740,6 +845,16 @@ LOCAL_SSH_CONFIG="$LOCAL_SESSION_DIR/ssh_config"
 CFG="$LOCAL_SSH_CONFIG"; touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
 write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
   || { err "could not create session SSH runtime directory"; exit 1; }
+# How long the laptop's connections to the box (the tunnel, the agent terminal) wait for an
+# unresponsive server before giving up: RH_KEEPALIVE_TIMEOUT seconds (default 300, the recommended
+# server-side ClientAliveInterval 60 x ClientAliveCountMax 5) in 30-second keepalives. Longer than a
+# network blip, shorter than the remote heartbeat (RH_HEARTBEAT_TIMEOUT, 600 s).
+keepalive_count() {
+  local _timeout="${RH_KEEPALIVE_TIMEOUT:-300}"
+  case "$_timeout" in ''|*[!0-9]*) _timeout=300;; esac
+  [ "$_timeout" -ge 30 ] || _timeout=30
+  printf '%s' $(( (_timeout + 29) / 30 ))
+}
 write_target_forward() {
   local _port="$1" _rf_line
   _rf_line="    RemoteForward $_port 127.0.0.1:$LOCAL_SSHD_PORT"
@@ -748,7 +863,7 @@ write_target_forward() {
   # ExitOnForwardFailure so a port-collision fails loudly instead of leaving a live-but-no-forward
   # connection that polls as "up".
   if write_managed_alias "$TARGET" "$_rf_line" \
-      "    ServerAliveInterval 30" "    ServerAliveCountMax 3" \
+      "    ServerAliveInterval 30" "    ServerAliveCountMax $(keepalive_count)" \
       "    ExitOnForwardFailure yes" "    TCPKeepAlive yes" \
       "    ForwardAgent no"; then
     ok "ssh config: prepared session Host '$TARGET' (HostName ${V_HOST:-?}, port ${V_PORT:-22}, user ${V_USER:-<login default>}${V_PROXYCOMMAND:+, ProxyCommand}) + RemoteForward $_port"
@@ -825,8 +940,9 @@ REMOTE_LISTENING_PORTS="{ if command -v ss >/dev/null 2>&1; then ss -tlnH 2>/dev
        elif command -v netstat >/dev/null 2>&1; then netstat -an 2>/dev/null | awk '/^tcp/ && /LISTEN/{print \$4}';
        elif command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1{print \$9}';
        fi; } | sed -E 's/.*[:.]([0-9]+)\$/\1/'"
-remote_port_listening() {
-  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=3 "$TARGET" \
+remote_port_listening() {  # bounded: also runs in the tunnel supervisor, which must stop promptly
+  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=3 -o ServerAliveInterval=5 \
+    -o ServerAliveCountMax=2 "$TARGET" \
     "$REMOTE_LISTENING_PORTS | grep -qx $(sq "$1")" 2>/dev/null
 }
 tunnel_alias_up() {
@@ -1355,8 +1471,10 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
   warn "no controlling tty found; remote ${LAUNCH} TUI may not start"
   ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd"
 }
+start_tunnel_supervisor
 launch_remote_agent
 CLAUDE_EXIT=$?
+stop_tunnel_supervisor
 if [ "$CLAUDE_EXIT" = 255 ]; then
   mkdir -p "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null && date +%s > "$LOCAL_RESUME_MARKER" 2>/dev/null || true
 fi
@@ -1373,5 +1491,6 @@ elif [ "$CLAUDE_EXIT" = 255 ]; then
 else
   warn "${LAUNCH} session ended (exit code $CLAUDE_EXIT)."
 fi
+report_tunnel_supervisor
 # cleanup() (armed via trap) auto-unmounts and drops the tunnel as this script exits.
 printf "\n${_B}Done.${_0}\n"
