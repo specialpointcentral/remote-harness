@@ -1462,6 +1462,17 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
   case "$_rows$_cols" in ''|*[!0-9]*) ;; *)
     [ "$_rows" -gt 0 ] && [ "$_cols" -gt 0 ] && _remote_cmd="stty rows $_rows cols $_cols 2>/dev/null; $_remote_cmd" ;;
   esac
+  # And which terminal it is: ssh carries only TERM, and the session config (-F) skips the system
+  # ssh_config whose SendEnv LC_* would carry LC_TERMINAL. Agents read these to pick notifications
+  # (iTerm2's OSC 9), the OSC 9;4 progress bar, and 24-bit color. TMUX and its pane are left out:
+  # they name this machine's tmux server.
+  local _term_env="" _term_var _term_value
+  for _term_var in TERM_PROGRAM TERM_PROGRAM_VERSION LC_TERMINAL LC_TERMINAL_VERSION COLORTERM; do
+    _term_value=${!_term_var:-}
+    case "$_term_value" in ''|*[!A-Za-z0-9._+-]*) continue ;; esac
+    _term_env="$_term_env $_term_var=$(sq "$_term_value")"
+  done
+  [ -z "$_term_env" ] || _remote_cmd="export$_term_env; $_remote_cmd"
   say "  ${_C}⋯${_0} $(tr2 "Connecting the remote session..." "正在连接远端会话…")"
   if { exec 3</dev/tty; } 2>/dev/null; then
     ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd" <&3

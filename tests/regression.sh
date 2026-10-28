@@ -1451,6 +1451,13 @@ assert_grep "$tmp/project-valid.out" "Connecting the remote session" "launch ann
 assert_grep "$launch_dir.out" "Remote session connected" "remote prelude reports the connected session"
 assert_grep "$launch_dir.out" "Prewarmed project metadata" "remote prelude prewarms project metadata"
 assert_grep "$launch_dir.out" "-lic codex" "remote prelude still execs the agent"
+# The agent learns which terminal it draws on; values outside a safe charset are not sent.
+SSH_LOG="$tmp/term-env.ssh.log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" TERM_PROGRAM=iTerm.app \
+  TERM_PROGRAM_VERSION=3.5.10 LC_TERMINAL='iTerm2;touch x' COLORTERM=truecolor \
+  project_launch "$tmp/term-env.out"
+assert_grep "$tmp/term-env.ssh.log" "export TERM_PROGRAM='iTerm.app' TERM_PROGRAM_VERSION='3.5.10' COLORTERM='truecolor';" \
+  "launch passes the terminal identity to the agent"
+refute_grep "$tmp/term-env.ssh.log" "touch x" "launch drops a terminal variable with unsafe characters"
 assert_grep "$ssh_log" "/bin/rh-run' Lg== dHJ1ZQ==" "remote prelude opens the routed-command master before the agent starts"
 assert_grep "$tmp/project-valid.out" "[2/3] ✓ Waiting for sshfs to flush and exit" "exit cleanup reports progress steps"
 assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
