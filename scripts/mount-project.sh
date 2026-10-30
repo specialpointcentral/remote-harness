@@ -120,9 +120,70 @@ sshfs_pids_for() {
     { n = split($0, f, " ")
       if (n >= 4 && (f[2] == "sshfs" || f[2] ~ /\/sshfs$/) && (f[4] == a || (b != "" && f[4] == b))) print f[1] }'
 }
-mount_path_in_use() {  # any process of this user with its cwd or an open file under $1
-  find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -user "$(id -u)" \
-    \( -lname "$1" -o -lname "$1/*" \) -print -quit 2>/dev/null | grep -q .
+# Whether a detached FUSE mount is still used comes from the kernel, not from other processes' /proc
+# links: those of sshd, (sd-pam) and other non-dumpable processes are unreadable, and a file on a
+# lazily detached mount is named relative to the detached root, never under the old mountpoint. A FUSE
+# superblock lives while anything references it (a cwd, an open file or mapping, a copy in another mount
+# namespace, a request blocked in the daemon), and fusectl lists each live one by its device number
+# until the last reference goes. RH_FUSECTL_DIR names another fusectl directory (tests).
+fusectl_dir() {
+  if [ -n "${RH_FUSECTL_DIR:-}" ]; then
+    [ -d "$RH_FUSECTL_DIR" ] || return 1
+    printf '%s' "$RH_FUSECTL_DIR"
+    return 0
+  fi
+  # Without fusectl mounted the directory still exists, empty, which must not read as "nothing in use".
+  awk '{ for (i = 7; i < NF; i++) if ($i == "-") break
+         if ($5 == "/sys/fs/fuse/connections" && $(i + 1) == "fusectl") found = 1 }
+       END { exit !found }' /proc/self/mountinfo 2>/dev/null || return 1
+  printf '/sys/fs/fuse/connections'
+}
+# fusectl ids of FUSE mounts in /proc/self/mountinfo: field 3 is the superblock's MAJOR:MINOR, and
+# fusectl names it by the kernel's dev_t, MAJOR << 20 | MINOR. With $1/$2, only the topmost FUSE mount
+# whose (octal-escaped) mountpoint is either spelling; otherwise every FUSE mount, one id per line.
+fuse_mount_ids() {
+  RH_A="${1:-}" RH_B="${2:-}" awk '
+    { for (i = 7; i < NF; i++) if ($i == "-") break
+      t = $(i + 1); if (t !~ /^fuse/ || t == "fusectl") next
+      split($3, d, ":"); id = sprintf("%.0f", d[1] * 1048576 + d[2])
+      if (ENVIRON["RH_A"] == "") { print id; next }
+      mp = $5; gsub(/\\040/, " ", mp); gsub(/\\011/, "\t", mp); gsub(/\\012/, "\n", mp); gsub(/\\134/, "\\\\", mp)
+      if (mp == ENVIRON["RH_A"] || (ENVIRON["RH_B"] != "" && mp == ENVIRON["RH_B"])) top = id }
+    END { if (top != "") print top }' /proc/self/mountinfo 2>/dev/null
+}
+fuse_conn_for() {  # $1/$2 = spellings of a still-mounted mountpoint -> fusectl id, "unlisted", or nothing
+  _fcf_id=$(fuse_mount_ids "$1" "${2:-}")
+  [ -n "$_fcf_id" ] || return 0
+  _fcf_dir=$(fusectl_dir) || return 0
+  if [ -e "$_fcf_dir/$_fcf_id" ]; then printf '%s' "$_fcf_id"; else printf unlisted; fi
+}
+# $1 = fuse_conn_for's answer from before the detach. Empty means an earlier run already detached the
+# mount (or fusectl was unavailable then): any of this user's live FUSE superblocks that no mount here
+# shows may be it. Without an authoritative fusectl answer it counts as used.
+detached_fuse_in_use() {
+  _dfiu_dir=$(fusectl_dir) || return 0
+  case "$1" in
+    "") ;;
+    *[!0-9]*) return 0 ;;
+    *) [ -e "$_dfiu_dir/$1" ]; return ;;
+  esac
+  _dfiu_attached=" $(fuse_mount_ids | tr '\n' ' ') "
+  for _dfiu_conn in "$_dfiu_dir"/*; do
+    _dfiu_id=${_dfiu_conn##*/}
+    case "$_dfiu_id" in ""|*[!0-9]*) continue ;; esac
+    [ -d "$_dfiu_conn" ] && [ -O "$_dfiu_conn" ] || continue   # gone, or another user's superblock
+    case "$_dfiu_attached" in *" $_dfiu_id "*) continue ;; esac
+    return 0
+  done
+  return 1
+}
+detached_sshfs_releasable() {  # reads _sds_mode and _sds_conn
+  # A clean unmount already proved this namespace had no open files. fusectl, when it lists the
+  # superblock, also covers other namespaces.
+  if [ "$_sds_mode" = clean ]; then
+    case "$_sds_conn" in ""|*[!0-9]*) return 0 ;; esac
+  fi
+  ! detached_fuse_in_use "$_sds_conn"
 }
 io_signature() {  # cumulative read/write byte counters of the given pids
   for _ios_p in "$@"; do
@@ -131,21 +192,22 @@ io_signature() {  # cumulative read/write byte counters of the given pids
 }
 # A detached mount's sshfs should exit by itself, but one whose worker threads are still blocked on
 # its SFTP connections (more likely with max_conns, or a dropped tunnel) can linger indefinitely.
-# Stop it only when that is safe. After a clean unmount the kernel already guaranteed no open files
-# (sshfs completes writes on close), so a 1s grace suffices. After a lazy (or earlier, unknown) detach
-# nothing may still use the mountpoint, and the daemon itself must show no read/write progress for
-# RH_SSHFS_IDLE_SECONDS (default 3); keepalives of its ssh connections are not its own I/O. A daemon
-# still making progress is left running once RH_SSHFS_SYNC_MAX_SECONDS (default 120) passes. Its sftp
-# ssh exits on EOF once sshfs is gone. Without /proc there is no reliable progress signal: no-op.
-stop_detached_sshfs() {  # $1 = clean|lazy, $2/$3 = mountpoint spellings no longer in the mount table
+# Stop it only when that is safe: its FUSE superblock must be gone (detached_sshfs_releasable). After a
+# clean unmount the kernel already guaranteed no open files here (sshfs completes writes on close), so a
+# 1s grace suffices. After a lazy (or earlier, unknown) detach the daemon itself must also show no
+# read/write progress for RH_SSHFS_IDLE_SECONDS (default 3); keepalives of its ssh connections are not
+# its own I/O. A daemon still making progress is left running once RH_SSHFS_SYNC_MAX_SECONDS (default
+# 120) passes. Its sftp ssh exits on EOF once sshfs is gone. Without /proc there is no reliable progress
+# signal: no-op.
+stop_detached_sshfs() {  # $1 = clean|lazy, $2 = fuse_conn_for before the detach, $3/$4 = mountpoint spellings
   [ -d /proc/self ] || return 0
-  _sds_mode="$1"; shift
+  _sds_mode="$1" _sds_conn="$2"; shift 2
   _sds_pids="$(sshfs_pids_for "$@")"
   [ -n "$_sds_pids" ] || return 0
   progress sshfs-wait
   _sds_limit="${RH_SSHFS_IDLE_SECONDS:-3}"
-  if [ "$_sds_mode" = clean ]; then _sds_limit=1
-  elif mount_path_in_use "$1"; then return 0; fi
+  [ "$_sds_mode" != clean ] || _sds_limit=1
+  detached_sshfs_releasable || return 0
   _sds_idle=0 _sds_waited=0 _sds_last=""
   while [ "$_sds_idle" -lt "$_sds_limit" ]; do
     [ "$_sds_waited" -lt "${RH_SSHFS_SYNC_MAX_SECONDS:-120}" ] || return 0  # still progressing: leave it
@@ -159,7 +221,7 @@ stop_detached_sshfs() {  # $1 = clean|lazy, $2/$3 = mountpoint spellings no long
     if [ "$_sds_now" = "$_sds_last" ]; then _sds_idle=$((_sds_idle + 1)); else _sds_idle=0 _sds_last="$_sds_now"; fi
     sleep 1
   done
-  [ "$_sds_mode" = clean ] || ! mount_path_in_use "$1" || return 0
+  detached_sshfs_releasable || return 0
   note "remote-harness: stopping sshfs for detached $1 (no I/O progress)"
   for _sds_sig in TERM KILL; do
     # shellcheck disable=SC2086
@@ -174,13 +236,15 @@ stop_detached_sshfs() {  # $1 = clean|lazy, $2/$3 = mountpoint spellings no long
 }
 do_unmount() {
   _du_canon="$(canon_mountpoint "$1")"
+  # Read before the detach: mountinfo has the device number without sending the daemon a request.
+  _du_conn="$(fuse_conn_for "$1" "$_du_canon")"
   detach_mount "$1" "$_du_canon"
   _du_status=$?
   is_mounted "$1" && return 1
   progress unmounted
   # Also covers a mount an earlier lazy unmount already detached while its daemon stayed wedged.
-  if [ "$_du_status" = 0 ]; then stop_detached_sshfs clean "$1" "$_du_canon"
-  else stop_detached_sshfs lazy "$1" "$_du_canon"; fi
+  if [ "$_du_status" = 0 ]; then stop_detached_sshfs clean "$_du_conn" "$1" "$_du_canon"
+  else stop_detached_sshfs lazy "$_du_conn" "$1" "$_du_canon"; fi
   [ "$_du_status" != 1 ]
 }
 detach_mount() {  # $1 = mountpoint, $2 = canonical spelling -> 0 clean, 2 lazy, 1 nothing detached

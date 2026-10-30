@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ordinary fixtures have no SSH channel. CI may give this script an already-closed pipe; only the
+# explicit pipelines below should exercise channel-EOF cancellation.
+exec </dev/null
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/rh-regression.XXXXXX")"
+# Exercise the enabled Unix-socket paths even when macOS supplies a long private TMPDIR.
+tmp="$(mktemp -d /tmp/rh-regression.XXXXXX)"
 tmp="$(cd "$tmp" && pwd -P)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -493,7 +498,7 @@ wait_until() {  # tenths-of-a-second command...: poll until the command succeeds
     _wu_n=$((_wu_n - 1)); sleep 0.1
   done
 }
-tree_alive() { ps -A -o args= 2>/dev/null | grep -Eqx "sleep ($1)"; }
+tree_alive() { ps -A -o args= 2>/dev/null | grep -Ex "sleep ($1)" >/dev/null; }
 tree_gone() { ! tree_alive "$1"; }
 watch_started=$(date +%s)
 { sleep 1; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
@@ -1623,8 +1628,9 @@ if user_sshd_bin >/dev/null && [ -n "${HOME:-}" ] && user_home=$(mktemp -d "$HOM
   kill "$busy_pid" 2>/dev/null || true
   [ -e "$user_home/raced" ] && [ "$USER_SSHD_PORT" != "$(cat "$user_home/busy")" ] || fail "user-mode sshd kept a taken port"
   kill "$USER_SSHD_PID" 2>/dev/null || true
-  # Below the world-writable /tmp StrictModes would refuse every key: report it instead of starting.
-  user_sshd_rc=0; user_sshd_start "$tmp/user-sshd-in-tmp" "$(id -un)" || user_sshd_rc=$?
+  # Make the unsafe ancestor explicit: macOS TMPDIR can be private rather than world-writable /tmp.
+  mkdir -p "$tmp/unsafe-sshd-parent"; chmod 777 "$tmp/unsafe-sshd-parent"
+  user_sshd_rc=0; user_sshd_start "$tmp/unsafe-sshd-parent/session" "$(id -un)" || user_sshd_rc=$?
   assert_eq "user-mode sshd refuses a StrictModes-unsafe directory" "$user_sshd_rc" "3"
   [ -n "$USER_SSHD_UNSAFE_DIR" ] || fail "user-mode sshd did not name the unsafe directory"
   rm -rf "$user_home"
@@ -1898,34 +1904,93 @@ mc_unsupported="$(MC_NO_MAX=1 RH_SSHFS_MAX_CONNS=4 mc_opts)"
 [ -n "$mc_unsupported" ] || fail "fake sshfs was not invoked"
 case "$mc_unsupported" in *max_conns*) fail "max_conns passed to an sshfs that does not support it";; esac
 
-# --- mount-project.sh: a detached sshfs is stopped only when unused and idle -------------------
+# --- mount-project.sh: a detached sshfs is stopped only when its FUSE superblock is gone and idle --
 if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then
   ds_mp="$tmp/detached-mount"; ds_cfg="$tmp/detached-ssh_config"; mkdir -p "$ds_mp"; : > "$ds_cfg"
   ds_title="sshfs box:/p $ds_mp -o reconnect,ssh_command=/usr/bin/ssh -F $ds_cfg"
-  ds_fake() {  # $1 = process title, $2 = 1 to keep doing I/O; prints the pid
+  ds_fusectl="$tmp/ds-fusectl"; mkdir -p "$ds_fusectl"
+  ds_fake() {  # $1 = pid variable, $2 = process title, $3 = 1 to keep doing I/O
     perl -e '$0 = $ARGV[0]; open(my $n, ">", "/dev/null");
              while (1) { syswrite($n, "x" x 65536) if $ARGV[1]; select(undef, undef, undef, 0.2) }' \
-      "$1" "$2" >/dev/null 2>&1 &
-    printf '%s' "$!"
+      "$2" "$3" >/dev/null 2>&1 &
+    # Keep this a child of the test shell, which can reap it even under a runner subreaper.
+    printf -v "$1" '%s' "$!"
   }
-  ds_unmount() { "$ROOT/scripts/mount-project.sh" --alias box --unmount --mountpoint "$ds_mp" 2>/dev/null; }
-  ds_idle=$(ds_fake "$ds_title" 0); ds_sftp=$(ds_fake "/usr/bin/ssh -F $ds_cfg -x box -s sftp" 0); sleep 0.5
+  # The mountpoint here was never mounted (an earlier run "already detached" it), so the decision
+  # rests on the fusectl listing: any live FUSE superblock of ours that no mount shows may be it.
+  ds_unmount() {
+    RH_FUSECTL_DIR="${ds_fusectl_dir-$ds_fusectl}" \
+      "$ROOT/scripts/mount-project.sh" --alias box --unmount --mountpoint "$ds_mp" 2>/dev/null
+  }
+  ds_fake ds_idle "$ds_title" 0; ds_fake ds_sftp "/usr/bin/ssh -F $ds_cfg -x box -s sftp" 0; sleep 0.5
   # Neither the unmounted daemon nor its sftp ssh keeps the session SSH config in use.
   RH_HOME="$tmp/ds-rh" sh "$ROOT/scripts/session-reaper.sh" config-used "$ds_cfg" | grep -qx USED=0 \
     || fail "an sshfs whose mount is gone kept its SSH config in use"
-  kill "$ds_sftp" 2>/dev/null || true
+  kill "$ds_sftp" 2>/dev/null || true; wait "$ds_sftp" 2>/dev/null || true
   RH_PROGRESS_FD=3 RH_SSHFS_IDLE_SECONDS=2 ds_unmount 3>"$tmp/ds-progress" | grep -qx STATUS=unmounted || fail "detached sshfs unmount status"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=unmounted" "unmount reports detach progress"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=sshfs-wait" "unmount reports waiting for a lingering sshfs"
-  wait_gone "$ds_idle" 20 || fail "idle detached sshfs kept running"
-  ds_used=$(ds_fake "$ds_title" 0); (cd "$ds_mp" && exec sleep 30) & ds_holder=$!; sleep 0.5
+  wait_gone "$ds_idle" 20 || fail "idle detached sshfs kept running although no FUSE superblock of ours was left"
+  wait "$ds_idle" 2>/dev/null || true
+  # A live superblock that no mount here shows is still referenced (cwd, open file, other namespace).
+  mkdir "$ds_fusectl/999999"
+  ds_fake ds_used "$ds_title" 0; sleep 0.5
   RH_SSHFS_IDLE_SECONDS=2 ds_unmount >/dev/null
-  kill -0 "$ds_used" 2>/dev/null || fail "detached sshfs was stopped while its mount path was in use"
-  kill "$ds_holder" "$ds_used" 2>/dev/null || true; wait "$ds_holder" 2>/dev/null || true
-  ds_busy=$(ds_fake "$ds_title" 1); sleep 0.5
+  kill -0 "$ds_used" 2>/dev/null || fail "detached sshfs was stopped while a detached FUSE superblock was still live"
+  kill "$ds_used" 2>/dev/null || true; wait "$ds_used" 2>/dev/null || true
+  rmdir "$ds_fusectl/999999"
+  # Without an authoritative fusectl answer nothing is stopped.
+  ds_fake ds_unknown "$ds_title" 0; sleep 0.5
+  ds_fusectl_dir="$tmp/ds-no-fusectl" RH_SSHFS_IDLE_SECONDS=2 ds_unmount >/dev/null
+  kill -0 "$ds_unknown" 2>/dev/null || fail "detached sshfs was stopped without a fusectl listing"
+  kill "$ds_unknown" 2>/dev/null || true; wait "$ds_unknown" 2>/dev/null || true
+  ds_fake ds_busy "$ds_title" 1; sleep 0.5
   RH_SSHFS_IDLE_SECONDS=2 RH_SSHFS_SYNC_MAX_SECONDS=4 ds_unmount >/dev/null
   kill -0 "$ds_busy" 2>/dev/null || fail "detached sshfs was stopped while it was still syncing"
-  kill "$ds_busy" 2>/dev/null || true
+  kill "$ds_busy" 2>/dev/null || true; wait "$ds_busy" 2>/dev/null || true
+fi
+
+# --- mount-project.sh: a real lazily detached sshfs mount (local sftp-server, no network) ---------
+fm_sftp=""
+for fm_candidate in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/sftp-server; do
+  [ -x "$fm_candidate" ] && { fm_sftp=$fm_candidate; break; }
+done
+fm_umount() { fusermount -uz "$1" 2>/dev/null || fusermount3 -uz "$1" 2>/dev/null || true; }
+if [ -n "$fm_sftp" ] && [ -c /dev/fuse ] && command -v sshfs >/dev/null 2>&1 \
+   && { command -v fusermount >/dev/null 2>&1 || command -v fusermount3 >/dev/null 2>&1; } \
+   && grep -q ' /sys/fs/fuse/connections .* - fusectl ' /proc/self/mountinfo 2>/dev/null; then
+  fm_src="$tmp/fm-src"; fm_mp="$tmp/fm-mount"; mkdir -p "$fm_src" "$fm_mp"
+  printf '#!/bin/sh\nexec %s\n' "$fm_sftp" > "$tmp/fm-ssh"; chmod +x "$tmp/fm-ssh"
+  fm_holder=""
+  trap 'kill $fm_holder 2>/dev/null; fm_umount "$fm_mp"; rm -rf "$tmp"' EXIT
+  fm_mount() { sshfs "x:$fm_src" "$fm_mp" -o "ssh_command=$tmp/fm-ssh" 2>/dev/null; }
+  fm_pid() { ps -ww -u "$(id -u)" -o pid= -o args= | awk -v m="$fm_mp" '$2 == "sshfs" && $4 == m { print $1 }'; }
+  fm_run() { RH_SSHFS_IDLE_SECONDS=1 "$ROOT/scripts/mount-project.sh" --alias x --unmount --mountpoint "$fm_mp" 2>/dev/null; }
+  if fm_mount; then
+    fm_daemon=$(fm_pid)
+    (cd "$fm_mp" && exec 9>>held && exec sleep 60) & fm_holder=$!; sleep 0.5
+    # The holder's cwd/fd now read "/" and "/held": invisible to any path scan of the old mountpoint.
+    fm_run | grep -qx STATUS=unmounted || fail "busy real sshfs mount was not lazily detached"
+    kill -0 "$fm_daemon" 2>/dev/null || fail "real sshfs was stopped while a process still used its detached mount"
+    ls "/proc/$fm_holder/cwd/" >/dev/null 2>&1 || fail "the detached mount stopped serving its holder"
+    # A second unmount no longer knows the device number: our unlisted live superblock keeps it.
+    fm_run >/dev/null
+    kill -0 "$fm_daemon" 2>/dev/null || fail "real sshfs was stopped by a repeated unmount while still in use"
+    kill "$fm_holder" 2>/dev/null; wait "$fm_holder" 2>/dev/null || true; fm_holder=""
+    wait_gone "$fm_daemon" 50 || fail "real sshfs kept running after the last user of its detached mount left"
+    # A clean unmount still ends the daemon.
+    if fm_mount; then
+      fm_daemon=$(fm_pid)
+      fm_run | grep -qx STATUS=unmounted || fail "idle real sshfs mount was not unmounted"
+      wait_gone "$fm_daemon" 50 || fail "real sshfs kept running after a clean unmount"
+    fi
+  else
+    printf 'skip: real sshfs mount (sshfs could not mount through a local sftp-server)\n'
+  fi
+  fm_umount "$fm_mp"
+  trap 'rm -rf "$tmp"' EXIT
+else
+  printf 'skip: real sshfs detach (needs sshfs, fusermount, /dev/fuse, fusectl and sftp-server)\n'
 fi
 
 # macOS bash 3.2 reads non-ASCII bytes right after "$name" as part of the variable name (e.g. a

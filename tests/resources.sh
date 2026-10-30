@@ -2,7 +2,9 @@
 # Exercise shared resource release and implementation snapshots without a real SSHFS mount.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/rh-resources.XXXXXX")
+# Keep the Unix-socket fixture short, and match mount-project's physical mountpoint spelling.
+fixture=$(mktemp -d /tmp/rh-resources.XXXXXX)
+fixture=$(cd "$fixture" && pwd -P)
 worker=""
 trap '[ -z "$worker" ] || kill "$worker" 2>/dev/null || true; rm -rf "$fixture"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }

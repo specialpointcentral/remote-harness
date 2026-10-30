@@ -27,10 +27,15 @@
   attributes and "no such file" answers in the kernel for `RH_SSHFS_CACHE_SECONDS` (default 20, `0`
   disables), because agents repeatedly probe the same `.git` paths; `auto_cache` keeps unchanged file
   contents across opens. An sshfs daemon that outlives its unmount is
-  stopped only when nothing uses the mountpoint and either the unmount was clean (1s grace: the kernel
+  stopped only when its FUSE superblock is gone and either the unmount was clean (1s grace: the kernel
   already confirmed no open files) or the daemon itself has made no I/O progress for
   `RH_SSHFS_IDLE_SECONDS` (default 3; its ssh connections' keepalives do not count); its sftp ssh then
-  exits on EOF. A daemon still flushing writes is left running once `RH_SSHFS_SYNC_MAX_SECONDS`
+  exits on EOF. The kernel keeps a superblock listed under fusectl (`/sys/fs/fuse/connections/<dev>`)
+  while any cwd, open file, mapping, other mount namespace, or blocked request still references the
+  detached mount; the device number is read from `/proc/self/mountinfo` before detaching. Other
+  processes' `/proc` links are not scanned: sshd and other non-dumpable processes hide them, and a lazily
+  detached file no longer appears under the old mountpoint. Without a fusectl answer a lazily detached
+  daemon is kept. A daemon still flushing writes is left running once `RH_SSHFS_SYNC_MAX_SECONDS`
   (default 120) passes. Without `/proc` nothing is stopped.
 - `inject-rule.sh`: installs session instructions, Claude/Codex hooks or the opencode plugin, and the
   remote runner. opencode emits a readiness marker path that must be observed before launch.

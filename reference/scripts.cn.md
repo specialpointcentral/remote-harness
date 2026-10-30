@@ -25,10 +25,13 @@
   设为大于 1 时，在 sshfs 支持的情况下启用并行连接；在约 360ms 的线路上实测，它会让并发查询慢约 7 倍）；libfuse 版 sshfs
   还会在内核里缓存路径查找、文件属性和「文件不存在」的结果 `RH_SSHFS_CACHE_SECONDS` 秒（默认 20，设为 `0`
   关闭），因为 Agent 会反复探测同一批 `.git` 路径；`auto_cache` 让未变化的文件内容在多次打开之间保持缓存。挂载解除后如果 sshfs 进程没有退出，
-  只有在没有进程使用该挂载点，并且满足以下之一时才会结束它：正常卸载成功（内核已确认没有打开的文件，等 1 秒），
-  或 sshfs 自身在 `RH_SSHFS_IDLE_SECONDS`（默认 3）秒内没有任何 I/O 进展（其 ssh 连接的 keepalive 不计入），之后其 sftp ssh 会因 EOF 自行退出；
-  仍在刷写数据的 sshfs 不会被打断（等待上限由 `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc`
-  的系统上不会结束任何进程。
+  只有在它的 FUSE superblock 已经释放，并且满足以下之一时才会结束它：正常卸载成功（内核已确认没有打开的文件，等 1 秒），
+  或 sshfs 自身在 `RH_SSHFS_IDLE_SECONDS`（默认 3）秒内没有任何 I/O 进展（其 ssh 连接的 keepalive 不计入），之后其 sftp ssh 会因 EOF 自行退出。
+  只要还有 cwd、打开的文件、内存映射、其他 mount namespace 或阻塞中的请求引用已卸下的挂载，内核就会在 fusectl
+  （`/sys/fs/fuse/connections/<设备号>`）下保留这个 superblock；设备号在卸载前从 `/proc/self/mountinfo` 读取。
+  不再扫描其他进程的 `/proc` 链接：sshd 等 non-dumpable 进程的链接读不到，lazy 卸载后的文件也不再显示在原挂载点之下。
+  拿不到 fusectl 的结论时，lazy 卸载后的 sshfs 会保留。仍在刷写数据的 sshfs 不会被打断（等待上限由
+  `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc` 的系统上不会结束任何进程。
 - `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
   opencode 还会返回启动前必须出现的 readiness marker 路径。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
