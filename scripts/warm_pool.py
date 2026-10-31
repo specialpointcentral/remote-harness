@@ -12,10 +12,16 @@ and opens another channel, so a command pays about one round trip.
 Each channel serves exactly one request, so every command keeps its own streams, exit status, and
 "closing stdin stops the command" cancellation. Anything that fails before the request is written (no
 broker, no ready channel, a failed handoff, a channel already gone) leaves the client on the ordinary
-path: a pool problem never fails a command that has not been sent. The pool grows when a client finds
-it empty and shrinks back to RH_WARM_MIN when channels sit idle for RH_WARM_IDLE seconds.
+path. A complete request whose acknowledgment is lost has uncertain delivery and is never retried
+for Bash. The ready reserve grows only to RH_WARM_READY_MAX (at most two), with at most two openings,
+and the total inventory including handed/closing channels stays at or below RH_WARM_MAX (9 by default,
+below the system sshd's MaxSessions 10; the launcher raises it to 16 for its user-mode sshd).
+Each opening has a deadline; ready channels age individually and shrink back to RH_WARM_MIN after
+RH_WARM_IDLE seconds. Shutdown drains handed commands before stopping their SSH master. The
+connection's keepalive notices a dead tunnel within about 15 s, which bounds how long its stale ready
+channels can be handed out (a request on one fails as uncertain instead of being retried).
 
-The client half imports only os, socket, array and select, because it runs on every routed call.
+The client half uses only small standard-library modules because it runs on every routed call.
 """
 
 from __future__ import annotations
@@ -44,7 +50,9 @@ class Claim:
             os.set_inheritable(fd, False)
 
     def close(self) -> None:
-        for fd in (self.stdin, self.stdout, self.stderr):
+        fds = self.stdin, self.stdout, self.stderr
+        self.stdin = self.stdout = self.stderr = -1
+        for fd in fds:
             try:
                 os.close(fd)
             except OSError:
@@ -52,43 +60,55 @@ class Claim:
         self.conn.close()
 
 
-def claim(path: str) -> Claim | None:
-    """Ask the broker listening on `path` for a ready channel; None means use the ordinary path."""
+def claim(path: str, wait_seconds: float = 0.0) -> Claim | None:
+    """Claim a ready channel, optionally waiting briefly for an empty pool to finish opening one.
+
+    An absent/unresponsive broker returns None without additional retries. All retries share one
+    deadline, so the wait cannot grow with the number of empty replies.
+    """
     if not path:
         return None
     import array
+    import time
 
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    fds = array.array("i")
-    try:
-        conn.settimeout(CLAIM_TIMEOUT)
-        conn.connect(path)
-        conn.sendall(b"GET\n")
-        data, ancdata, _flags, _addr = conn.recvmsg(64, socket.CMSG_SPACE(3 * fds.itemsize))
-        for level, kind, payload in ancdata:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
-        if data == b"OK\n" and len(fds) == 3:
-            conn.settimeout(None)
-            return Claim(conn, list(fds))
-    except OSError:
-        pass
-    for fd in fds:
-        os.close(fd)
-    conn.close()
-    return None
+    wait_seconds = max(0.0, min(1.0, wait_seconds))
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        fds = array.array("i")
+        data = b""
+        try:
+            timeout = min(CLAIM_TIMEOUT, max(0.001, deadline - time.monotonic())) if wait_seconds else CLAIM_TIMEOUT
+            conn.settimeout(timeout)
+            conn.connect(path)
+            conn.sendall(b"GET\n")
+            data, ancdata, _flags, _addr = conn.recvmsg(64, socket.CMSG_SPACE(3 * fds.itemsize))
+            for level, kind, payload in ancdata:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
+            if data == b"OK\n" and len(fds) == 3:
+                conn.settimeout(None)
+                return Claim(conn, list(fds))
+        except OSError:
+            pass
+        for fd in fds:
+            os.close(fd)
+        conn.close()
+        remaining = deadline - time.monotonic()
+        if data != b"NONE\n" or remaining <= 0:
+            return None
+        time.sleep(min(0.02, remaining))
 
 
 def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
     """Send `request` (one line) on the claimed channel, pass its output to on_stdout/on_stderr until
     both streams end and the broker reports the exit status, and return that status.
 
-    Raises NotDelivered when the gateway never acknowledged the request (RH_WAIT_GOT): the line could
-    not be written, or the channel failed before the line arrived, so the request did not run and the
-    ordinary path may take it. Output before the acknowledgment is held back, so a failed channel's
-    errors never reach the caller. The channel's stdin stays open until the end; closing it
-    (held.close(), or this process dying) stops the command on the project host. Exceptions from the
-    callbacks (BrokenPipeError) propagate.
+    Raises NotDelivered only when the complete request line could not be written. After a complete
+    write a lost acknowledgment leaves delivery uncertain, so return 255 without permitting a Bash
+    retry. Output before the acknowledgment is held back. The channel's stdin stays open until the
+    end; closing it (held.close(), or this process dying) stops the command on the project host.
+    Exceptions from the callbacks (BrokenPipeError) propagate.
     """
     import select
 
@@ -144,7 +164,11 @@ def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
                     on_stderr(b"remote-harness: the warm channel pool stopped before the command finished\n")
     if not acked:
         detail = b"".join(early_err).decode("utf-8", "replace").strip()[-200:]
-        raise NotDelivered(f"the channel ended before the project host acknowledged the request: {detail}")
+        on_stderr(("remote-harness: warm request delivery is uncertain; the complete request was sent "
+                   "but no acknowledgment arrived; not retrying Bash\n").encode())
+        if detail:
+            on_stderr((detail + "\n").encode())
+        return 255
     return status
 
 
@@ -177,9 +201,11 @@ def serve(argv: list[str]) -> int:
     opt = {flag[2:].replace("-", "_"): value for flag, value in zip(argv[::2], argv[1::2])}
     owner = int(opt["owner_pid"])
     sock_path, control = opt["socket"], opt["control_path"]
-    # Up to 9 sessions besides the master fit sshd's default MaxSessions 10 on this connection.
-    pool_max = env_int("RH_WARM_MAX", 8, 0, 9)
-    pool_min = env_int("RH_WARM_MIN", 1, 0, pool_max)
+    pool_max = env_int("RH_WARM_MAX", 9, 0, 16)
+    ready_max = env_int("RH_WARM_READY_MAX", 2, 0, min(2, pool_max))
+    opening_max = env_int("RH_WARM_OPENING_MAX", 2, 1, 2)
+    pool_min = env_int("RH_WARM_MIN", 1, 0, ready_max)
+    open_timeout = env_int("RH_WARM_OPEN_TIMEOUT", 10, 1, 300)
     idle = env_int("RH_WARM_IDLE", 90, 5, 86400)
     max_age = env_int("RH_WARM_MAX_AGE", 600, 30, 86400)
     if pool_max == 0:
@@ -230,14 +256,19 @@ def serve(argv: list[str]) -> int:
 
     remember(sock_path)
 
+    # A shorter keepalive than routed commands use: until the master notices a dead tunnel its ready
+    # channels look healthy, and a request written on one is uncertain, so it is never retried. Not
+    # shorter still, because these keepalives queue behind SSHFS traffic in the same reverse tunnel.
     ssh_base = ["ssh", "-F", opt["ssh_config"], "-T", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+                "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
                 "-o", f"ControlPath={control}"]
 
     class Channel:
         def __init__(self, proc: subprocess.Popen, now: float) -> None:
             self.proc, self.started, self.ready_at = proc, now, 0.0
-            self.state = "opening"  # -> ready -> handed, or -> closing
+            self.state = "new"  # -> opening -> ready -> handed, or -> closing
+            self.number = state["sequence"]
+            self.closing_at = 0.0
             self.out = b""
             self.err = b""
             self.conn: socket.socket | None = None
@@ -256,11 +287,19 @@ def serve(argv: list[str]) -> int:
 
     channels: list[Channel] = []
     state = {"target": pool_min, "failures": 0, "next_spawn": 0.0, "disabled": False,
-             "master": None, "master_failures": 0, "next_master": 0.0}
+             "master": None, "master_failures": 0, "next_master": 0.0,
+             "sequence": 0, "draining": False}
+
+    def transition(ch: Channel, target: str, reason: str, now: float) -> None:
+        log(f"channel={ch.number} {ch.state}->{target} age_ms={int(1000 * (now - ch.started))} "
+            f"reason={reason}")
+        ch.state = target
 
     def stop_old_master() -> None:
         if os.path.exists(control):
-            subprocess.run(["ssh", "-o", f"ControlPath={control}", "-O", "exit", "rh-warm"],
+            # A predecessor may have handed out live channels before it died. Stop accepting new
+            # ones on its master, preserving those commands while this broker creates its own.
+            subprocess.run(["ssh", "-o", f"ControlPath={control}", "-O", "stop", "rh-warm"],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=10, check=False)
             try:
@@ -307,9 +346,12 @@ def serve(argv: list[str]) -> int:
         return now + min(30.0, 0.5 * 2 ** min(state[kind], 6))
 
     def discard(ch: Channel, reason: str, now: float) -> None:
+        if ch.state in ("closing", "handed", "exited"):
+            return
         was = ch.state
         close_pipes(ch)
-        ch.state = "closing"
+        transition(ch, "closing", reason, now)
+        ch.closing_at = now
         if ch.proc.poll() is None:
             ch.proc.terminate()
         if was == "opening":
@@ -320,20 +362,30 @@ def serve(argv: list[str]) -> int:
                 log("the project host's gateway has no remote-harness-wait; the pool stays off")
                 return
             state["next_spawn"] = backoff("failures", now)
-            log(f"channel failed before it was ready ({reason}){': ' + detail_text if detail_text else ''}")
+            capacity = "session open refused" in detail_text.lower() or "no more sessions" in detail_text.lower()
+            log(f"channel={ch.number} opening failed capacity={int(capacity)} "
+                f"backoff_ms={int(1000 * (state['next_spawn'] - now))} "
+                f"({reason}){': ' + detail_text if detail_text else ''}")
         elif was == "ready" and reason != "idle":
             log(f"a ready channel closed ({reason})")
 
     def spawn(now: float) -> None:
-        proc = subprocess.Popen(ssh_base + ["-o", "ControlMaster=no", opt["alias"], "remote-harness-wait"],
+        # OpenSSH otherwise silently falls back to a fresh TCP connection if the mux session is
+        # refused. The existing master is tried first; false prevents only that new-connection path.
+        proc = subprocess.Popen(ssh_base + ["-o", "ControlMaster=no", "-o", "ProxyCommand=false",
+                                           opt["alias"], "remote-harness-wait"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        state["sequence"] += 1
         ch = Channel(proc, now)
         for stream, which in ((proc.stdout, "out"), (proc.stderr, "err")):
             os.set_blocking(stream.fileno(), False)
             sel.register(stream, selectors.EVENT_READ, (which, ch))
         channels.append(ch)
+        transition(ch, "opening", "spawn", now)
 
     def on_output(ch: Channel, which: str, now: float) -> None:
+        if ch.state not in ("opening", "ready"):
+            return
         stream = ch.proc.stdout if which == "out" else ch.proc.stderr
         try:
             data = os.read(stream.fileno(), 4096)
@@ -344,14 +396,18 @@ def serve(argv: list[str]) -> int:
         if which == "err":
             ch.err = (ch.err + data)[-4096:]
             if not data:
-                sel.unregister(stream)
+                try:
+                    sel.unregister(stream)
+                except (KeyError, ValueError):
+                    pass  # reap() drains a stream whose end the loop already handled
             return
         if not data:
             discard(ch, "its ssh ended", now)
             return
         ch.out += data
         if ch.state == "opening" and ch.out == READY:
-            ch.state, ch.ready_at = "ready", now
+            transition(ch, "ready", "gateway ready", now)
+            ch.ready_at = now
             state["failures"] = 0
         elif ch.state != "opening" or not READY.startswith(ch.out):
             discard(ch, "unexpected output", now)
@@ -364,7 +420,7 @@ def serve(argv: list[str]) -> int:
             except OSError:
                 pass
             conn.close()
-            if not state["disabled"] and state["target"] < pool_max:
+            if not state["disabled"] and state["target"] < ready_max:
                 state["target"] += 1
             return
         ch = max(ready, key=lambda c: c.ready_at)  # newest: idle ones age out
@@ -376,7 +432,8 @@ def serve(argv: list[str]) -> int:
             return
         # The client now holds the only copies: its exit, or its closing stdin, ends the channel.
         close_pipes(ch)
-        ch.state, ch.conn = "handed", conn
+        transition(ch, "handed", "client claim", now)
+        ch.conn = conn
 
     def on_client(conn: socket.socket, now: float) -> None:
         sel.unregister(conn)
@@ -384,7 +441,7 @@ def serve(argv: list[str]) -> int:
             request = conn.recv(16)
         except OSError:
             request = b""
-        if request == b"GET\n" and not state["disabled"]:
+        if request == b"GET\n" and not state["disabled"] and not state["draining"]:
             hand_out(conn, now)
             return
         if request == b"STAT\n":
@@ -422,6 +479,7 @@ def serve(argv: list[str]) -> int:
                 if ch.state != "closing":
                     discard(ch, f"its ssh exited with {code}", now)
             close_pipes(ch)
+            transition(ch, "exited", f"status {code}", now)
             channels.remove(ch)
         master = state["master"]
         if master is not None and master.poll() is not None:
@@ -433,7 +491,12 @@ def serve(argv: list[str]) -> int:
                     discard(ch, "its connection ended", now)
 
     def maintain(now: float) -> None:
-        if state["disabled"]:
+        for ch in channels:
+            if ch.state == "closing" and ch.proc.poll() is None and now - ch.closing_at >= 1:
+                ch.proc.kill()
+            elif ch.state == "opening" and now - ch.started >= open_timeout:
+                discard(ch, "opening timeout", now)
+        if state["disabled"] or state["draining"]:
             return
         if state["master"] is None:
             if now >= state["next_master"]:
@@ -456,7 +519,7 @@ def serve(argv: list[str]) -> int:
         warm = sum(1 for ch in channels if ch.state in ("opening", "ready"))
         opening = sum(1 for ch in channels if ch.state == "opening")
         room = pool_max - len(channels)
-        want = min(state["target"] - warm, room, 4 - opening)
+        want = min(state["target"] - warm, room, opening_max - opening)
         if want > 0 and now >= state["next_spawn"]:
             for _ in range(want):
                 spawn(now)
@@ -476,13 +539,25 @@ def serve(argv: list[str]) -> int:
             pass
         return os.path.isdir(opt["session_dir"])
 
-    log(f"warm pool started (min {pool_min}, max {pool_max}, idle {idle}s)")
+    log(f"warm pool started (min {pool_min}, max {pool_max}, ready_max {ready_max}, "
+        f"opening_max {opening_max}, opening_timeout {open_timeout}s, idle {idle}s)")
     try:
         # A gateway without the wait verb turns the pool off: clients that find no socket use the
         # ordinary path.
-        while not stop and not state["disabled"] and owner_alive():
+        while True:
             now = time.monotonic()
-            for key, _mask in sel.select(timeout=1.0):
+            if not state["draining"] and (stop or state["disabled"] or not owner_alive()):
+                state["draining"] = True
+                log("warm pool draining handed channels")
+                unlink_own(sock_path)
+                sel.unregister(listener)
+                listener.close()
+                for ch in channels:
+                    if ch.state in ("opening", "ready"):
+                        discard(ch, "shutdown", now)
+            if state["draining"] and not channels:
+                break
+            for key, _mask in sel.select(timeout=0.25):
                 kind, ch = key.data
                 if kind == "wake":
                     try:

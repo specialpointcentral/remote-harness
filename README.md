@@ -172,7 +172,9 @@ gateway 拒绝。Agent 内部的 Git 状态扫描和文件搜索通过会话 PAT
 `RH_SHELL_SNAPSHOT=off` 可关闭。
 
 远端会话还会预先打开几条到本机的 SSH 通道（预热通道池），Bash 和 git/rg 调用直接使用，省去每次新开
-通道的 2 到 3 个往返；用不上时自动走原来的路径，请求只执行一次。`RH_WARM_MAX=0` 可关闭。
+通道的 2 到 3 个往返；用不上时自动走原来的路径，请求绝不会执行两次。`RH_WARM_MAX=0` 可关闭。通道数、
+并发配额和排队时间可以写在本机的 `~/.remote-harness/transport.conf`（`KEY=VALUE`，例如
+`RH_WARM_MAX=9`），说明见 `reference/scripts.cn.md`。
 
 ### 用户态 sshd（FreeIPA 等主机）
 
@@ -522,8 +524,10 @@ shell. Set `RH_SHELL_SNAPSHOT=off` to disable it.
 
 The remote session also keeps a few SSH channels to the laptop open ahead of time (a warm channel
 pool) for Bash and git/rg calls, saving the two to three round trips of opening one per call; when
-none is usable the call takes the ordinary path, and every request runs exactly once. Set
-`RH_WARM_MAX=0` to disable it.
+none is usable the call takes the ordinary path, and no request ever runs twice. Set
+`RH_WARM_MAX=0` to disable it. Channel counts, concurrency quotas, and queue waits can be set in
+`~/.remote-harness/transport.conf` on the laptop (`KEY=VALUE`, e.g. `RH_WARM_MAX=9`); see
+`reference/scripts.md`.
 
 ### User-mode sshd (FreeIPA-style hosts)
 

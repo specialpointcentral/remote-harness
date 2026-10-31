@@ -117,15 +117,32 @@ SSHFS 使用自己独立的连接。
 3. 客户端转发输出；通道的 ssh 退出时，通道池报告退出码并补开一条。每条通道只服务一次请求，所以
    输出流、退出码和"关闭 stdin 即停止命令"都不变。
 
-请求只执行一次。没能写进去、或项目主机没有确认的请求并没有执行，改走普通路径；已确认的 Bash 请求
-绝不重发，只读的 git/rg 调用保持原有的重试。没有通道池、没有就绪通道、或旧版 gateway 不支持 wait
-动词，也都走普通路径，所以通道池不会让任何命令失败。
+请求最多执行一次。完整的一行没能写进去的请求并没有执行，改走普通路径。一旦整行写出，没有收到确认就
+属于送达不确定（通道可能在 gateway 读到这一行之前或之后断开），所以 Bash 以 255 失败、绝不重发；只读的
+git/rg 调用保持原有的重试。已确认的 Bash 请求同样绝不重发。没有通道池、没有就绪通道、或旧版 gateway
+不支持 wait 动词，都走普通路径。
 
-通道池启动时保持 `RH_WARM_MIN` 条就绪通道（1）；客户端每遇到一次池空就加一条；连接上最多
-`RH_WARM_MAX` 条（8，低于 sshd 默认的 `MaxSessions 10`）；空闲超过 `RH_WARM_IDLE` 秒（90）的通道
-关闭到下限；就绪通道每 `RH_WARM_MAX_AGE` 秒（600）更新一次。打不开的通道按最长 30 秒退避，断开的
-连接会重建。Agent 退出（包括尚未被回收的僵尸进程）或会话目录消失时通道池随之退出，只删除自己创建的
-socket，日志写在会话目录的 `warm.log`。`RH_WARM_MAX=0` 可关闭。
+通道池启动时保持 `RH_WARM_MIN` 条就绪通道（1），客户端每遇到一次池空就加一条，就绪通道最多
+`RH_WARM_READY_MAX` 条（2），同时打开中的最多 `RH_WARM_OPENING_MAX` 条（2），每条打开超过
+`RH_WARM_OPEN_TIMEOUT` 秒（10）就放弃。连接上包括已交出的通道在内最多 `RH_WARM_MAX` 条：默认 9，
+低于 system sshd 未另行配置时的 `MaxSessions 10`；使用 user 模式 sshd（`RH_SSHD_MAX_SESSIONS`，32）时，
+启动器把它提高到比该值少 1，最多 16。打开通道只走复用（`ProxyCommand=false`），被拒的 session 不会悄悄
+变成一条新连接；被拒后按最长 30 秒退避。空闲超过 `RH_WARM_IDLE` 秒（90）的通道关闭到下限；就绪通道每
+`RH_WARM_MAX_AGE` 秒（600）更新一次。它的连接用比路由命令更短的 keepalive（`ServerAliveInterval=5`、
+`ServerAliveCountMax=3`）：在发现隧道已断（约 15 秒）之前，就绪通道看起来都正常，写在上面的请求属于送达
+不确定。断开的连接会重建。Agent 退出（包括尚未被回收的僵尸进程）或会话目录消失时，通道池停止交出通道，
+等已交出的命令结束后退出，只删除自己创建的 socket，日志写在会话目录的 `warm.log`。`RH_WARM_MAX=0` 可关闭。
+
+拿不到预热通道的 Bash 调用走普通路径，受每会话 `RH_FOREGROUND_CONCURRENCY`（6）个并发的配额限制。
+超出配额的调用最多排队 `RH_CHANNEL_QUEUE_SECONDS`（600）秒，排队期间持续向通道池要通道，空出来的预热
+通道会接手；只有排队超时才以 255 失败。显式的后台 Bash（`run_in_background`）不用通道池，使用独立连接，
+配额为 `RH_BACKGROUND_CONCURRENCY`（8），排队时间较短，为 `RH_BACKGROUND_QUEUE_SECONDS`（10），因为长时间
+运行的后台任务很少释放名额。git/rg 调用有自己的配额 `RH_TOOL_CONCURRENCY`（6），最多排队
+`RH_TOOL_QUEUE_SECONDS`（600）秒。
+
+这些容量设置只接受白名单内的数字，来自环境变量或本机可选的 `~/.remote-harness/transport.conf`
+（`KEY=VALUE` 行，只解析、绝不 source；环境变量优先）。启动器把每个值作为 SSH 命令的显式 `env` 前缀
+转发，会话把它们固定在自己的 runner 和 launcher 里，所以子 Agent 共用同一套限制。
 
 ## 异常断开
 

@@ -74,16 +74,29 @@
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
   open while the command runs so the project host stops the command tree on cancel or disconnect.
   With `--warm SOCKET --warm-request LINE` (written by `rh-run`) it first sends the request on a warm
-  channel and relays its output; a request that was not written or not acknowledged runs on the
-  ordinary path instead, so it runs exactly once.
+  channel and relays its output; a request whose complete line was not written runs on the ordinary
+  path instead, and a written one without an acknowledgment fails with 255 (uncertain delivery,
+  never retried). With `--slots-dir` the ordinary path holds a per-session slot:
+  `RH_FOREGROUND_CONCURRENCY` (6), queued up to `RH_CHANNEL_QUEUE_SECONDS` (600) while it keeps asking
+  the warm pool; `--background` (explicit background Bash, standalone connections, no pool) uses
+  `RH_BACKGROUND_CONCURRENCY` (8) and `RH_BACKGROUND_QUEUE_SECONDS` (10).
 - `warm_pool.py`: `serve` (started by `rh-session`, one per session) keeps channels open on the
   gateway's wait verb over its own multiplexed connection (`runtime/wm.<session id>`) and hands one
   to a client over `runtime/warm.<session id>` as file descriptors, then reports its exit status. The
-  pool holds `RH_WARM_MIN` (1) to `RH_WARM_MAX` (8) channels, grows when a client finds it empty,
-  shrinks after `RH_WARM_IDLE` (90 s) idle, renews a channel after `RH_WARM_MAX_AGE` (600 s), backs off
-  channels that fail to open, rebuilds a dead connection, stops for a gateway without the wait verb,
-  exits with its agent or session dir, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0`
-  turns it off. The module's client half (`claim`, `run`) imports only os, socket, array and select.
+  pool keeps `RH_WARM_MIN` (1) to `RH_WARM_READY_MAX` (2) ready channels, opens at most
+  `RH_WARM_OPENING_MAX` (2) at once with an `RH_WARM_OPEN_TIMEOUT` (10 s) deadline, and holds at most
+  `RH_WARM_MAX` channels including handed ones (9 for the system sshd; up to 16 with the user-mode
+  sshd's `RH_SSHD_MAX_SESSIONS`). It shrinks after `RH_WARM_IDLE` (90 s) idle, renews a channel after
+  `RH_WARM_MAX_AGE` (600 s), opens channels only over its master (`ProxyCommand=false`), backs off
+  refused or failed openings, notices a dead tunnel in about 15 s (keepalive 5 s x 3), rebuilds a
+  dead connection, stops for a gateway without the wait verb, drains handed commands and exits with
+  its agent or session dir, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0` turns it off.
+  The module's client half (`claim`, `run`) uses only small standard-library modules.
+- Transport settings (`scripts/_common.sh`): the warm pool, quota and queue values above, plus
+  `RH_SSHD_MAX_SESSIONS` (32, the user-mode sshd's `MaxSessions`), are allowlisted numbers from the
+  environment or the laptop's optional `~/.remote-harness/transport.conf` (`KEY=VALUE`, parsed, never
+  sourced; the environment wins). `laptop-setup.sh` forwards all of them as an explicit `env` prefix
+  and each session freezes them into `rh-run` and `rh-session`.
 - `project-host-tool.py`: remote session PATH shim for `git` and `rg`. Work-tree scans inside the
   mount and read-only discovery (`rev-parse`, `config --get`, ...) run on the project host with paths
   translated both ways; git calls that write and calls outside the mount run the real remote tool. Routed calls share a concurrency cap (`RH_TOOL_CONCURRENCY`,

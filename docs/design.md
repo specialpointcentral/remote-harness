@@ -135,18 +135,41 @@ connection (`runtime/wm.<session id>`), so a routed Bash or git/rg call pays abo
    opens a replacement. Each channel serves one request, so streams, exit status, and "closing
    stdin stops the command" are unchanged.
 
-Delivery is exactly once. A request that could not be written, or that the project host never
-acknowledged, did not run and takes the ordinary path. An acknowledged Bash request is never sent
-again; read-only git/rg calls keep their existing retry. No pool, no ready channel, or an old gateway
-without the wait verb also means the ordinary path, so the pool never makes a command fail.
+Delivery is at most once. A request whose complete line could not be written did not run and takes
+the ordinary path. Once the line is written, a missing acknowledgment leaves delivery uncertain (the
+channel may have died before or after the gateway read it), so Bash fails with status 255 and is
+never sent again; read-only git/rg calls keep their existing retry. An acknowledged Bash request is
+never sent again either. No pool, no ready channel, or an old gateway without the wait verb means
+the ordinary path.
 
-The pool starts with `RH_WARM_MIN` ready channels (1), adds one whenever a client finds it empty,
-holds at most `RH_WARM_MAX` channels on its connection (8, below sshd's default `MaxSessions 10`),
-closes channels idle for `RH_WARM_IDLE` seconds (90) down to the minimum, and renews a ready channel
-after `RH_WARM_MAX_AGE` seconds (600). Channels that fail to open back off up to 30 seconds and a
-dead connection is rebuilt. The pool exits with its agent (also an unreaped one) or its session dir,
-removes only the sockets it created, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0`
-turns it off.
+The pool starts with `RH_WARM_MIN` ready channels (1) and adds one whenever a client finds it empty,
+up to `RH_WARM_READY_MAX` ready channels (2) with at most `RH_WARM_OPENING_MAX` openings (2) at a
+time, each abandoned after `RH_WARM_OPEN_TIMEOUT` seconds (10). Its connection carries at most
+`RH_WARM_MAX` channels including handed-out ones: 9 by default, below the `MaxSessions 10` that a
+system sshd keeps unless configured otherwise; with the user-mode sshd (`RH_SSHD_MAX_SESSIONS`, 32)
+the launcher raises it to one fewer than that, at most 16. Openings are mux-only
+(`ProxyCommand=false`), so a refused session never becomes a silent fresh connection; refusals back
+off up to 30 seconds. The pool closes channels idle for `RH_WARM_IDLE` seconds (90) down to the
+minimum and renews a ready channel after `RH_WARM_MAX_AGE` seconds (600). Its connection uses a
+shorter keepalive than routed commands (`ServerAliveInterval=5`, `ServerAliveCountMax=3`): until it
+notices a dead tunnel (about 15 seconds) its ready channels look healthy, and a request written on one
+is uncertain. A dead connection is rebuilt. When its agent (also an unreaped one) or session dir goes,
+the pool stops handing out channels, waits for handed commands, then exits, removes only the sockets
+it created, and logs to `warm.log` in the session dir. `RH_WARM_MAX=0` turns it off.
+
+Bash calls that do not get a warm channel take the ordinary path under a per-session quota of
+`RH_FOREGROUND_CONCURRENCY` (6) concurrent calls. A call over the quota queues for up to
+`RH_CHANNEL_QUEUE_SECONDS` (600) and keeps asking the pool meanwhile, so a channel that frees up
+serves it; only an expired queue fails it with 255. Explicit background Bash (`run_in_background`)
+skips the pool and uses standalone connections under `RH_BACKGROUND_CONCURRENCY` (8) with a short
+queue, `RH_BACKGROUND_QUEUE_SECONDS` (10), since long-running background jobs free slots rarely.
+git/rg calls have their own quota, `RH_TOOL_CONCURRENCY` (6), queued up to `RH_TOOL_QUEUE_SECONDS`
+(600).
+
+These capacity settings are allowlisted numbers, read from the environment or from the optional
+`~/.remote-harness/transport.conf` on the laptop (`KEY=VALUE` lines, parsed and never sourced; the
+environment wins). The launcher forwards every value as an explicit `env` prefix of its SSH command,
+and the session freezes them into its runner and launcher, so subagents share the same limits.
 
 ## Abnormal Disconnects
 

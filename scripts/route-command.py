@@ -109,8 +109,12 @@ def route(runner_arg: str, mount_root_arg: str) -> dict[str, object]:
 
     relative_cwd = os.path.relpath(cwd, mount_root)
     updated_input = dict(tool_input)
+    runner_args = [runner]
+    if tool_input.get("run_in_background") is True:
+        runner_args.append("--background")
+    runner_args.extend((encode(relative_cwd), encode(command)))
     updated_input["command"] = " ".join(
-        shlex.quote(part) for part in (runner, encode(relative_cwd), encode(command))
+        shlex.quote(part) for part in runner_args
     )
     return decision("allow", updatedInput=updated_input)
 

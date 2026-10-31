@@ -52,7 +52,7 @@ require_session_root() {  # $1 = requested project root (base64)
 # A waiting channel, opened ahead of use by the agent host's warm pool (warm_pool.py): say it is ready,
 # then take exactly one request line from the channel and handle it as the same exec or tool request
 # sent as the SSH command. Only a complete line counts. RH_WAIT_GOT acknowledges it before anything
-# runs, so a client whose channel fails without it knows the request never arrived. The rest of the
+# runs. A missing acknowledgment after a complete client write leaves delivery uncertain. The rest of the
 # channel stays the request's stdin, so closing it still cancels the command.
 if [ "$original" = remote-harness-wait ]; then
   printf 'RH_WAIT_READY\n'

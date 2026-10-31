@@ -61,8 +61,13 @@ it provides files over SSHFS and executes project commands through a forced gate
   `RH_WAIT_READY`, reads exactly one complete line that must itself be an exec or tool request,
   acknowledges it with `RH_WAIT_GOT` before anything runs, and handles it through the same checks
   and dispatcher. It never accepts health, SFTP, or another wait. Clients send a request on the
-  ordinary path only when it was provably not delivered (not written, or not acknowledged); a Bash
-  request that was acknowledged is never retried.
+  ordinary path only when it was provably not delivered (the complete line could not be written).
+  A completely written line without an acknowledgment has uncertain delivery: Bash fails with 255
+  and is never retried; only read-only git/rg calls may run again.
+- Transport capacity settings (`RH_WARM_*`, `RH_SSHD_MAX_SESSIONS`, Bash/tool quotas and queue
+  waits) are allowlisted numbers from the environment or `~/.remote-harness/transport.conf`, which is
+  parsed, never sourced. The launcher forwards them explicitly as an `env` prefix and each session
+  freezes them in its runner and launcher.
 - The registered physical project root must match every exec request.
 - Reject direct local launches of `claude`, `codex`, and `opencode` in both hook and dispatcher;
   scrub common AI credentials and shadow those binaries in the local command PATH.

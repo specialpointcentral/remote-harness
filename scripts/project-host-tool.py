@@ -471,7 +471,8 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
 
 def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewriter) -> tuple[int, bool, bytes] | None:
     """The call on a channel the session's warm pool opened ahead of time (warm_pool.py), or None when
-    there is none or the project host never acknowledged the request, so nothing ran."""
+    there is none or the complete request could not be written. Read-only requests can also retry
+    after an uncertain delivery status of 255."""
     global current_claim
     args = ctx.args
     if not args.warm_socket:
@@ -546,9 +547,11 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
         if result is None or (result[0] == TRANSPORT_FAILURE and not result[1]):
             result = run_attempt(runner_command(args, relative, spec, True), rewriter(), ctx)
             if result[0] == TRANSPORT_FAILURE and not result[1] and args.control_path:
-                # The shared master may be dead, wedged on a dropped tunnel, or out of sessions:
-                # retire it and retry once on a fresh direct connection.
-                stop_master(args)
+                # A capacity refusal says the master is alive. Leave its running sessions and
+                # future callers alone; only other transport failures retire a possibly wedged one.
+                error = result[2].lower()
+                if b"session open refused" not in error and b"no more sessions" not in error:
+                    stop_master(args)
                 result = run_attempt(runner_command(args, relative, spec, False), rewriter(), ctx)
         status, emitted, stderr = result
     finally:

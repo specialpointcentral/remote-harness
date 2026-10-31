@@ -99,6 +99,7 @@ if [ -f "$RH_COMMON" ]; then
   # shellcheck source=./_common.sh
   . "$RH_COMMON"
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
+transport_settings_load "$LOCAL_SSHD_MODE" || exit 2
 
 # Its own RH_LAPTOP_STEPS steps, after any simple-laptop-setup.sh steps (RH_STEP_BASE).
 STEP_TOTAL=$((STEP_N + RH_LAPTOP_STEPS))
@@ -1277,7 +1278,7 @@ LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
-inject_remote_cmd="\"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+inject_remote_cmd="$(transport_settings_env) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
 # Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"

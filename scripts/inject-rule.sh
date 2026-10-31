@@ -186,15 +186,30 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
   # project host stops the command tree when this call is cancelled or the connection drops. With a
   # warm pool it first sends the same request on a channel opened ahead of time (warm_pool.py).
   _wsr_guard=""
+  _wsr_background_guard=""
   if [ -n "${6:-}" ] && [ -f "$SCRIPT_DIR/channel-guard.py" ]; then
     _wsr_warm=""
     [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
-    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") $_wsr_warm-- "
+    _wsr_slots="$(dirname "$4")/runtime/bash-slots/${1##*/}"
+    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --background --slots-dir $(sq "$_wsr_slots") -- "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --slots-dir $(sq "$_wsr_slots") $_wsr_warm-- "
     _wsr_mux="$_wsr_mux --watch"
   fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
+    _wsr_env="$(transport_settings_env)" || return 1
+    printf 'export %s\n' "${_wsr_env#env }"
+    printf 'background=0\ncase "${1:-}" in --background) background=1; shift;; esac\n'
+    printf '[ "$#" = 2 ] || { echo "usage: rh-run [--background] CWD_B64 COMMAND_B64" >&2; exit 2; }\n'
+    printf 'if [ "$background" = 1 ]; then\n'
+    if [ -z "$_wsr_background_guard" ]; then
+      printf '  echo "remote-harness: background routing requires python3 for bounded execution" >&2; exit 2\n'
+    fi
+    printf '  exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s --no-mux%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$_wsr_background_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
+      "$(b64_value "$3")" "${_wsr_background_guard:+ --watch}"
+    printf 'fi\n'
     printf 'exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
       "$_wsr_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
       "$(b64_value "$3")" "$_wsr_mux"
@@ -257,6 +272,8 @@ write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm 
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
+    _wsl_env="$(transport_settings_env)" || return 1
+    printf 'export %s\n' "${_wsl_env#env }"
     printf 'sd=%s\n' "$(sq "$1")"
     printf 'reaper=%s\n' "$(sq "$SCRIPT_DIR/session-reaper.sh")"
     printf 'rh_home=%s\n' "$(sq "${RH_HOME:-$HOME/.remote-harness}")"
@@ -484,6 +501,9 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
 
 case "${1:-}" in
   on)
+    # Reuse the same allowlist as the local launcher; forwarded environment overrides remote defaults.
+    . "$SCRIPT_DIR/_common.sh"
+    transport_settings_load || { echo 'RH_STATUS=ERROR'; exit 2; }
     agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; approval="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
     case "$agent" in claude|codex|opencode) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
     case "$approval" in 1|yolo) yolo=1; approval=yolo;; auto) yolo=0;; *) yolo=0; approval=normal;; esac
@@ -548,7 +568,7 @@ case "${1:-}" in
     PYTHON3=$(command -v python3 2>/dev/null || true)
     # RH_WARM_MAX=0 turns the warm channel pool off; it also needs python3 here.
     warm_socket="" warm_control=""
-    if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-8}" != 0 ]; then
+    if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-9}" != 0 ]; then
       session_warm_paths "$ssh_config" "$sid"
     fi
     runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3" "$warm_socket") \

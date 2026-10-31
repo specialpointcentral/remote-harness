@@ -55,8 +55,12 @@
   `/dev/null`，并在 SSH 通道关闭时终止命令的进程组和进程树。
 - `remote-harness-wait`（Agent 主机的预热通道池 `warm_pool.py`）先输出 `RH_WAIT_READY`，只读取一行
   完整请求，这一行本身必须是 exec 或 tool 请求；在执行任何东西之前先以 `RH_WAIT_GOT` 确认，然后走同样
-  的校验和 dispatcher。它绝不接受 health、SFTP 或嵌套的 wait。客户端只在请求确定没有送达（没写进去，
-  或没有收到确认）时才改走普通路径；已确认的 Bash 请求绝不重试。
+  的校验和 dispatcher。它绝不接受 health、SFTP 或嵌套的 wait。客户端只在请求确定没有送达（完整的一行
+  没能写进去）时才改走普通路径。完整写出却没有收到确认的请求属于送达不确定：Bash 以 255 失败，绝不重试；
+  只有只读的 git/rg 调用可以再执行一次。
+- 传输容量设置（`RH_WARM_*`、`RH_SSHD_MAX_SESSIONS`、Bash/工具的并发配额和排队时间）只接受白名单内的
+  数字，来自环境变量或 `~/.remote-harness/transport.conf`；该文件只解析、绝不 source。启动器以 `env`
+  前缀显式转发这些值，每个会话把它们固定在自己的 runner 和 launcher 里。
 - 每次 exec 的项目根必须与本机会话登记的物理根一致。
 - hook 和 dispatcher 都拒绝直接在本机启动 `claude`、`codex`、`opencode`；清除常见 AI 凭据，
   并在本机命令 PATH 中屏蔽这些二进制。

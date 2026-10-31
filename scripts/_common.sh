@@ -131,6 +131,92 @@ sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 # First value of KEY in KEY=VALUE lines on stdin (values may contain '=').
 kv_value() { sed -n "s/^$1=//p" | head -1; }
 
+# Numeric transport settings are data, never shell input. The optional local file is deliberately
+# not sourced or rewritten; environment values take precedence, including explicit zero/empty values.
+# The warm pool's default size follows the sshd its connection reaches: the system sshd is assumed to
+# keep OpenSSH's MaxSessions 10, so 9 channels; the user-mode sshd is configured with
+# RH_SSHD_MAX_SESSIONS, so one fewer than that, at most 16.
+transport_setting_names() {
+  printf '%s\n' RH_SSHD_MAX_SESSIONS RH_WARM_MAX RH_WARM_MIN RH_WARM_READY_MAX \
+    RH_WARM_OPENING_MAX RH_WARM_IDLE RH_WARM_MAX_AGE RH_WARM_OPEN_TIMEOUT \
+    RH_BACKGROUND_CONCURRENCY RH_FOREGROUND_CONCURRENCY RH_CHANNEL_QUEUE_SECONDS \
+    RH_BACKGROUND_QUEUE_SECONDS RH_TOOL_CONCURRENCY RH_TOOL_QUEUE_SECONDS
+}
+
+transport_setting_spec() {  # name -> default low high
+  case "$1" in
+    RH_SSHD_MAX_SESSIONS) printf '32 1 1024';;
+    RH_WARM_MAX) printf '9 0 16';;
+    RH_WARM_MIN) printf '1 0 2';;
+    RH_WARM_READY_MAX) printf '2 0 2';;
+    RH_WARM_OPENING_MAX) printf '2 1 2';;
+    RH_WARM_IDLE) printf '90 5 86400';;
+    RH_WARM_MAX_AGE) printf '600 30 86400';;
+    RH_WARM_OPEN_TIMEOUT) printf '10 1 300';;
+    RH_BACKGROUND_CONCURRENCY) printf '8 1 64';;
+    RH_FOREGROUND_CONCURRENCY|RH_TOOL_CONCURRENCY) printf '6 1 64';;
+    RH_CHANNEL_QUEUE_SECONDS) printf '600 0 3600';;
+    RH_BACKGROUND_QUEUE_SECONDS) printf '10 0 3600';;
+    RH_TOOL_QUEUE_SECONDS) printf '600 0 86400';;
+    *) printf 'remote-harness: unsupported transport setting: %s\n' "$1" >&2; return 2;;
+  esac
+}
+
+transport_setting_validate() {  # name value
+  local _tsv_spec _tsv_n
+  _tsv_spec=$(transport_setting_spec "$1") || return 2
+  case "$2" in ''|*[!0-9]*) printf 'remote-harness: %s must be numeric\n' "$1" >&2; return 2;; esac
+  [ "${#2}" -le 6 ] || { printf 'remote-harness: %s is out of range\n' "$1" >&2; return 2; }
+  _tsv_n=$((10#$2))
+  set -- "$1" $_tsv_spec
+  [ "$_tsv_n" -ge "$3" ] && [ "$_tsv_n" -le "$4" ] \
+    || { printf 'remote-harness: %s must be between %s and %s\n' "$1" "$3" "$4" >&2; return 2; }
+}
+
+transport_settings_load() {  # [$1 = system|user: the local sshd mode, for the pool's default size]
+  local _tsl_file="${RH_TRANSPORT_CONFIG:-$HOME/.remote-harness/transport.conf}"
+  local _tsl_line _tsl_key _tsl_value _tsl_spec _tsl_default
+  if [ -e "$_tsl_file" ]; then
+    [ -r "$_tsl_file" ] || { printf 'remote-harness: cannot read %s\n' "$_tsl_file" >&2; return 2; }
+    while IFS= read -r _tsl_line || [ -n "$_tsl_line" ]; do
+      _tsl_line="${_tsl_line#"${_tsl_line%%[![:space:]]*}"}"
+      _tsl_line="${_tsl_line%"${_tsl_line##*[![:space:]]}"}"
+      case "$_tsl_line" in ''|\#*) continue;; esac
+      _tsl_key=${_tsl_line%%=*}; _tsl_value=${_tsl_line#*=}
+      transport_setting_validate "$_tsl_key" "$_tsl_value" || return 2
+      if [ -z "${!_tsl_key+x}" ]; then
+        printf -v "$_tsl_key" '%s' "$((10#$_tsl_value))"
+      fi
+    done < "$_tsl_file"
+  fi
+  for _tsl_key in $(transport_setting_names); do
+    _tsl_spec=$(transport_setting_spec "$_tsl_key") || return 2
+    _tsl_default=${_tsl_spec%% *}
+    if [ "$_tsl_key" = RH_WARM_MAX ] && [ "${1:-}" = user ]; then
+      _tsl_default=$((RH_SSHD_MAX_SESSIONS - 1))   # RH_SSHD_MAX_SESSIONS is resolved first
+      [ "$_tsl_default" -le 16 ] || _tsl_default=16
+    fi
+    _tsl_value=${!_tsl_key-$_tsl_default}
+    transport_setting_validate "$_tsl_key" "$_tsl_value" || return 2
+    printf -v "$_tsl_key" '%s' "$((10#$_tsl_value))"
+    export "$_tsl_key"
+  done
+  # Small/disabled pools retain a coherent reserve even when only the total was overridden.
+  [ "$RH_WARM_READY_MAX" -le "$RH_WARM_MAX" ] || RH_WARM_READY_MAX=$RH_WARM_MAX
+  [ "$RH_WARM_MIN" -le "$RH_WARM_READY_MAX" ] || RH_WARM_MIN=$RH_WARM_READY_MAX
+}
+
+# Values have already been validated and canonicalized. An explicit env prefix survives the remote
+# login shell without AcceptEnv/SendEnv, quoting tricks, or evaluating configuration file contents.
+transport_settings_env() {
+  local _tse_key
+  printf 'env'
+  for _tse_key in $(transport_setting_names); do
+    transport_setting_validate "$_tse_key" "${!_tse_key-}" || return 2
+    printf ' %s=%s' "$_tse_key" "${!_tse_key}"
+  done
+}
+
 # Option parsing: a flag without a value is a usage error that ends the script.
 need_arg() {
   if [ -z "${2+x}" ] || [ -z "$2" ]; then
@@ -332,6 +418,7 @@ local_sshd_user_mode_hint() {
 
 user_sshd_write_config() {  # dir port user
   local _usw_allow=""
+  transport_setting_validate RH_SSHD_MAX_SESSIONS "${RH_SSHD_MAX_SESSIONS:-32}" || return 2
   case "$3" in ""|*[!A-Za-z0-9._-]*) ;; *) _usw_allow="AllowUsers $3";; esac
   cat > "$1/sshd_config" <<EOF || return 1
 # remote-harness user-mode sshd: loopback only, this session's forced-gateway key only.
@@ -358,6 +445,7 @@ PrintMotd no
 UseDNS no
 ClientAliveInterval 30
 ClientAliveCountMax 3
+MaxSessions ${RH_SSHD_MAX_SESSIONS:-32}
 # With the forced gateway, an sftp request reaches it as SSH_ORIGINAL_COMMAND=internal-sftp.
 Subsystem sftp internal-sftp
 LogLevel VERBOSE

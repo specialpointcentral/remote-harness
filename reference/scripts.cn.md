@@ -61,14 +61,24 @@
   exec dispatcher，覆盖客户端可能带来的同名值。
 - `channel-guard.py`：远端有 python3 时包装会话 Bash runner，命令运行期间一直持有 SSH 通道，
   使项目主机在取消或断线时终止命令树。带 `--warm SOCKET --warm-request LINE`（由 `rh-run` 写入）时，
-  先在预热通道上发送请求并转发输出；没写进去或没有被确认的请求改走普通路径，保证只执行一次。
+  先在预热通道上发送请求并转发输出；完整的一行没写进去的请求改走普通路径，已写出却没有收到确认的请求以
+  255 失败（送达不确定，绝不重试）。带 `--slots-dir` 时普通路径占用一个每会话名额：
+  `RH_FOREGROUND_CONCURRENCY`（6），最多排队 `RH_CHANNEL_QUEUE_SECONDS`（600）秒，排队期间持续向预热池
+  要通道；`--background`（显式的后台 Bash，使用独立连接，不用通道池）使用 `RH_BACKGROUND_CONCURRENCY`（8）
+  和 `RH_BACKGROUND_QUEUE_SECONDS`（10）。
 - `warm_pool.py`：`serve`（由 `rh-session` 启动，每会话一个）通过自己的复用连接
   （`runtime/wm.<会话 ID>`）在 gateway 的 wait 动词上保持已打开的通道，经 `runtime/warm.<会话 ID>`
-  以文件描述符的形式交给客户端，并报告退出码。通道数在 `RH_WARM_MIN`（1）到 `RH_WARM_MAX`（8）之间：
-  客户端遇到池空时增加，空闲 `RH_WARM_IDLE`（90 秒）后收缩，就绪通道每 `RH_WARM_MAX_AGE`（600 秒）
-  更新；打不开的通道退避，断开的连接重建，遇到不支持 wait 的 gateway 就停用，随 Agent 或会话目录退出，
-  日志写在会话目录的 `warm.log`。`RH_WARM_MAX=0` 关闭。模块的客户端部分（`claim`、`run`）只导入
-  os、socket、array 和 select。
+  以文件描述符的形式交给客户端，并报告退出码。就绪通道保持在 `RH_WARM_MIN`（1）到 `RH_WARM_READY_MAX`
+  （2）条，同时最多打开 `RH_WARM_OPENING_MAX`（2）条、每条限时 `RH_WARM_OPEN_TIMEOUT`（10 秒），包括已交出的
+  通道在内最多 `RH_WARM_MAX` 条（system sshd 为 9；user 模式 sshd 按 `RH_SSHD_MAX_SESSIONS` 最多 16）。
+  空闲 `RH_WARM_IDLE`（90 秒）后收缩，就绪通道每 `RH_WARM_MAX_AGE`（600 秒）更新；只经自己的 master 打开
+  通道（`ProxyCommand=false`），被拒或打不开时退避，约 15 秒内发现隧道断开（keepalive 5 秒 × 3），断开的
+  连接重建，遇到不支持 wait 的 gateway 就停用，随 Agent 或会话目录排空已交出的命令后退出，日志写在会话目录的
+  `warm.log`。`RH_WARM_MAX=0` 关闭。模块的客户端部分（`claim`、`run`）只用少量标准库模块。
+- 传输设置（`scripts/_common.sh`）：上面的预热池、配额和排队时间，加上 `RH_SSHD_MAX_SESSIONS`（32，user 模式
+  sshd 的 `MaxSessions`），都只接受白名单内的数字，来自环境变量或本机可选的
+  `~/.remote-harness/transport.conf`（`KEY=VALUE`，只解析、绝不 source；环境变量优先）。`laptop-setup.sh`
+  以显式的 `env` 前缀转发全部设置，每个会话把它们固定在 `rh-run` 和 `rh-session` 里。
 - `project-host-tool.py`：远端会话的 `git`、`rg` PATH 垫片。挂载点内的工作区扫描在项目主机执行，
   只读发现命令（`rev-parse`、`config --get` 等）也在项目主机执行，路径双向翻译；会写入的 git 调用和挂载点外的
   调用使用远端真实工具。路由调用共享并发上限

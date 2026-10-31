@@ -1881,6 +1881,7 @@ assert_grep "$wr_cold_sd/bin/git" "--warm-socket ''" "RH_WARM_MAX=0 leaves the w
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount-warm" rev.cold >/dev/null
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/wr-mount-nopy" >/dev/null
 
+python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 
 # --- mount-project.sh: opt-in parallel SFTP connections, kernel lookup caching ----------------
