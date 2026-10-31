@@ -10,12 +10,8 @@ import base64
 import json
 import os
 import shlex
+import subprocess
 import sys
-
-
-AGENT_BINARIES = {"claude", "codex", "opencode"}
-COMMAND_WRAPPERS = {"command", "env", "exec", "nohup", "sudo", "time"}
-COMMAND_SEPARATORS = {";", "&", "&&", "|", "||", "(", ")"}
 
 
 def encode(value: str) -> str:
@@ -37,26 +33,14 @@ def deny(reason: str) -> dict[str, object]:
 
 
 def launches_agent(command: str) -> bool:
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
-    lexer.whitespace_split = True
-    expect_command = True
-    for token in lexer:
-        if token in COMMAND_SEPARATORS:
-            expect_command = True
-            continue
-        if not expect_command:
-            continue
-        if "=" in token and not token.startswith(("/", "./", "../")):
-            name = token.split("=", 1)[0]
-            if name.replace("_", "a").isalnum():
-                continue
-        executable = os.path.basename(token)
-        if executable in COMMAND_WRAPPERS:
-            continue
-        if executable in AGENT_BINARIES:
-            return True
-        expect_command = False
-    return False
+    # The project host has no required Python runtime. Its portable lexical check is also used
+    # here, so quoting and here-documents receive the same policy on both sides of the tunnel.
+    checker = os.path.join(os.path.dirname(os.path.realpath(__file__)), "run-on-project-host.sh")
+    result = subprocess.run(["sh", checker, "--check-command"], input=command,
+                            text=True, capture_output=True, timeout=10)
+    if result.returncode not in (0, 1):
+        raise ValueError("incomplete shell quoting or here-document, or unavailable command policy")
+    return result.returncode == 1
 
 
 def route(runner_arg: str, mount_root_arg: str) -> dict[str, object]:

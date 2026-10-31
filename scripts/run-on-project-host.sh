@@ -36,8 +36,181 @@ sq() {
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# A lexical guard for literal command names, not a shell evaluator. Keep quoted arguments, comments
+# and here-document text out of command positions. This best-effort check complements the existing
+# PATH and credential defenses; arbitrary shell still requires the documented account isolation.
+# Used by both dispatch and the remote hook's check-only call.
+check_command_policy() {
+  LC_ALL=C awk '
+    function finish_word( executable) {
+      if (!present) return
+      if (redirection) {
+        if (redirection == "here") {
+          if (opaque) invalid = 1
+          delimiter[++documents] = word; strip_tabs[documents] = tabs
+          literal[documents] = quoted
+        }
+        redirection = ""
+      } else if (expect_command) {
+        executable = word; sub(/^.*\//, "", executable)
+        if (wrapper_argument) wrapper_argument = 0
+        else if (word ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { }
+        else if (opaque) invalid = 1
+        else if (executable ~ /^(command|env|exec|nohup|sudo|time)$/) wrapper = executable
+        else if (wrapper && word ~ /^-/) {
+          if (wrapper == "command" && word ~ /^-[vV]$/) expect_command = 0
+          if ((wrapper == "env" && word ~ /^(-u|--unset|-C|--chdir)$/) ||
+              (wrapper == "exec" && word == "-a") ||
+              (wrapper == "sudo" && word ~ /^(-[acCDghpRrtTUu]|--(auth-type|login-class|close-from|chdir|group|host|prompt|chroot|role|type|other-user|command-timeout|user))$/))
+            wrapper_argument = 1
+        } else if (!quoted && word ~ /^(if|then|elif|else|do|while|until|!|\{)$/) wrapper = ""
+        else {
+          if (executable ~ /^(claude|codex|opencode)$/) denied = 1
+          expect_command = 0; wrapper = ""
+        }
+      }
+      word = ""; present = quoted = opaque = 0
+    }
+    function begin_substitution(kind) {
+      saved_word[++level] = word; saved_present[level] = present
+      saved_quote[level] = quote; saved_quoted[level] = quoted
+      saved_opaque[level] = opaque
+      saved_expect[level] = expect_command; saved_redirection[level] = redirection
+      saved_wrapper[level] = wrapper; saved_argument[level] = wrapper_argument
+      saved_depth[level] = depth; saved_arithmetic[level] = arithmetic; substitution[level] = kind
+      word = quote = redirection = wrapper = ""
+      present = quoted = opaque = wrapper_argument = depth = arithmetic = 0
+      expect_command = 1
+    }
+    function end_substitution() {
+      finish_word()
+      word = saved_word[level] "$()"; present = 1
+      quote = saved_quote[level]; quoted = saved_quoted[level]
+      opaque = saved_opaque[level]
+      expect_command = saved_expect[level]; redirection = saved_redirection[level]
+      wrapper = saved_wrapper[level]; wrapper_argument = saved_argument[level]
+      arithmetic = saved_arithmetic[level]; depth = saved_depth[level--]
+    }
+    BEGIN {
+      expect_command = 1; single = sprintf("%c", 39)
+      ansi["a"] = sprintf("%c", 7); ansi["b"] = sprintf("%c", 8)
+      ansi["e"] = ansi["E"] = sprintf("%c", 27); ansi["f"] = sprintf("%c", 12)
+      ansi["n"] = "\n"; ansi["r"] = "\r"; ansi["t"] = "\t"; ansi["v"] = sprintf("%c", 11)
+    }
+    {
+      line = $0; here_text = 0
+      if (body) {
+        comparison = line
+        if (strip_tabs[body]) sub(/^\t+/, "", comparison)
+        if (comparison == delimiter[body]) {
+          if (++body > documents) body = documents = 0
+          next
+        }
+        if (literal[body]) next
+        here_text = 1
+      }
+      continued = 0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1); following = substr(line, i + 1, 1)
+        if (here_text && !level && !arithmetic) {
+          if (c == "\\") { i++; continue }
+          if (c == "$" && following == "(") {
+            if (substr(line, i + 2, 1) == "(") {
+              arithmetic = 2; present = 1; word = "$ARITH"; i += 2
+            } else { begin_substitution("("); i++ }
+          }
+          else if (c == "`") begin_substitution("`")
+          continue
+        }
+        if (quote == single) {
+          if (c == single) quote = ""; else word = word c
+          continue
+        }
+        if (quote == "ansi") {
+          if (c == single) quote = ""
+          else if (c == "\\" && i < length(line)) {
+            if (following == single || following == "\\" || following == "\"" || following == "?")
+              word = word following
+            else if (following in ansi) word = word ansi[following]
+            # Leave complex escapes to the executing shell in ordinary data. Their source bytes
+            # cannot identify a command, option or heredoc delimiter safely (including NUL).
+            else { opaque = 1; word = word c following }
+            i++
+          } else word = word c
+          continue
+        }
+        if (c == "\\") {
+          present = quoted = 1
+          if (i == length(line)) { continued = 1; break }
+          if (quote == "\"" && following !~ /[$`"\\]/) word = word c
+          word = word following; i++; continue
+        }
+        if (c == "$" && following == "(") {
+          if (substr(line, i + 2, 1) == "(") {
+            arithmetic += 2; present = 1; word = word "$ARITH"; i += 2
+          } else { begin_substitution("("); i++ }
+          continue
+        }
+        if (c == "`") {
+          if (level && substitution[level] == "`" && quote == "") end_substitution()
+          else begin_substitution("`")
+          continue
+        }
+        if (arithmetic) {
+          if (c == "(") arithmetic++
+          if (c == ")") arithmetic--
+          continue
+        }
+        if (quote == "\"") {
+          if (c == "\"") quote = ""; else word = word c
+          continue
+        }
+        if (c == "$" && following == single) { quote = "ansi"; present = quoted = 1; i++; continue }
+        if (c == single || c == "\"") { quote = c; present = quoted = 1; continue }
+        if (c == "#" && !present) break
+        if (c ~ /[ \t\r]/) { finish_word(); continue }
+        if (c == "<" || c == ">") {
+          if (following == "(") { begin_substitution("("); i++; continue }
+          if (word ~ /^[0-9]+$/) { word = ""; present = 0 }; finish_word()
+          redirection = "file"; tabs = 0
+          if (c == "<" && following == "<") {
+            i++; redirection = "here"
+            if (substr(line, i + 1, 1) == "-") { tabs = 1; i++ }
+            else if (substr(line, i + 1, 1) == "<") { redirection = "file"; i++ }
+          } else if (following == c || following == "&" || following == "|") i++
+          continue
+        }
+        if (c == ")" && level && substitution[level] == "(" && !depth) {
+          end_substitution(); continue
+        }
+        if (c ~ /[;&|()]/) {
+          finish_word(); expect_command = 1; wrapper = ""; wrapper_argument = 0
+          if (level && c == "(") depth++
+          if (level && c == ")") depth--
+          continue
+        }
+        present = 1; word = word c
+      }
+      if (!continued && quote == "") {
+        finish_word(); expect_command = 1; wrapper = ""; wrapper_argument = 0
+        if (documents && !body) body = 1
+      } else if (!continued) word = word "\n"
+    }
+    END {
+      if (denied) exit 1
+      if (invalid || quote != "" || level || arithmetic || continued || body || redirection == "here") exit 2
+      exit 0
+    }'
+}
+
 reject_direct_agent_launch() {
-  printf '%s\n' "$1" | grep -Eq '(^|[;&|()]|[[:space:]])(command[[:space:]]+|env([[:space:]]+[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]+)*[[:space:]]+|exec[[:space:]]+|nohup[[:space:]]+|sudo[[:space:]]+|time[[:space:]]+)?([^;&|()[:space:]]*/)?(claude|codex|opencode)([[:space:];&|()]|$)'
+  _policy_status=0
+  printf '%s\n' "$1" | check_command_policy || _policy_status=$?
+  case $_policy_status in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) fail "could not safely parse the project command" ;;
+  esac
 }
 
 make_agent_guard_path() {
@@ -57,6 +230,7 @@ make_agent_guard_path() {
 start_agent_guard() {
   scrub_agent_credentials
   guard_path=$(make_agent_guard_path)
+  active_command_pid="" active_command_helper="" active_command_claim=""
   trap cleanup_dispatch EXIT
   trap 'cleanup_dispatch; exit 129' HUP
   trap 'cleanup_dispatch; exit 130' INT
@@ -64,6 +238,18 @@ start_agent_guard() {
 }
 
 cleanup_dispatch() {
+  # A dispatcher signal must finish cancellation before removing the shared claim directory. The
+  # existing watcher may already own cancellation; in that case it completes the same escalation.
+  if [ -n "$active_command_pid" ]; then
+    trap '' HUP INT TERM
+    if mkdir "$active_command_claim" 2>/dev/null; then
+      terminate_tree "$active_command_pid"
+      [ -z "$active_command_helper" ] || kill "$active_command_helper" 2>/dev/null || true
+    fi
+    [ -z "$active_command_helper" ] || wait "$active_command_helper" 2>/dev/null || true
+    wait "$active_command_pid" 2>/dev/null || true
+    active_command_pid="" active_command_helper="" active_command_claim=""
+  fi
   rm -rf "$guard_path"
   [ -z "$snapshot_work" ] || rm -rf "$snapshot_work"
   [ -z "$snapshot_lock" ] || rmdir "$snapshot_lock" 2>/dev/null || true
@@ -111,10 +297,15 @@ run_in_new_group() {
   exec "$@"
 }
 
-process_tree() {  # $1=root pid -> root and every current descendant
-  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
-    { parent[$1] = $2; seen[NR] = $1 }
+process_tree() {  # $1=root pid -> pid, process group and start time for every current descendant
+  LC_ALL=C ps -A -o pid= -o ppid= -o pgid= -o lstart= 2>/dev/null | awk -v root="$1" -v owner="$$" '
+    {
+      pid = $1; parent[pid] = $2; seen[NR] = pid
+      identity[pid] = pid " " $3
+      for (i = 4; i <= NF; i++) identity[pid] = identity[pid] " " $i
+    }
     END {
+      if (parent[root] != owner) exit
       found[root] = 1
       changed = 1
       while (changed) {
@@ -124,27 +315,55 @@ process_tree() {  # $1=root pid -> root and every current descendant
           if (!(pid in found) && (parent[pid] in found)) { found[pid] = 1; changed = 1 }
         }
       }
-      for (pid in found) print pid
+      for (pid in found) if (pid in identity) print identity[pid]
     }'
+}
+
+live_tree_targets() {  # $1=process_tree snapshot -> still matching pid and process group pairs
+  LC_ALL=C ps -A -o pid= -o pgid= -o stat= -o lstart= 2>/dev/null | awk -v snapshot="$1" '
+    BEGIN { n = split(snapshot, records, "\n"); for (i = 1; i <= n; i++) saved[records[i]] = 1 }
+    $3 !~ /^Z/ {
+      identity = $1 " " $2
+      for (i = 4; i <= NF; i++) identity = identity " " $i
+      if (identity in saved) print $1, $2
+    }'
+}
+
+signal_tree_targets() {  # $1=signal $2=root/group pid $3=matching pid/group pairs
+  # A surviving original group member anchors the group ID. Never signal a group after all of its
+  # recorded members have disappeared, or a saved PID whose start time no longer matches.
+  while read -r _stt_pid _stt_group; do
+    [ -n "$_stt_pid" ] || continue
+    if [ "$_stt_group" = "$2" ]; then
+      kill -s "$1" -- "-$2" 2>/dev/null || true
+      break
+    fi
+  done <<EOF
+$3
+EOF
+  while read -r _stt_pid _stt_group; do
+    [ -n "$_stt_pid" ] || continue
+    kill -s "$1" "$_stt_pid" 2>/dev/null || true
+  done <<EOF
+$3
+EOF
 }
 
 # Stop a command and everything it started: TERM to its process group and process tree, then KILL
 # whatever is still there after five seconds.
 terminate_tree() {  # $1=root pid
   _tt_targets=$(process_tree "$1")
-  kill -s TERM -- "-$1" 2>/dev/null || true
-  for _tt_pid in $_tt_targets; do kill -s TERM "$_tt_pid" 2>/dev/null || true; done
+  _tt_live=$(live_tree_targets "$_tt_targets")
+  signal_tree_targets TERM "$1" "$_tt_live"
   _tt_i=0
   while [ "$_tt_i" -lt 5 ]; do
-    _tt_alive=0
-    for _tt_pid in $_tt_targets; do kill -0 "$_tt_pid" 2>/dev/null && _tt_alive=1; done
-    [ "$_tt_alive" = 1 ] || return 0
+    _tt_live=$(live_tree_targets "$_tt_targets")
+    [ -n "$_tt_live" ] || return 0
     sleep 1
     _tt_i=$((_tt_i + 1))
   done
-  _tt_targets="$_tt_targets $(process_tree "$1")"
-  kill -s KILL -- "-$1" 2>/dev/null || true
-  for _tt_pid in $_tt_targets; do kill -s KILL "$_tt_pid" 2>/dev/null || true; done
+  _tt_live=$(live_tree_targets "$_tt_targets")
+  signal_tree_targets KILL "$1" "$_tt_live"
 }
 
 stdin_is_channel() { [ -p /dev/stdin ] || [ -S /dev/stdin ]; }
@@ -154,15 +373,40 @@ stdin_is_channel() { [ -p /dev/stdin ] || [ -S /dev/stdin ]; }
 # out, or lost the connection, so the command's whole process tree is stopped. Exits with the
 # command's status.
 run_watched() {
+  _rw_claim="$guard_path/watch-claimed"
+  active_command_claim=$_rw_claim
   exec 3<&0
   ( run_in_new_group "$@" ) </dev/null 3<&- &
   watched_pid=$!
-  ( cat <&3 >/dev/null 2>&1; terminate_tree "$watched_pid" ) </dev/null >/dev/null 2>&1 &
+  active_command_pid=$watched_pid
+  ( _rw_stopped=0 _rw_reader=""
+    trap '_rw_stopped=1; [ -z "$_rw_reader" ] || kill -s KILL "$_rw_reader" 2>/dev/null || true' TERM
+    cat <&3 >/dev/null 2>&1 &
+    _rw_reader=$!
+    # KILL the private relay/timer children: TERM can arrive before exec resets an inherited shell
+    # handler. Stopping an assigned child in the trap also covers the gap before wait starts.
+    if [ "$_rw_stopped" = 0 ]; then wait "$_rw_reader" || true; fi
+    if [ "$_rw_stopped" = 1 ]; then
+      kill -s KILL "$_rw_reader" 2>/dev/null || true
+      wait "$_rw_reader" 2>/dev/null || true
+      exit 0
+    fi
+    # This atomic claim makes normal completion and channel EOF mutually exclusive. Once EOF has
+    # claimed cancellation, the caller must let TERM/KILL escalation finish even if the root exits.
+    mkdir "$_rw_claim" 2>/dev/null || exit 0
+    trap '' TERM
+    terminate_tree "$watched_pid" ) </dev/null >/dev/null 2>&1 &
   watchdog_pid=$!
+  active_command_helper=$watchdog_pid
   exec 3<&-
   watched_status=0
   wait "$watched_pid" || watched_status=$?
-  kill "$watchdog_pid" 2>/dev/null || true
+  if mkdir "$_rw_claim" 2>/dev/null; then
+    kill "$watchdog_pid" 2>/dev/null || true
+  fi
+  wait "$watchdog_pid" 2>/dev/null || true
+  active_command_pid="" active_command_helper="" active_command_claim=""
+  rmdir "$_rw_claim" 2>/dev/null || true
   return "$watched_status"
 }
 
@@ -171,20 +415,35 @@ run_watched() {
 run_with_timeout() {  # $1=seconds $2=timeout marker, then the command
   _rwt_seconds=$1 _rwt_marker=$2
   shift 2
+  _rwt_claim="$guard_path/timeout-claimed"
+  active_command_claim=$_rwt_claim
   ( run_in_new_group "$@" ) </dev/null &
   _rwt_pid=$!
-  ( _rwt_sleep=""
-    trap '[ -z "$_rwt_sleep" ] || kill "$_rwt_sleep" 2>/dev/null; exit 0' TERM
+  active_command_pid=$_rwt_pid
+  ( _rwt_stopped=0 _rwt_sleep=""
+    trap '_rwt_stopped=1; [ -z "$_rwt_sleep" ] || kill -s KILL "$_rwt_sleep" 2>/dev/null || true' TERM
     sleep "$_rwt_seconds" &
     _rwt_sleep=$!
-    wait "$_rwt_sleep" || exit 0
+    if [ "$_rwt_stopped" = 0 ]; then wait "$_rwt_sleep" || true; fi
+    if [ "$_rwt_stopped" = 1 ]; then
+      kill -s KILL "$_rwt_sleep" 2>/dev/null || true
+      wait "$_rwt_sleep" 2>/dev/null || true
+      exit 0
+    fi
+    mkdir "$_rwt_claim" 2>/dev/null || exit 0
+    trap '' TERM
     : > "$_rwt_marker" 2>/dev/null || true
     terminate_tree "$_rwt_pid" ) </dev/null >/dev/null 2>&1 &
   _rwt_timer=$!
+  active_command_helper=$_rwt_timer
   _rwt_status=0
   wait "$_rwt_pid" || _rwt_status=$?
-  kill "$_rwt_timer" 2>/dev/null || true
+  if mkdir "$_rwt_claim" 2>/dev/null; then
+    kill "$_rwt_timer" 2>/dev/null || true
+  fi
   wait "$_rwt_timer" 2>/dev/null || true
+  active_command_pid="" active_command_helper="" active_command_claim=""
+  rmdir "$_rwt_claim" 2>/dev/null || true
   return "$_rwt_status"
 }
 
@@ -566,6 +825,14 @@ dispatch_tool() {
   fi
   finish_agent_guard "$status"
 }
+
+# Check-only entry for the remote hook: read shell text without executing or dispatching it.
+if [ "${1:-}" = "--check-command" ]; then
+  [ "$#" -eq 1 ] || fail "--check-command takes no arguments"
+  _policy_status=0
+  check_command_policy || _policy_status=$?
+  exit "$_policy_status"
+fi
 
 # Launch-time preflight on the project host: report where the tool verb would find $2.
 if [ "${1:-}" = "--find-tool" ]; then
