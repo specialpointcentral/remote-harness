@@ -1882,6 +1882,7 @@ RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/wr-mount-nopy" >/dev/null
 
 python3 "$ROOT/tests/test_dispatch_lifecycle.py" -v
+python3 "$ROOT/tests/test_project_host_tool.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"

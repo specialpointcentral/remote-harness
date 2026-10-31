@@ -154,6 +154,7 @@ class Context:
         self.used_mount = self.mount_real
         self.touches_mount = False
         self.rewrite_output = False  # discovery output names project-host paths
+        self.rg_json = False
 
     def inside(self, path: str) -> bool:
         real = os.path.realpath(path)
@@ -307,17 +308,117 @@ def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
         raise StayLocal()
     ctx.touches_mount = True
     args = argv if "--no-config" in argv else rg_config_args() + argv
-    if "-" in args:
-        raise StayLocal()  # stdin search needs the agent-side stdin
-    return cwd, [ctx.translate_arg(arg, cwd) for arg in args]
+    # The option roles come from rg 15's --help (including its documented aliases). Unknown
+    # options stay local: guessing whether their following argument is a pattern or a path can
+    # silently change a search. This is a planning decision, never a transport-error fallback.
+    values = set("""regexp file pre pre-glob dfa-size-limit encoding engine max-count
+        regex-size-limit threads glob iglob ignore-file max-depth maxdepth max-filesize type
+        type-not type-add type-clear after-context before-context color colors context
+        context-separator field-context-separator field-match-separator hostname-bin
+        hyperlink-format max-columns path-separator replace sort sortr generate""".split())
+    flags = set("""search-zip case-sensitive crlf fixed-strings ignore-case invert-match
+        line-regexp mmap multiline multiline-dotall no-unicode null-data pcre2 smart-case
+        stop-on-nonmatch text word-regexp auto-hybrid-regex no-pcre2-unicode binary follow
+        glob-case-insensitive hidden ignore-file-case-insensitive no-ignore no-ignore-dot
+        no-ignore-exclude no-ignore-files no-ignore-global no-ignore-parent no-ignore-vcs
+        no-require-git one-file-system unrestricted block-buffered byte-offset column heading
+        help include-zero line-buffered line-number no-line-number max-columns-preview null
+        only-matching passthru passthrough pretty quiet trim vimgrep with-filename no-filename
+        sort-files count count-matches files-with-matches files-without-match json debug
+        no-ignore-messages no-messages stats trace files no-config pcre2-version type-list
+        version print0""".split())
+    flags |= {"no-" + flag for flag in flags if not flag.startswith("no-")}
+    flags |= {"ignore", "ignore-dot", "ignore-exclude", "ignore-files", "ignore-global",
+              "ignore-parent", "ignore-vcs", "require-git", "unicode", "pcre2-unicode",
+              "ignore-messages", "messages", "no-encoding", "no-pre", "no-context-separator"}
+    short_values = dict(zip("efEmjgdtTABC Mr".replace(" ", ""),
+                            "regexp file encoding max-count threads glob max-depth type type-not "
+                            "after-context before-context context max-columns replace".split()))
+    short_flags = dict(zip("zsFivxUPSawL.u bhnN0opqHIclV".replace(" ", ""),
+                           "search-zip case-sensitive fixed-strings ignore-case invert-match "
+                           "line-regexp multiline pcre2 smart-case text word-regexp follow hidden "
+                           "unrestricted byte-offset help line-number no-line-number null "
+                           "only-matching pretty quiet with-filename no-filename count "
+                           "files-with-matches version".split()))
+    routed = list(args)
+    paths: list[int] = []
+    explicit_pattern = False
+    mode = "search"
+    options = True
+
+    def option(name: str, index: int, prefix: str = "") -> None:
+        nonlocal explicit_pattern, mode
+        if name in ("regexp", "file"):
+            explicit_pattern = True
+        if name in ("file", "ignore-file"):
+            value = routed[index][len(prefix):]
+            if value == "-":
+                raise StayLocal()  # pattern files on stdin need agent-side stdin
+            routed[index] = prefix + ctx.translate_path(value, cwd)
+        # Programs named by these options can depend on agent-host executables or credentials.
+        if name in ("pre", "hostname-bin"):
+            raise StayLocal()
+        if name in ("files", "type-list", "files-with-matches", "files-without-match",
+                    "count", "count-matches"):
+            mode = name
+        if name in ("json", "no-json"):
+            ctx.rg_json = name == "json"
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if options and arg == "--":
+            options = False
+        elif options and arg.startswith("--"):
+            name, equals, _value = arg[2:].partition("=")
+            if name in values:
+                if equals:
+                    option(name, i, "--" + name + "=")
+                else:
+                    i += 1
+                    if i >= len(args):
+                        raise StayLocal()
+                    option(name, i)
+            elif name in flags and not equals:
+                option(name, i)
+            else:
+                raise StayLocal()
+        elif options and arg.startswith("-") and arg != "-":
+            j = 1
+            while j < len(arg):
+                char = arg[j]
+                if char in short_values:
+                    if j + 1 < len(arg):
+                        option(short_values[char], i, arg[:j + 1])
+                    else:
+                        i += 1
+                        if i >= len(args):
+                            raise StayLocal()
+                        option(short_values[char], i)
+                    break
+                if char not in short_flags:
+                    raise StayLocal()
+                option(short_flags[char], i)
+                j += 1
+        else:
+            paths.append(i)
+        i += 1
+    # -e/-f can occur after a positional: then *all* positionals name search paths.
+    if not explicit_pattern and mode not in ("files", "type-list") and paths:
+        paths.pop(0)
+    for index in paths:
+        if args[index] == "-":
+            raise StayLocal()
+        routed[index] = ctx.translate_path(args[index], cwd)
+    return cwd, routed
 
 
 class OutputRewriter:
-    """Rewrite project-host paths back to the mount in each output record.
+    """Map rg filename prefixes or paths in small git discovery records.
 
-    rg records start with a path and may contain file text, so only that leading path is rewritten.
-    git discovery output carries paths after labels or before columns (`worktree <path>`,
-    `<path>  <sha> [branch]`), so with `anywhere` every occurrence on a path boundary is rewritten.
+    rg text retains only an undecided root prefix, so even huge matches stream immediately.
+    JSON is decoded one whole record at a time and changes only data.path; git discovery uses
+    newline/NUL records. Those two record formats may use memory proportional to a record.
     """
 
     def __init__(self, old: str, new: str, json_mode: bool, anywhere: bool = False) -> None:
@@ -326,43 +427,96 @@ class OutputRewriter:
         self.new = os.fsencode(new)
         self.json_mode = json_mode
         self.anywhere = re.compile(
-            rb"(?:(?<=^)|(?<=[\s:=]))" + re.escape(self.old) + rb"(?=$|[/\s:])"
+            rb"(?<![^\s\x00:=])" + re.escape(self.old) + rb"(?=$|[/\s\x00:])"
         ) if anywhere else None
-        if json_mode:
-            import json
-
-            self.old_json = os.fsencode(json.dumps(old)[1:-1])
-            self.new_json = os.fsencode(json.dumps(new)[1:-1])
         self.pending = b""
+        self.leading = True
+        self.record = bytearray()
 
-    def _record(self, record: bytes) -> bytes:
+    def _text(self, chunk: bytes, final: bool = False):
+        # Only an undecided filename prefix is retained. Content-only output beginning with the
+        # project root is ambiguous and receives the same prefix mapping as filename output.
+        for part in re.split(rb"([\n\0])", chunk):
+            if part in (b"\n", b"\0"):
+                if self.pending:
+                    yield self._leading(self.pending, True)
+                    self.pending = b""
+                yield part
+                self.leading = True
+            elif part:
+                if not self.leading:
+                    yield part
+                    continue
+                data = self.pending + part
+                if len(data) <= len(self.old) and self.old.startswith(data):
+                    self.pending = data
+                else:
+                    self.pending = b""
+                    self.leading = False
+                    yield self._leading(data, False)
+        if final and self.pending:
+            yield self._leading(self.pending, True)
+            self.pending = b""
+
+    def _leading(self, data: bytes, final: bool) -> bytes:
+        if data.startswith(self.old) and (data[len(self.old):len(self.old) + 1] in
+                                          (b"/", b":") or (final and data == self.old)):
+            return self.new + data[len(self.old):]
+        return data
+
+    def _json_record(self, data: bytes) -> bytes:
+        import json
+
+        try:
+            value = json.loads(data)
+            path = value["data"]["path"]
+            # rg's text/bytes alternatives are exclusive; other shapes pass through unchanged.
+            if not isinstance(path, dict) or len(path) != 1:
+                return data
+            kind = next(iter(path))
+            if kind not in ("text", "bytes") or not isinstance(path[kind], str):
+                return data
+            original = (path[kind].encode("utf-8") if kind == "text" else
+                        base64.b64decode(path[kind], validate=True))
+            if original != self.old and not original.startswith(self.old + b"/"):
+                return data
+            mapped = self.new + original[len(self.old):]
+            path[kind] = (mapped.decode("utf-8") if kind == "text" else
+                          base64.b64encode(mapped).decode("ascii"))
+            return json.dumps(value).encode("utf-8") + (b"\n" if data.endswith(b"\n") else b"")
+        except (ValueError, UnicodeError, TypeError, KeyError, IndexError, RecursionError):
+            return data
+
+    def _record(self, data: bytes) -> bytes:
         if self.json_mode:
-            return record.replace(b'"' + self.old_json, b'"' + self.new_json)
-        if self.anywhere is not None:
-            return self.anywhere.sub(lambda _match: self.new, record)
-        if record.startswith(self.old):
-            tail = record[len(self.old):len(self.old) + 1]
-            if tail in (b"", b"/", b":"):
-                return self.new + record[len(self.old):]
-        return record
+            return self._json_record(data)
+        assert self.anywhere is not None
+        return self.anywhere.sub(lambda _match: self.new, data)
 
-    def feed(self, chunk: bytes) -> bytes:
+    def feed(self, chunk: bytes):
         if not self.enabled:
-            return chunk
-        data = self.pending + chunk
-        parts = re.split(rb"([\n\0])", data)
-        self.pending = parts.pop()
-        out = []
-        for index in range(0, len(parts), 2):
-            out.append(self._record(parts[index]))
-            out.append(parts[index + 1])
-        return b"".join(out)
+            yield chunk
+        elif not self.json_mode and self.anywhere is None:
+            yield from self._text(chunk)
+        else:
+            # Discovery output is small; rg JSON records can be multi-megabyte match lines.
+            separator = rb"\n" if self.json_mode else rb"[\n\0]"
+            start = 0
+            for match in re.finditer(separator, chunk):
+                end = match.end()
+                self.record.extend(chunk[start:end])
+                yield self._record(bytes(self.record))
+                self.record.clear()
+                start = end
+            self.record.extend(chunk[start:])
 
-    def flush(self) -> bytes:
-        if not self.enabled:
-            return b""
-        data, self.pending = self.pending, b""
-        return self._record(data) if data else b""
+    def flush(self):
+        if self.enabled:
+            if not self.json_mode and self.anywhere is None:
+                yield from self._text(b"", final=True)
+            elif self.record:
+                yield self._record(bytes(self.record))
+                self.record.clear()
 
 
 def acquire_slot(directory: str, limit: int, wait_seconds: float) -> int | None:
@@ -418,6 +572,51 @@ def stop_master(args: Args) -> None:
         pass
 
 
+class DiagnosticCapture:
+    """Hold small transport diagnostics for retry decisions, stream larger stderr immediately.
+
+    Once stderr is visible, retrying would duplicate diagnostics (and possibly completed work).
+    The caller treats this just like visible stdout. Gateway missing-tool/capacity messages fit in
+    the bounded capture and retain the original retry behavior. Only the captured prefix is path
+    mapped; overflow streams unchanged so an arbitrarily long diagnostic cannot grow a record buffer.
+    """
+
+    LIMIT = 65536
+
+    def __init__(self, ctx: Context) -> None:
+        self.pending = bytearray()
+        self.emitted = False
+        self.rewriter = OutputRewriter(ctx.root, ctx.used_mount, False, anywhere=True)
+
+    def _write(self, chunk: bytes) -> None:
+        if chunk:
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+            self.emitted = True
+
+    def feed(self, chunk: bytes) -> None:
+        if not self.emitted and len(self.pending) + len(chunk) <= self.LIMIT:
+            self.pending.extend(chunk)
+            return
+        if self.pending:
+            for data in self.rewriter.feed(bytes(self.pending)):
+                self._write(data)
+            for data in self.rewriter.flush():
+                self._write(data)
+            self.pending.clear()
+        # Do not put an unbounded, newline-free diagnostic into the discovery record buffer.
+        # Overflow streams unchanged; small transport diagnostics still get path mapping below.
+        self._write(chunk)
+
+    def finish(self) -> bytes:
+        if self.emitted:
+            return b""
+        parts = list(self.rewriter.feed(bytes(self.pending)))
+        parts.extend(self.rewriter.flush())
+        self.pending.clear()
+        return b"".join(parts)
+
+
 def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> tuple[int, bool, bytes]:
     global current_proc
     proc = subprocess.Popen(
@@ -427,12 +626,16 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
         stderr=subprocess.PIPE,
     )
     current_proc = proc
-    errors: list[bytes] = []
+    errors = DiagnosticCapture(ctx)
 
     def drain_stderr() -> None:
         assert proc.stderr is not None
         for chunk in iter(lambda: proc.stderr.read1(65536), b""):
-            errors.append(chunk)
+            try:
+                errors.feed(chunk)
+            except BrokenPipeError:
+                proc.terminate()
+                os._exit(141)
 
     reader = threading.Thread(target=drain_stderr, daemon=True)
     reader.start()
@@ -441,13 +644,11 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
     assert proc.stdout is not None
     try:
         for chunk in iter(lambda: proc.stdout.read1(65536), b""):
-            data = rewriter.feed(chunk)
-            if data:
+            for data in rewriter.feed(chunk):
                 out.write(data)
                 out.flush()
                 emitted = True
-        tail = rewriter.flush()
-        if tail:
+        for tail in rewriter.flush():
             out.write(tail)
             out.flush()
             emitted = True
@@ -457,16 +658,17 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
         os._exit(141)
     status = proc.wait()
     reader.join()
+    proc.stdout.close()
+    assert proc.stderr is not None
+    proc.stderr.close()
     try:
         if proc.stdin is not None:
             proc.stdin.close()
     except OSError:
         pass
     current_proc = None
-    stderr = b"".join(errors)
-    if ctx.root != ctx.used_mount:
-        stderr = stderr.replace(os.fsencode(ctx.root), os.fsencode(ctx.used_mount))
-    return status, emitted, stderr
+    stderr = errors.finish()
+    return status, emitted or errors.emitted, stderr
 
 
 def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewriter) -> tuple[int, bool, bytes] | None:
@@ -486,22 +688,20 @@ def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewrite
     current_claim = held
     request = " ".join(("remote-harness-tool", base64.b64encode(os.fsencode(args.project_root)).decode("ascii"),
                         base64.b64encode(os.fsencode(relative)).decode("ascii"), args.tool, spec))
-    errors: list[bytes] = []
+    errors = DiagnosticCapture(ctx)
     emitted = False
     out = sys.stdout.buffer
 
     def on_stdout(chunk: bytes) -> None:
         nonlocal emitted
-        data = rewriter.feed(chunk)
-        if data:
+        for data in rewriter.feed(chunk):
             out.write(data)
             out.flush()
             emitted = True
 
     try:
-        status = warm_pool.run(held, request, on_stdout, errors.append)
-        tail = rewriter.flush()
-        if tail:
+        status = warm_pool.run(held, request, on_stdout, errors.feed)
+        for tail in rewriter.flush():
             out.write(tail)
             out.flush()
             emitted = True
@@ -513,17 +713,15 @@ def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewrite
     finally:
         held.close()
         current_claim = None
-    stderr = b"".join(errors)
-    if ctx.root != ctx.used_mount:
-        stderr = stderr.replace(os.fsencode(ctx.root), os.fsencode(ctx.used_mount))
-    return status, emitted, stderr
+    stderr = errors.finish()
+    return status, emitted or errors.emitted, stderr
 
 
 def route(ctx: Context, effective: str, routed: list[str]) -> int:
     args = ctx.args
     relative = os.path.relpath(os.path.realpath(effective), ctx.mount_real)
     spec = encode_args(routed)
-    json_mode = args.tool == "rg" and "--json" in routed
+    json_mode = args.tool == "rg" and ctx.rg_json
 
     def rewriter() -> OutputRewriter:
         # git scan output is repository-relative; rg and git discovery (rev-parse --show-toplevel,

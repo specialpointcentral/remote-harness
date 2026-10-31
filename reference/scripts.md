@@ -102,6 +102,16 @@
   translated both ways; git calls that write and calls outside the mount run the real remote tool. Routed calls share a concurrency cap (`RH_TOOL_CONCURRENCY`,
   default 6), try a warm channel first (`--warm-socket`), retry on the ordinary path after a transport
   failure without output, once more without the multiplexing master, and otherwise fail non-zero.
+  rg translates search paths and path-valued options while preserving patterns, replacements and
+  globs. Unknown/ambiguous options and agent-side program options (`--pre`, `--hostname-bin`) stay
+  on the agent host during planning; transport failures never select that path. rg text always maps
+  a leading project-root prefix, including `--vimgrep` output for a single absolute file. A content-only
+  match beginning with that same prefix is ambiguous and receives the same mapping. JSON mapping
+  decodes one whole record in memory and changes only `data.path.text` or its base64 `bytes` variant;
+  content and match offsets retain their values, while JSON formatting may change. Git discovery
+  paths are mapped one newline/NUL record at a time. rg text rewriting uses bounded memory. stderr
+  captures at most 64 KiB for path mapping and retry decisions, then streams overflow unchanged;
+  visible stdout or stderr prevents retries.
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is
   gone (or its terminal was hung up), it stops the multiplexing master and leftover routed processes,
   unmounts the session mount unless another live session uses it, and removes the session dir and the
