@@ -4,6 +4,7 @@ import base64
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -129,6 +130,61 @@ else:
         self.assertTrue(wait_for(lambda: not any(active(pid) for pid in self.pids)),
                         'watchdog or channel reader survived cancellation')
 
+    def test_channel_close_with_awk_rejecting_multiline_v_assignments(self):
+        real_awk = shutil.which('awk')
+        self.assertIsNotNone(real_awk)
+        shim_dir = self.path / 'bsd-awk-bin'
+        shim_dir.mkdir()
+        rejected = self.path / 'rejected-assignment'
+        shim = shim_dir / 'awk'
+        # Model macOS awk at the actual subprocess boundary while preserving real awk evaluation.
+        # Only -v values reject newlines; the multiline awk program itself remains valid input.
+        shim.write_text(f'''#!{sys.executable}
+import os, sys
+from pathlib import Path
+assignments = [argument[2:] for argument in sys.argv[1:] if argument.startswith("-v") and len(argument) > 2]
+assignments += [value for flag, value in zip(sys.argv[1:], sys.argv[2:]) if flag == "-v"]
+if any("\\n" in assignment for assignment in assignments):
+    Path({str(rejected)!r}).touch()
+    sys.stderr.write("awk: newline in string\\n")
+    sys.exit(2)
+os.execv({real_awk!r}, [{real_awk!r}, *sys.argv[1:]])
+''')
+        shim.chmod(0o700)
+        self.env['PATH'] = str(shim_dir) + os.pathsep + self.env['PATH']
+        first, second = self.path / 'first.pid', self.path / 'second.pid'
+        proc = self.watched(self.worker_command('respond', first) + ' & '
+                            + self.worker_command('respond', second) + ' & wait')
+        self.await_markers(first, second)
+        self.pids.update(descendants(proc.pid))
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=5), 143)
+        self.assert_workers_stopped(first, second)
+        self.assertFalse(rejected.exists(), 'a multiline snapshot was passed through awk -v')
+
+    def test_live_tree_targets_preserves_identity_and_excludes_zombies(self):
+        definitions = DISPATCHER.read_text().split('# --- Login shell snapshot', 1)[0]
+        ps_dir = self.path / 'ps-bin'
+        ps_dir.mkdir()
+        rows = self.path / 'process-rows'
+        rows.write_text(''' 101 101 S Sat Oct 31 12:00:00 2026
+ 202 202 S Sat Oct 31 12:01:00 2026
+ 303 999 S Sat Oct 31 12:00:00 2026
+ 404 404 Z Sat Oct 31 12:00:00 2026
+ 505 505 S Sat Oct 31 12:00:00 2026
+''')
+        ps = ps_dir / 'ps'
+        ps.write_text('#!/bin/sh\nexec cat ' + shlex.quote(str(rows)) + '\n')
+        ps.chmod(0o700)
+        snapshot = '\n'.join(f'{pid} {pid} Sat Oct 31 12:00:00 2026'
+                             for pid in (101, 202, 303, 404))
+        env = dict(self.env, PATH=str(ps_dir) + os.pathsep + self.env['PATH'],
+                   RH_TREE_SNAPSHOT='an inherited value must be replaced')
+        result = subprocess.run(['sh', '-c', definitions + '\nlive_tree_targets "$1"\n',
+                                 'identity-test', snapshot], env=env, stdin=subprocess.DEVNULL,
+                                text=True, capture_output=True, check=True, timeout=5)
+        self.assertEqual(result.stdout, '101 101\n')
+
     def test_normal_completion_keeps_channel_open_status_and_no_reader(self):
         marker, release = self.path / 'normal.pid', self.path / 'release'
         proc = self.watched(self.worker_command('normal', marker, release)
@@ -214,9 +270,11 @@ else:
                 # Force the narrow scheduling window without adding production test hooks: the
                 # branch has been chosen, then TERM arrives immediately before wait starts. The
                 # completion claim prevents the caller from masking the bug with a second TERM.
+                # Resolve the helper through its live child: older Bash can retain an intermediate
+                # command-substitution shell, so a nested shell's PPID need not identify the helper.
                 injected = f'''if [ "$_{helper}_stopped" = 0 ]; then
       mkdir "$_{helper}_claim"
-      kill -s TERM "$(/bin/sh -c 'printf %s "$PPID"')"
+      kill -s TERM "$(ps -p "$_{helper}_{child}" -o ppid= | awk '{{print $1}}')"
       : > "$guard_path/signal-injected"
       wait "$_{helper}_{child}" || true
     fi'''

@@ -69,8 +69,10 @@ if mode in ('loss-ack', 'acked-drop'):
     command = base64.b64decode(request.split()[3]).decode()
     subprocess.run(['/bin/sh', '-c', command], check=True)
     raise SystemExit(255 if mode == 'acked-drop' else 0)
-if mode == 'delay-ready':
-    time.sleep(.12)
+if mode == 'gated-ready':
+    (root / 'ready-gated').touch()
+    while not (root / 'ready-release').exists():
+        time.sleep(.01)
 env = dict(os.environ, SSH_ORIGINAL_COMMAND='remote-harness-wait', SHELL='/bin/sh')
 os.execve(str(root / 'gateway' / 'bin' / 'project-host-gateway.sh'),
           ['project-host-gateway.sh', 'capacity'], env)

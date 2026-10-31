@@ -320,8 +320,9 @@ process_tree() {  # $1=root pid -> pid, process group and start time for every c
 }
 
 live_tree_targets() {  # $1=process_tree snapshot -> still matching pid and process group pairs
-  LC_ALL=C ps -A -o pid= -o pgid= -o stat= -o lstart= 2>/dev/null | awk -v snapshot="$1" '
-    BEGIN { n = split(snapshot, records, "\n"); for (i = 1; i <= n; i++) saved[records[i]] = 1 }
+  # BSD awk rejects literal newlines in -v assignments; keep the snapshot as data in the environment.
+  LC_ALL=C ps -A -o pid= -o pgid= -o stat= -o lstart= 2>/dev/null | RH_TREE_SNAPSHOT="$1" awk '
+    BEGIN { n = split(ENVIRON["RH_TREE_SNAPSHOT"], records, "\n"); for (i = 1; i <= n; i++) saved[records[i]] = 1 }
     $3 !~ /^Z/ {
       identity = $1 " " $2
       for (i = 4; i <= NF; i++) identity = identity " " $i

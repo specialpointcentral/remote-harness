@@ -600,10 +600,23 @@ class PoolTests(unittest.TestCase):
         self.ready(1)
 
     def test_bounded_claim_waits_for_opening_channel_before_fallback(self):
-        self.start('delay-ready', RH_WARM_MIN='1')
-        self.wait_for(lambda: self.stats().get('opening') == 1)
-        held = self.warm.claim(self.socket, wait_seconds=.25)
-        self.assertIsNotNone(held)
+        # Put interpreter startup outside the claim budget and hold the gateway until a real
+        # empty GET has increased the broker's demand target. No fixed sleep establishes order.
+        self.start('gated-ready', RH_WARM_MIN='1', RH_WARM_OPEN_TIMEOUT='5')
+        self.wait_for(lambda: (self.root / 'ready-gated').exists())
+        self.assertEqual(self.stats().get('target'), 1, self.log())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            waiting = executor.submit(self.warm.claim, self.socket, wait_seconds=1)
+            try:
+                self.wait_for(lambda: self.stats().get('target') == 2, timeout=1)
+                self.assertFalse(waiting.done(), 'claim stopped before gateway release; ' + self.log())
+                self.assertEqual(self.stats().get('ready'), 0, self.log())
+            finally:
+                (self.root / 'ready-release').touch()
+                held = waiting.result(timeout=2)
+                if held is not None:
+                    self.addCleanup(held.close)
+        self.assertIsNotNone(held, 'stats=' + str(self.stats()) + '; log=' + self.log())
         self.assertEqual(self.run_claim(held, 'printf warmed'), (0, b'warmed', b''))
 
     def test_empty_pool_wait_is_bounded_and_missing_broker_is_immediate(self):
