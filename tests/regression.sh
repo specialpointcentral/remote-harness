@@ -318,14 +318,64 @@ tool_quote=$(HOME="$gateway_home" \
   SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 src) git $(targs rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")" \
   sh "$tool_gateway" "$tool_tag")
 assert_eq "gateway tool argument fidelity" "$tool_quote" "$(git rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")"
-for tool_bad in "remote-harness-tool $(b64 "$tool_proj") $(b64 .) sh $(targs -c id)" \
-    "remote-harness-tool $(b64 "$tool_proj") $(b64 .) git a;b" \
-    "remote-harness-tool $(b64 "$router_tmp/project") $(b64 .) git -"; do
-  if HOME="$gateway_home" SSH_ORIGINAL_COMMAND="$tool_bad" sh "$tool_gateway" "$tool_tag" \
-      >/dev/null 2>"$router_tmp/tool-bad.err"; then
-    fail "gateway accepted an invalid tool request: $tool_bad"
-  fi
+# Each public tool entry must reject invalid requests before running a tool or contacting SSH.
+# A shell request would create the marker if it escaped the allowlist; the client-side fake SSH
+# creates the same marker if validation is deferred to the other end of the connection.
+tool_rejected_marker="$router_tmp/tool-rejected-ran"
+tool_validation_bin="$router_tmp/tool-validation-bin"
+mkdir -p "$tool_validation_bin"
+cat > "$tool_validation_bin/ssh" <<'EOS'
+#!/bin/sh
+: > "${TOOL_REJECTED_MARKER:?}"
+exit 0
+EOS
+chmod +x "$tool_validation_bin/ssh"
+: > "$router_tmp/tool-validation.ssh_config"
+for tool_entry in gateway dispatch client; do
+  for tool_invalid in name encoding; do
+    case "$tool_invalid" in
+      name)
+        invalid_tool=sh
+        invalid_args=$(targs -c ": > '$tool_rejected_marker'")
+        invalid_message='unsupported project tool'
+        ;;
+      encoding)
+        invalid_tool=git
+        invalid_args='a;b'
+        invalid_message='invalid tool argument encoding'
+        ;;
+    esac
+    rejected_status=0
+    case "$tool_entry" in
+      gateway)
+        HOME="$gateway_home" \
+          SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 .) $invalid_tool $invalid_args" \
+          sh "$tool_gateway" "$tool_tag" >"$router_tmp/tool-bad.out" 2>"$router_tmp/tool-bad.err" \
+          || rejected_status=$?
+        ;;
+      dispatch)
+        HOME="$gateway_home" sh "$ROOT/scripts/run-on-project-host.sh" --dispatch-tool \
+          "$(b64 "$tool_proj")" "$(b64 .)" "$invalid_tool" "$invalid_args" \
+          >"$router_tmp/tool-bad.out" 2>"$router_tmp/tool-bad.err" || rejected_status=$?
+        ;;
+      client)
+        PATH="$tool_validation_bin:$PATH" TOOL_REJECTED_MARKER="$tool_rejected_marker" \
+          sh "$ROOT/scripts/run-on-project-host.sh" --ssh-config "$router_tmp/tool-validation.ssh_config" \
+          --alias laptop --project-root "$tool_proj" --cwd-relative-b64 "$(b64 .)" \
+          --tool "$invalid_tool" --args-b64 "$invalid_args" \
+          >"$router_tmp/tool-bad.out" 2>"$router_tmp/tool-bad.err" || rejected_status=$?
+        ;;
+    esac
+    assert_eq "$tool_entry rejects invalid tool $tool_invalid" "$rejected_status" 2
+    assert_grep "$router_tmp/tool-bad.err" "$invalid_message" "$tool_entry validates tool $tool_invalid"
+    [ ! -e "$tool_rejected_marker" ] || fail "$tool_entry executed a rejected tool request"
+  done
 done
+if HOME="$gateway_home" \
+    SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$router_tmp/project") $(b64 .) git -" \
+    sh "$tool_gateway" "$tool_tag" >/dev/null 2>"$router_tmp/tool-bad.err"; then
+  fail "gateway accepted a tool request for another project root"
+fi
 # Closing the SSH channel (cancelled caller / dropped link) stops the tool on the project host.
 mkfifo "$tool_proj/blocked.fifo"
 tool_started=$(date +%s)
@@ -1264,29 +1314,15 @@ assert_grep "$ROOT/SKILL.md" "--mode reverse" "skill documents reverse mode arg"
 if grep -F -- "--mode forward" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" >/dev/null; then
   fail "remote-only skill still documents a forward launch command"
 fi
-assert_grep "$ROOT/SKILL.md" "never launch an" "skill forbids local agent launch"
-assert_grep "$ROOT/SKILL.md" "local project host" "skill identifies the forbidden host"
-assert_grep "$ROOT/SKILL.md" "forced-command project-host gateway" "skill documents forced gateway"
-assert_grep "$ROOT/SKILL.md" "absolute guarantee" "skill states the absolute isolation boundary"
-assert_grep "$ROOT/SKILL.md" "OS account" "skill requires a dedicated runner account for absolute isolation"
-assert_grep "$ROOT/AGENTS.md" "Simple Reverse Rules" "agents docs carry simple reverse rules"
-assert_grep "$ROOT/AGENTS.md" "compact but copyable" "agents docs carry bootstrap command shape"
-assert_grep "$ROOT/AGENTS.md" "fields 1 and 2 are local/client data" "agents docs protect local/client ssh metadata"
-assert_grep "$ROOT/AGENTS.md" "not ask for it again" "agents docs forbid an approval-mode reprompt"
-assert_grep "$ROOT/AGENTS.md" "script may live remotely" "agents docs forbid assuming local script install"
-assert_grep "$ROOT/AGENTS.cn.md" "Simple Reverse 规则" "Chinese agents docs carry simple reverse rules"
-assert_grep "$ROOT/AGENTS.cn.md" "紧凑但可复制" "Chinese agents docs carry bootstrap command shape"
-assert_grep "$ROOT/AGENTS.cn.md" "第 1/2 字段是本地客户端数据" "Chinese agents docs protect local/client ssh metadata"
-assert_grep "$ROOT/AGENTS.cn.md" "不得再二次询问" "Chinese agents docs forbid yolo reprompt"
-assert_grep "$ROOT/scripts/inject-rule.sh" "File tools edit the mount" "inject rule allows local file work"
-# The tool verb's allowlist and argument charset are checked in three places on purpose (gateway, both
-# dispatcher sides); the copies must stay identical.
-for tool_check in 'git|rg) ;; *) fail "unsupported project tool"' \
-    '""|*[!A-Za-z0-9+/=,]*) fail "invalid tool argument encoding"'; do
-  assert_eq "gateway tool check: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/project-host-gateway.sh")" 1
-  assert_eq "dispatcher tool checks: $tool_check" "$(grep -cF -- "$tool_check" "$ROOT/scripts/run-on-project-host.sh")" 2
-done
-assert_grep "$ROOT/scripts/project-host-tool.py" 'TOOLS = ("git", "rg")' "tool shim allows the same tools"
+# The skill text is model input, so its explicit local-agent prohibition needs a guard as well as
+# the behavioral launch checks. Permit wrapping of the English instruction and check both entries.
+if ! tr '\n' ' ' < "$ROOT/SKILL.md" |
+    grep -E 'never launch an[[:space:]]+agent on the local project host' >/dev/null; then
+  fail "English skill must explicitly forbid launching an agent on the local project host"
+fi
+assert_grep "$ROOT/SKILL.cn.md" "绝不在本机项目主机启动 Agent" "Chinese skill forbids local agent launch"
+# Executable examples and behavioral launch/approval/privacy tests cover the remaining contract;
+# bilingual document presence is checked below, without pinning unrelated prose.
 
 install_home="$tmp/install-home"
 mkdir -p "$install_home"
@@ -1883,6 +1919,7 @@ RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$t
 
 python3 "$ROOT/tests/test_dispatch_lifecycle.py" -v
 python3 "$ROOT/tests/test_project_host_tool.py" -v
+python3 "$ROOT/tests/test_shell_snapshot.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"

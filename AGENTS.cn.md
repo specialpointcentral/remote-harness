@@ -104,8 +104,8 @@
 ## 验证
 
 ```bash
-bash -n manage.sh tests/regression.sh scripts/*.sh
-python3 -m py_compile scripts/route-command.py scripts/project-host-tool.py scripts/channel-guard.py scripts/warm_pool.py tests/codex_tui_e2e.py
+for script in manage.sh tests/*.sh scripts/*.sh; do bash -n "$script" || exit 1; done
+python3 -m py_compile scripts/*.py tests/*.py tests/fixtures/*.py
 bash tests/regression.sh
 git diff --check
 ```

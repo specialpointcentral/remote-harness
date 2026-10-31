@@ -124,8 +124,14 @@ class RoutingTests(unittest.TestCase):
     @staticmethod
     def stop_process(proc):
         if proc.poll() is None:
+            # Let the guard cancel and reap its child. Killing only the guard leaves the child's
+            # inherited output pipes open, so communicate() can wait for an unrelated job delay.
+            proc.terminate()
+        try:
+            proc.communicate(timeout=6)
+        except subprocess.TimeoutExpired:
             proc.kill()
-        proc.communicate(timeout=6)
+            proc.communicate(timeout=3)
 
     def test_hook_marks_only_explicit_background_calls_and_preserves_input(self):
         runner = self.home / 'runner'
@@ -293,7 +299,11 @@ class RoutingTests(unittest.TestCase):
     def test_guard_limits_fallback_and_background_independently(self):
         command = ['python3', str(SCRIPTS / 'channel-guard.py'), '--slots-dir', str(self.home / 'slots')]
         env = dict(self.env, RH_FOREGROUND_CONCURRENCY='1', RH_BACKGROUND_CONCURRENCY='1', RH_CHANNEL_QUEUE_SECONDS='0')
-        child = ['python3', '-c', 'import time; print("running", flush=True); time.sleep(1); raise SystemExit(17)']
+        release = self.home / 'release'
+        child = ['python3', '-c', 'import sys,time; from pathlib import Path\n'
+                 'print("running", flush=True)\n'
+                 'while not Path(sys.argv[1]).exists(): time.sleep(.01)\n'
+                 'raise SystemExit(17)', str(release)]
         first = subprocess.Popen(command + ['--'] + child, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.stop_process, first)
         self.assertEqual(first.stdout.readline().strip(), 'running')
@@ -303,6 +313,7 @@ class RoutingTests(unittest.TestCase):
         background = subprocess.run(command + ['--background', '--', 'python3', '-c', 'raise SystemExit(19)'],
                                     env=env, text=True, capture_output=True)
         self.assertEqual(background.returncode, 19, background.stderr)
+        release.touch()
         out, err = first.communicate(timeout=4)
         self.assertEqual(first.returncode, 17, err)
         reused = subprocess.run(command + ['--', 'python3', '-c', 'raise SystemExit(21)'],
@@ -486,7 +497,9 @@ class PoolTests(unittest.TestCase):
         self.assertIn('ready->handed', self.log())
         self.assertNotIn('printf one', self.log())
 
-    def assert_channels_are_held_and_bounded(self, count=16):
+    def test_explicit_sixteen_pool_holds_sixteen_channels_and_refuses_seventeenth(self):
+        self.start(RH_WARM_MAX='16')
+        count = 16
         held = []
         for index in range(count):
             self.wait_for(lambda: self.stats().get('ready', 0) > 0, timeout=2)
@@ -507,19 +520,28 @@ class PoolTests(unittest.TestCase):
                 self.assertEqual(future.result(timeout=5), (17, b'sixteen', b''))
         self.wait_for(lambda: self.stats().get('handed') == 0)
 
-    def test_default_pool_holds_nine_channels_and_refuses_tenth(self):
-        # Without a forwarded size the broker stays below the system sshd's MaxSessions 10.
-        self.env.pop('RH_WARM_MAX')
-        self.start()
-        self.assert_channels_are_held_and_bounded(9)
-
-    def test_explicit_sixteen_pool_holds_sixteen_channels_and_refuses_seventeenth(self):
-        self.start(RH_WARM_MAX='16')
-        self.assert_channels_are_held_and_bounded()
-
-    def test_broker_caps_direct_oversized_environment_at_sixteen(self):
-        self.start(RH_WARM_MAX='17')
-        self.assert_channels_are_held_and_bounded()
+    def test_broker_default_and_oversized_configuration_complete_gateway_handshake(self):
+        # Exercise serve()'s actual configuration without repeating the full sixteen-job cycle.
+        # No forwarded size stays below the system sshd's MaxSessions 10; direct callers that
+        # bypass the launcher's strict setting validation are capped at sixteen.
+        for maximum, expected in ((None, 9), ('17', 16)):
+            with self.subTest(maximum=maximum):
+                self.env.pop('RH_WARM_MAX', None)
+                if maximum is not None:
+                    self.env['RH_WARM_MAX'] = maximum
+                log_offset = len(self.log())
+                self.start()
+                try:
+                    self.ready()
+                    self.assertRegex(self.log()[log_offset:],
+                                     rf'warm pool started \(min \d+, max {expected},')
+                    held = self.warm.claim(self.socket)
+                    self.assertIsNotNone(held)
+                    self.assertEqual(self.run_claim(held, 'printf configured; exit 17'),
+                                     (17, b'configured', b''))
+                    self.wait_for(lambda: self.stats().get('handed') == 0)
+                finally:
+                    self.stop()
 
     def test_queued_fallback_takes_a_warm_channel_that_frees_up(self):
         self.start('hang-opening', RH_WARM_MIN='1')
@@ -527,7 +549,7 @@ class PoolTests(unittest.TestCase):
         env = dict(self.env, RH_FOREGROUND_CONCURRENCY='1', RH_CHANNEL_QUEUE_SECONDS='20')
         slots = str(self.root / 'slots')
         holder = subprocess.Popen(['python3', str(SCRIPTS / 'channel-guard.py'), '--slots-dir', slots, '--',
-                                   'python3', '-c', 'import time; print("holding", flush=True); time.sleep(8)'],
+                                   'python3', '-c', 'import sys; print("holding", flush=True); sys.stdin.read()'],
                                   env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(RoutingTests.stop_process, holder)
         self.assertEqual(holder.stdout.readline().strip(), 'holding')
@@ -628,19 +650,28 @@ class PoolTests(unittest.TestCase):
         live = self.warm.claim(self.socket)
         self.assertIsNotNone(live)
         self.assertIsNone(self.warm.claim(self.socket))  # demand grows reserve to its bounded target
+        started = self.project / 'job-started'
+        release = self.project / 'job-release'
+        held_command = 'touch job-started; while [ ! -e job-release ]; do sleep .05; done; printf alive'
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            running = executor.submit(self.run_claim, live, 'sleep 7; printf alive')
-            self.ready(2)
-            time.sleep(4)
-            fresh = self.warm.claim(self.socket)
-            self.assertIsNotNone(fresh)
-            self.assertEqual(self.run_claim(fresh, 'exit 0'), (0, b'', b''))
-            self.ready(2)
-            self.wait_for(lambda: self.stats().get('ready') == 1, timeout=3)
-            counts = self.stats()
-            self.assertEqual(counts['target'], 1)
-            self.assertEqual(counts['handed'], 1)
-            self.assertFalse(running.done())
+            running = executor.submit(self.run_claim, live, held_command)
+            try:
+                self.wait_for(started.exists)
+                self.ready(2)
+                # Channel age remains a real-clock integration check. A deterministic clock would
+                # require refactoring the broker loop; keep that separate from fixture cleanup.
+                time.sleep(4)
+                fresh = self.warm.claim(self.socket)
+                self.assertIsNotNone(fresh)
+                self.assertEqual(self.run_claim(fresh, 'exit 0'), (0, b'', b''))
+                self.ready(2)
+                self.wait_for(lambda: self.stats().get('ready') == 1, timeout=3)
+                counts = self.stats()
+                self.assertEqual(counts['target'], 1)
+                self.assertEqual(counts['handed'], 1)
+                self.assertFalse(running.done())
+            finally:
+                release.touch()
             self.assertEqual(running.result(timeout=4), (0, b'alive', b''))
 
     def test_acknowledged_failure_is_not_retried(self):
@@ -673,10 +704,19 @@ class PoolTests(unittest.TestCase):
         held = self.warm.claim(self.socket)
         self.assertIsNotNone(held)
         marker = self.root / 'started'
+        release = self.root / 'release'
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            result = executor.submit(self.run_claim, held, 'touch ' + shlex.quote(str(marker)) + '; sleep 1; printf survived')
-            self.wait_for(marker.exists)
-            self.pool.terminate()
+            result = executor.submit(self.run_claim, held,
+                                     'touch ' + shlex.quote(str(marker)) + '; while [ ! -e '
+                                     + shlex.quote(str(release)) + ' ]; do sleep .01; done; printf survived')
+            try:
+                self.wait_for(marker.exists)
+                self.pool.terminate()
+                self.wait_for(lambda: 'warm pool draining handed channels' in self.log())
+                self.assertIsNone(self.pool.poll())
+                self.assertFalse(result.done(), 'shutdown must wait for the handed command')
+            finally:
+                release.touch()
             self.assertEqual(result.result(timeout=4), (0, b'survived', b''))
         self.pool.wait(timeout=4)
         self.assertEqual(self.pool.returncode, 0)
