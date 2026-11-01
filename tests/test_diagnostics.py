@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
 import subprocess
@@ -105,16 +106,28 @@ class DiagnosticsTests(unittest.TestCase):
                                     for path in Path(self.store.directory).glob('ssh.*')))
 
     @unittest.skipUnless(shutil.which('ssh'), 'OpenSSH is unavailable')
-    def test_actual_ssh_proxy_false_logs_its_errors_without_network_or_stderr_leak(self):
+    def test_actual_ssh_bad_banner_logs_its_errors_without_network_or_stderr_leak(self):
         real_ssh = shutil.which('ssh')
+        banner = b'SSH-PRIVATE_INVALID_VERSION\r\n'
+        proxy = self.root / 'invalid-ssh-banner.py'
+        # Consume the client banner, then hold the pipes open until OpenSSH rejects ours.
+        # Immediate proxy EOF diagnostics vary across OpenSSH versions; this produces an ERROR.
+        proxy.write_text('import sys\n'
+            'sys.stdin.buffer.readline()\n'
+            f'sys.stdout.buffer.write({banner!r})\n'
+            'sys.stdout.buffer.flush()\n'
+            'sys.stdin.buffer.read()\n')
+        proxy_command = 'ProxyCommand=' + shlex.join([sys.executable, str(proxy)])
         # A leading option wins over the runner's disabled ProxyCommand. This test-only wrapper
         # reaches OpenSSH itself, with no network connection or external proxy diagnostic stream.
         (self.bin / 'ssh').write_text('#!' + sys.executable + '\nimport os,sys\n'
-            f'os.execv({real_ssh!r}, [{real_ssh!r}, "-o", "ProxyCommand=false"] + sys.argv[1:])\n')
+            f'os.execv({real_ssh!r}, [{real_ssh!r}, "-o", {proxy_command!r}] + sys.argv[1:])\n')
         result = self.invoke('standalone')
         self.assertEqual(result.returncode, 255)
+        self.assertEqual(result.stdout, b'')
         self.assertEqual(result.stderr, diagnostics.summary('ssh', 255, self.store.session))
-        self.assertTrue(any(path.stat().st_size for path in Path(self.store.directory).glob('ssh.*')))
+        self.assertTrue(any(banner.rstrip(b'\r\n') in path.read_bytes()
+                            for path in Path(self.store.directory).glob('ssh.*')))
 
     def warm(self, acknowledged, error, output=b''):
         code = ('import os,sys,time\n'
