@@ -29,7 +29,20 @@
   ~360ms link they made concurrent lookups about 7x slower), and (libfuse sshfs) caches lookups,
   attributes and "no such file" answers in the kernel for `RH_SSHFS_CACHE_SECONDS` (default 20, `0`
   disables), because agents repeatedly probe the same `.git` paths; `auto_cache` keeps unchanged file
-  contents across opens. An sshfs daemon that outlives its unmount is
+  contents across opens. Symlinks are resolved on the project host by default (`follow_symlinks`):
+  every link reads as it does there, and linked files and directories appear as ordinary entries, so
+  recursive scans also descend into linked trees. To preserve links instead, run
+  `export RH_SSHFS_FOLLOW_SYMLINKS=0` in the local terminal before the bootstrap command;
+  `laptop-setup.sh` validates the `0|1` value and forwards it to the remote mount, which then uses
+  `transform_symlinks`. Relative targets stay unchanged; absolute targets inside the mounted project
+  become relative in the mount without changing the stored link. The remote host resolves the links
+  itself: targets outside the project are not remapped and may be missing or resolve to remote-host
+  paths, and sshfs builds with symlink containment enabled by default (for example Debian 12's
+  security update `3.7.3-1.2~deb12u1`, CVE-2026-47187) refuse every target containing `..` or an
+  absolute path, including in-project links. Containment stays on; use routed Bash when such links
+  matter. The mode is fixed when the mount is created and recorded with it: a session that reuses a
+  mount shared with another live session gets the existing mode, and the launcher warns when that
+  differs from the requested one. An sshfs daemon that outlives its unmount is
   stopped only when its FUSE superblock is gone and either the unmount was clean (1s grace: the kernel
   already confirmed no open files) or the daemon itself has made no I/O progress for
   `RH_SSHFS_IDLE_SECONDS` (default 3; its ssh connections' keepalives do not count); its sftp ssh then

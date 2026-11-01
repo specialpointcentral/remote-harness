@@ -219,6 +219,10 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
   断线时进行中的写会报错而不是悄悄丢失。为提速，远端会缓存目录项、属性和"文件不存在"结果 20 秒
   （`RH_SSHFS_CACHE_SECONDS`），所以本机侧新建或修改的文件最多 20 秒后在远端可见。短暂断网由 sshfs
   `reconnect` 自动恢复。
+- **符号链接**：默认由项目主机解析符号链接，所有链接都与在项目主机上读取的结果一致；目录链接表现为普通
+  目录，递归扫描也会进入其中。在本机终端设置 `RH_SSHFS_FOLLOW_SYMLINKS=0` 后再启动，可保留链接本身，
+  让扫描跳过指向大型缓存或源码树的链接，但含 `..` 或绝对路径的链接可能无法读取，详见
+  [挂载脚本参考](reference/scripts.cn.md)。该设置在创建挂载时确定；挂载正被其他会话使用时保持原方式，启动器会提示。
 - **隧道自动重连与断开判定**：会话期间，若本次启动建立的反向隧道单独断开（隧道进程被杀，或服务器关掉了
   这条连接而终端仍在），本机会在同一端口上自动重建，失败时按 5、10、20、30、60 秒退避，一直重试到会话结束；
   sshfs、路由命令和远端心跳随后自行恢复。隧道和 Agent 终端最多等 5 分钟无响应才判定断开
@@ -582,6 +586,13 @@ Notes:
   fail instead of being lost silently. For speed the remote caches directory entries, attributes, and
   "no such file" answers for 20 seconds (`RH_SSHFS_CACHE_SECONDS`), so files created or changed on the
   laptop can take up to 20 seconds to appear remotely. Short drops recover through sshfs `reconnect`.
+- **Symlinks**: by default the project host resolves symlinks, so every link reads as it does there;
+  directory links look like ordinary directories and recursive scans descend into them. Setting
+  `RH_SSHFS_FOLLOW_SYMLINKS=0` in the local terminal before launching preserves links instead, so
+  scans can skip links into large caches or source trees, but links with `..` or absolute targets
+  may become unreadable; see [the mount script reference](reference/scripts.md). The mode is fixed
+  when the mount is created; a mount shared with another live session keeps its mode, and the
+  launcher says so.
 - **Tunnel reconnect and disconnect detection**: during the session, when the reverse tunnel this
   launch created drops on its own (its ssh was killed, or the server closed that connection while the
   terminal stayed up), the laptop rebuilds it on the same port, backing off 5, 10, 20, 30, and 60

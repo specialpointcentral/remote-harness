@@ -1452,7 +1452,9 @@ PY
     *'grep -qx'*) exit 0;;
     *'mount-project.sh'*)
       [ -z "${MOUNT_FAIL:-}" ] || { printf 'STATUS=failed\nERROR=read: Connection reset by peer\n'; exit 0; }
-      printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'; exit 0;;
+      printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'
+      [ -z "${MOUNT_FOLLOW_SYMLINKS:-}" ] || printf 'FOLLOW_SYMLINKS=%s\n' "$MOUNT_FOLLOW_SYMLINKS"
+      exit 0;;
     *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\nRH_APPROVAL=auto\n'; exit 0;;
   esac
 done
@@ -1473,7 +1475,9 @@ printf '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n' > "$lau
 project_launch() {  # output file; the caller's environment is passed through
   LAUNCH_DIR="$launch_dir" reverse_session "$proj_home" 32023 "$valid_project" > "$1"
 }
-SSH_LOG="$ssh_log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" project_launch "$tmp/project-valid.out"
+SSH_LOG="$ssh_log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" MOUNT_FOLLOW_SYMLINKS=1 project_launch "$tmp/project-valid.out"
+assert_grep "$ssh_log" "env RH_SSHFS_FOLLOW_SYMLINKS='1'" "launcher mounts with symlinks followed by default"
+refute_grep "$tmp/project-valid.out" "shared with another live session" "a mount with the requested symlink mode is not reported"
 assert_grep "$tmp/project-valid.out" "authorized_keys: temporarily authorized" "reverse authkey added"
 assert_grep "$tmp/project-valid.out" "forced project-host gateway" "reverse authkey uses forced command gateway"
 assert_grep "$tmp/project-valid.out" "Project dir (from skill)" "project-dir valid accepted"
@@ -1484,12 +1488,15 @@ assert_grep "$launch_dir.out" "Remote session connected" "remote prelude reports
 assert_grep "$launch_dir.out" "Prewarmed project metadata" "remote prelude prewarms project metadata"
 assert_grep "$launch_dir.out" "-lic codex" "remote prelude still execs the agent"
 # The agent learns which terminal it draws on; values outside a safe charset are not sent.
-SSH_LOG="$tmp/term-env.ssh.log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" TERM_PROGRAM=iTerm.app \
+SSH_LOG="$tmp/term-env.ssh.log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" RH_SSHFS_FOLLOW_SYMLINKS=0 MOUNT_FOLLOW_SYMLINKS=1 TERM_PROGRAM=iTerm.app \
   TERM_PROGRAM_VERSION=3.5.10 LC_TERMINAL='iTerm2;touch x' COLORTERM=truecolor \
   project_launch "$tmp/term-env.out"
 assert_grep "$tmp/term-env.ssh.log" "export TERM_PROGRAM='iTerm.app' TERM_PROGRAM_VERSION='3.5.10' COLORTERM='truecolor';" \
   "launch passes the terminal identity to the agent"
 refute_grep "$tmp/term-env.ssh.log" "touch x" "launch drops a terminal variable with unsafe characters"
+assert_grep "$tmp/term-env.ssh.log" "env RH_SSHFS_FOLLOW_SYMLINKS='0'" "launcher forwards the preserved-symlink opt-in to the remote mount"
+assert_grep "$tmp/term-env.out" "shared with another live session and follows symlinks on the project host" \
+  "launcher reports a shared mount that keeps another symlink mode"
 assert_grep "$ssh_log" "/bin/rh-run' Lg== dHJ1ZQ==" "remote prelude opens the routed-command master before the agent starts"
 assert_grep "$tmp/project-valid.out" "[2/3] ✓ Waiting for sshfs to flush and exit" "exit cleanup reports progress steps"
 assert_grep "$ssh_log" "ControlMaster=yes" "setup starts a multiplexing master"
@@ -1921,26 +1928,8 @@ python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 
-# --- mount-project.sh: opt-in parallel SFTP connections, kernel lookup caching ----------------
-mc_bin="$tmp/mc-bin"; mc_log="$tmp/mc-sshfs.log"; mkdir -p "$mc_bin" "$tmp/mc-mount"; : > "$tmp/mc-ssh_config"
-printf '#!/bin/sh\nif [ "$1" = --help ]; then [ -n "$MC_NO_MAX" ] || echo "-o max_conns=N"; exit 0; fi\necho "$*" > %s\nexit 1\n' \
-  "'$mc_log'" > "$mc_bin/sshfs"; chmod +x "$mc_bin/sshfs"
-mc_opts() {  # prints the arguments mount-project passed to (fake) sshfs
-  : > "$mc_log"
-  PATH="$mc_bin:$PATH" "$ROOT/scripts/mount-project.sh" --alias box --remote-path /p \
-    --ssh-config "$tmp/mc-ssh_config" --mountpoint "$tmp/mc-mount" >/dev/null 2>&1 || true
-  cat "$mc_log"
-}
-mc_default="$(mc_opts)"
-case "$mc_default" in *max_conns*) fail "sshfs used parallel SFTP connections by default";; esac
-case "$(RH_SSHFS_MAX_CONNS=4 mc_opts)" in *max_conns=4*) ;; *) fail "RH_SSHFS_MAX_CONNS=4 did not enable max_conns";; esac
-if [ "$(uname -s)" != Darwin ]; then
-  case "$mc_default" in *entry_timeout=20,attr_timeout=20,negative_timeout=20,auto_cache*) ;; *) fail "sshfs lookups and contents are not cached by default";; esac
-  case "$(RH_SSHFS_CACHE_SECONDS=0 mc_opts)" in *negative_timeout*|*auto_cache*) fail "RH_SSHFS_CACHE_SECONDS=0 still cached";; esac
-fi
-mc_unsupported="$(MC_NO_MAX=1 RH_SSHFS_MAX_CONNS=4 mc_opts)"
-[ -n "$mc_unsupported" ] || fail "fake sshfs was not invoked"
-case "$mc_unsupported" in *max_conns*) fail "max_conns passed to an sshfs that does not support it";; esac
+# --- mount-project.sh: SSHFS options and symlink identity/access ------------------------------
+bash "$ROOT/tests/mount-options.sh"
 
 # --- mount-project.sh: a detached sshfs is stopped only when its FUSE superblock is gone and idle --
 if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then
@@ -2023,11 +2012,16 @@ if [ -n "$fm_sftp" ] && [ -c /dev/fuse ] && command -v sshfs >/dev/null 2>&1 \
       wait_gone "$fm_daemon" 50 || fail "real sshfs kept running after a clean unmount"
     fi
   else
+    [ "${RH_TEST_REAL_SSHFS:-0}" != 1 ] || fail "real sshfs could not mount through a local sftp-server"
     printf 'skip: real sshfs mount (sshfs could not mount through a local sftp-server)\n'
   fi
   fm_umount "$fm_mp"
   trap 'rm -rf "$tmp"' EXIT
+elif [ "$(uname -s)" = Darwin ]; then
+  printf 'skip: real sshfs detach (Linux FUSE lazy unmount and fusectl only)\n'
 else
+  # CI installs SSHFS and sets RH_TEST_REAL_SSHFS=1, so the test fails there instead of skipping.
+  [ "${RH_TEST_REAL_SSHFS:-0}" != 1 ] || fail "real sshfs detach test could not run (needs sshfs, fusermount, /dev/fuse, fusectl and sftp-server)"
   printf 'skip: real sshfs detach (needs sshfs, fusermount, /dev/fuse, fusectl and sftp-server)\n'
 fi
 

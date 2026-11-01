@@ -15,10 +15,30 @@ jobs:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Install test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sshfs openssh-sftp-server zsh ripgrep
+          # The detached-mount test reads live FUSE superblocks from fusectl.
+          sudo modprobe fuse || true
+          mountpoint -q /sys/fs/fuse/connections || sudo mount -t fusectl fusectl /sys/fs/fuse/connections
+      - name: Install test tools (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew install ripgrep
+          # The install command mount-project.sh suggests on macOS.
+          brew install macos-fuse-t/cask/fuse-t
+          brew install macos-fuse-t/cask/sshfs-fuse-t
       - name: Check shell syntax
         run: bash -n manage.sh tests/regression.sh scripts/*.sh
       - name: Check Python syntax
         run: python3 -m py_compile scripts/route-command.py tests/codex_tui_e2e.py
       - name: Run regression tests
+        env:
+          # SSHFS is installed above: a real mount test that cannot run fails instead of skipping.
+          RH_TEST_REAL_SSHFS: 1
         run: bash tests/regression.sh

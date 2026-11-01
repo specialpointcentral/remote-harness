@@ -291,6 +291,9 @@ sshfs user@host:/remote/path /local/mount \
   -o follow_symlinks
 ```
 
+`follow_symlinks` 在服务端解析链接，结果与项目主机上看到的一致。remote-harness 也可以改为保留链接本身
+（`RH_SSHFS_FOLLOW_SYMLINKS=0`，即 `transform_symlinks`），取舍见[挂载脚本参考](../reference/scripts.cn.md)。
+
 不建议在 remote-harness 自动生成的会话 config 中启用 `ControlMaster`。它能减少重复握手，但在 macOS/FUSE-T
 和长时间 SSHFS 会话里，一旦复用连接本身卡住，后续请求也会被拖住；`ControlPath` socket 还容易碰到路径长度限制。
 

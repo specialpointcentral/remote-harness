@@ -275,6 +275,11 @@ fi
 
 [ -n "$RPATH" ] || { note "need --remote-path"; exit 2; }
 [ -n "$SSH_CONFIG" ] || { note "need --ssh-config (session-local config keeps SSH runtime files out of ~/.ssh)"; exit 2; }
+FOLLOW_SYMLINKS="${RH_SSHFS_FOLLOW_SYMLINKS:-1}"
+case "$FOLLOW_SYMLINKS" in
+  0|1) ;;
+  *) note 'RH_SSHFS_FOLLOW_SYMLINKS must be 0 or 1'; exit 2;;
+esac
 
 if [ -n "$SESSION_ID" ]; then
   SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
@@ -329,8 +334,13 @@ if is_mounted "$MP"; then
         exit 2
       fi
       register_mount_lease "$SESSION_ID" "$MP" "$SSH_CONFIG" "$mount_cfg" "$ALIAS" || exit 2
+      # A shared mount keeps the symlink mode it was created with; records from before the
+      # setting existed belong to mounts that always followed links.
+      mount_follow=$(kv "$record" FOLLOW_SYMLINKS)
+      case "$mount_follow" in 0|1) ;; *) mount_follow=1;; esac
     fi
     emit STATUS already-mounted; emit MOUNTPOINT "$MP"; emit REMOTE "$want"
+    [ -z "${mount_follow:-}" ] || emit FOLLOW_SYMLINKS "$mount_follow"
     emit_session_policy
     exit 0
   fi
@@ -366,9 +376,20 @@ err="$(mktemp "$RH_HOME/.sessions/rh-mount.XXXXXX" 2>/dev/null)" || err="${RH_HO
 # over the tunnel. The trade-off is a brief window where a file changed on the project host (for
 # example by a routed build) may still look stale through the mount.
 case "$OS" in
-  Darwin) SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks";;
-  *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,follow_symlinks,idmap=user";;
+  Darwin) SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3";;
+  *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user";;
 esac
+# By default the project host resolves symlinks, so every link reads exactly as it does there; linked
+# directories then look like ordinary ones and recursive scans descend into them. RH_SSHFS_FOLLOW_SYMLINKS=0
+# keeps link identity instead (transform_symlinks maps absolute targets inside RPATH to relative ones),
+# so scans can skip linked trees, but the remote host then resolves the links itself: outside-project
+# targets resolve on the remote host, and sshfs builds with default containment (contain_symlinks)
+# refuse every target with '..' or an absolute path. The mode is fixed when the mount is created.
+if [ "$FOLLOW_SYMLINKS" = 1 ]; then
+  SSHFS_OPTS="$SSHFS_OPTS,follow_symlinks"
+else
+  SSHFS_OPTS="$SSHFS_OPTS,transform_symlinks"
+fi
 SSH_BIN="$(command -v ssh 2>/dev/null || printf 'ssh')"
 # Kernel-side caching of lookups, attributes and "no such file" answers. sshfs already caches
 # attributes for 20s, but libfuse defaults to 1s attribute/entry and 0s negative caching, so an agent
@@ -409,10 +430,15 @@ if "$SSHFS_BIN" "$ALIAS:$RPATH" "$MP" -o "$SSHFS_OPTS" 2>"$err"; then
   fi
   if [ -n "$SESSION_ID" ]; then
     register_mount_lease "$SESSION_ID" "$MP" "$SSH_CONFIG" "$SSH_CONFIG" "$ALIAS" || exit 2
+    record=$(mount_record "$MP")
+    if [ -f "$record" ] && [ ! -L "$record" ] && [ -z "$(kv "$record" FOLLOW_SYMLINKS)" ]; then
+      printf 'FOLLOW_SYMLINKS=%s\n' "$FOLLOW_SYMLINKS" >> "$record"
+    fi
   fi
   emit STATUS mounted
   emit MOUNTPOINT "$MP"
   emit REMOTE "$ALIAS:$RPATH"
+  emit FOLLOW_SYMLINKS "$FOLLOW_SYMLINKS"
   emit_session_policy
   # Claude Code reads CLAUDE.md, not AGENTS.md — flag if the project ships only AGENTS.md.
   [ -f "$MP/AGENTS.md" ] && [ ! -e "$MP/CLAUDE.md" ] && emit AGENTS_MD_ONLY 1

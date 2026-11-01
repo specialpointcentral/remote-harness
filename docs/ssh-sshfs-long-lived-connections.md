@@ -295,6 +295,10 @@ sshfs user@host:/remote/path /local/mount \
   -o follow_symlinks
 ```
 
+`follow_symlinks` resolves links on the server, matching what the project host sees. remote-harness
+can preserve links instead (`RH_SSHFS_FOLLOW_SYMLINKS=0`, `transform_symlinks`); for its trade-offs see
+[the mount script reference](../reference/scripts.md).
+
 Do not enable `ControlMaster` in remote-harness generated session configs. It can reduce repeated
 handshakes, but if the reused connection gets stuck, later requests get stuck too; on macOS/FUSE-T,
 `ControlPath` sockets can also hit path-length limits.

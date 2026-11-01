@@ -46,6 +46,11 @@
 #   --yes                 non-interactive (skip all confirm prompts)
 set -uo pipefail
 
+case "${RH_SSHFS_FOLLOW_SYMLINKS:-1}" in
+  0|1) ;;
+  *) printf 'RH_SSHFS_FOLLOW_SYMLINKS must be 0 or 1\n' >&2; exit 2;;
+esac
+
 need_arg() {
   if [ -z "${2+x}" ] || [ -z "$2" ]; then
     printf 'missing value for %s\n' "$1" >&2
@@ -1227,7 +1232,7 @@ while :; do
     mp=$(sq "$REMOTE_MOUNTPOINT")
     [ -n \"\$mp\" ] || mp=\"\$rh/mounts/\"$(sq "$PROJ_NAME")
     mkdir -p \"\$mp\"
-    \"\$rh/scripts/mount-project.sh\" \
+    env RH_SSHFS_FOLLOW_SYMLINKS=$(sq "${RH_SSHFS_FOLLOW_SYMLINKS:-1}") \"\$rh/scripts/mount-project.sh\" \
       --alias $(sq "$BOX_ALIAS") \
       --remote-path $(sq "$PROJ_DIR") \
       --mountpoint \"\$mp\"$(box_check_config_arg) \
@@ -1278,6 +1283,20 @@ while :; do
       ;;
   esac
 done
+
+# A mount shared with another live session keeps the symlink mode it was created with.
+_mount_follow=$(printf '%s\n' "$MOUNT_OUT" | kv_value FOLLOW_SYMLINKS)
+if [ -n "$_mount_follow" ] && [ "$_mount_follow" != "${RH_SSHFS_FOLLOW_SYMLINKS:-1}" ]; then
+  if [ "$_mount_follow" = 1 ]; then
+    _mode_en="follows symlinks on the project host"; _mode_cn="在项目主机上跟随符号链接"
+  else
+    _mode_en="preserves symlinks"; _mode_cn="保留符号链接"
+  fi
+  warn "$(tr2 "The remote mount is shared with another live session and ${_mode_en};" \
+              "远端挂载正被另一个会话使用，当前${_mode_cn}；")"
+  say  "    $(tr2 "RH_SSHFS_FOLLOW_SYMLINKS=${RH_SSHFS_FOLLOW_SYMLINKS:-1} applies once every session using it exits and it is unmounted." \
+                 "RH_SSHFS_FOLLOW_SYMLINKS=${RH_SSHFS_FOLLOW_SYMLINKS:-1} 要等所有使用它的会话退出、挂载卸下后才生效。")"
+fi
 
 if [ "$(printf '%s\n' "$MOUNT_OUT" | kv_value KILL_USER_PROCESSES)" = 1 ]; then
   warn "the remote box has systemd-logind KillUserProcesses=yes: ending an SSH login kills the mount,"
