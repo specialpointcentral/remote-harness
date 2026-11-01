@@ -201,6 +201,44 @@ os.execv({real_awk!r}, [{real_awk!r}, *sys.argv[1:]])
         self.assertTrue(wait_for(lambda: not any(active(pid) for pid in self.pids)),
                         'watchdog or channel reader survived normal completion')
 
+    def test_completion_before_helper_installs_its_signal_handler(self):
+        definitions = DISPATCHER.read_text().split('# --- Login shell snapshot', 1)[0]
+        for mode, start, stop in (
+                ('watch', '( _rw_stopped=0 _rw_reader=""', 'kill "$watchdog_pid" 2>/dev/null || true'),
+                ('timeout', '( _rwt_stopped=0 _rwt_sleep=""', 'kill "$_rwt_timer" 2>/dev/null || true')):
+            with self.subTest(mode=mode):
+                guard = self.path / mode
+                guard.mkdir()
+                ready = guard / 'helper-starting'
+                stopped = guard / 'parent-stopped'
+                # Model the shell's startup interval before the helper's own trap is installed.
+                # The command waits for this fixture marker, then finishes while TERM is ignored.
+                # Only this disposable definition is instrumented; stdin stays open throughout.
+                startup = ("( trap '' TERM; : > " + shlex.quote(str(ready)) +
+                           '; while [ ! -f ' + shlex.quote(str(stopped)) +
+                           ' ]; do sleep .01; done; ' + start[2:])
+                instrumented = definitions.replace(start, startup, 1)
+                instrumented = instrumented.replace(stop, stop + '\n    : > ' + shlex.quote(str(stopped)), 1)
+                command = ('while [ ! -f ' + shlex.quote(str(ready)) +
+                           ' ]; do sleep .01; done; printf fast; exit 7')
+                call = ('run_watched /bin/sh -c "$2"' if mode == 'watch' else
+                        'run_with_timeout 60 "$1/timed-out" /bin/sh -c "$2"')
+                script = instrumented + '\nguard_path=$1\n' + call + '\n'
+                proc = subprocess.Popen(['sh', '-c', script, 'startup-test', str(guard), command],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, env=self.env)
+                self.pids.add(proc.pid)
+                self.addCleanup(self.close_process, proc)
+                self.assertTrue(wait_for(ready.exists), 'helper did not reach the startup gate')
+                self.pids.update(descendants(proc.pid))
+                self.assertTrue(wait_for(lambda: proc.poll() is not None, seconds=2),
+                                'helper missed normal completion during startup')
+                self.assertEqual(proc.returncode, 7)
+                self.assertEqual(proc.stdout.read(), 'fast')
+                self.assertEqual(proc.stderr.read(), '')
+                self.assertTrue(wait_for(lambda: not any(active(pid) for pid in self.pids)),
+                                'helper or private reader/timer survived early completion')
+
     def test_dispatcher_signal_finishes_cleanup_before_removing_claim_state(self):
         marker = self.path / 'signal.pid'
         proc = self.watched(self.worker_command('detached', marker) + ' & wait')

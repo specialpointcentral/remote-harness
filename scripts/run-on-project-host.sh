@@ -382,6 +382,9 @@ run_watched() {
   active_command_pid=$watched_pid
   ( _rw_stopped=0 _rw_reader=""
     trap '_rw_stopped=1; [ -z "$_rw_reader" ] || kill -s KILL "$_rw_reader" 2>/dev/null || true' TERM
+    # Completion can claim the command before this subshell installs its own signal handler.
+    # Observe that durable claim as well as TERM, which may have arrived during shell startup.
+    [ ! -d "$_rw_claim" ] || exit 0
     cat <&3 >/dev/null 2>&1 &
     _rw_reader=$!
     # KILL the private relay/timer children: TERM can arrive before exec resets an inherited shell
@@ -423,6 +426,7 @@ run_with_timeout() {  # $1=seconds $2=timeout marker, then the command
   active_command_pid=$_rwt_pid
   ( _rwt_stopped=0 _rwt_sleep=""
     trap '_rwt_stopped=1; [ -z "$_rwt_sleep" ] || kill -s KILL "$_rwt_sleep" 2>/dev/null || true' TERM
+    [ ! -d "$_rwt_claim" ] || exit 0
     sleep "$_rwt_seconds" &
     _rwt_sleep=$!
     if [ "$_rwt_stopped" = 0 ]; then wait "$_rwt_sleep" || true; fi
