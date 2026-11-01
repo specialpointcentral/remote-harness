@@ -85,6 +85,8 @@ it provides files over SSHFS and executes project commands through a forced gate
   host, mapping absolute project-host paths in discovery output back to the mount; git calls that
   write stay on the remote host.
 - Calls outside the mount, or naming another repository/index, run the real tool unchanged.
+- Claude sessions default `CLAUDE_CODE_BASH_EDIT_DIFF` to `0` (a value exported by the remote login
+  shell wins): its per-directory inotify watcher cannot see routed changes and stalls on SSHFS.
 - A routed call that cannot reach the project host fails non-zero; it never reports clean or
   no-match and never falls back to scanning SSHFS. Only an explicit "tool not installed" answer
   from a reachable project host switches that tool to the remote host for the rest of the session.

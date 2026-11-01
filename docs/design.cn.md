@@ -94,6 +94,13 @@ PATH 垫片（`project-host-tool.py`）。在 SSHFS 上，这类扫描的每次 
 - 路由调用读取项目主机的 Git 配置（全局 excludes、`core.autocrlf` 等），留在远端的 git 读取
   远端用户的全局配置和共享的仓库 `.git/config`。因此仓库级设置一致，用户级设置可能不同。
 
+Claude Code 的 Bash 自动差异（bash edit diff）属于垫片无法接管的扫描：在 Linux 上它遍历工作区，在
+主线程上逐个目录同步注册 inotify 监听，再根据这些监听看到的变化报告改动路径。在 SSHFS 上每个目录都要
+经过 FUSE 往返；而路由命令在项目主机上修改文件，远端主机不会产生 inotify 事件，所以差异始终为空。
+它查询被忽略目录和建立快照时使用私有 `GIT_DIR`，因此留在远端执行，并会在 SSHFS 上超时，导致被忽略的
+构建缓存目录也被监听。因此 Claude 会话以 `CLAUDE_CODE_BASH_EDIT_DIFF=${CLAUDE_CODE_BASH_EDIT_DIFF:-0}`
+启动，该值在远端登录 shell 读取启动文件之后展开；用户在启动文件中 export 的值会重新开启该功能。
+
 ## 连接
 
 路由命令和工具调用只在命令行上传入 `ServerAliveInterval=10`、`ServerAliveCountMax=3`、

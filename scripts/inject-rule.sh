@@ -666,6 +666,12 @@ case "${1:-}" in
         write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" \
           || abort_session
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
+        # Bash edit diff learns what a command changed from inotify watches on every work-tree
+        # directory of the mount. Routed commands change files on the project host, which SSHFS never
+        # reports as inotify events, so the diff stays empty while each directory costs a synchronous
+        # FUSE round trip on Claude's main thread. Off by default; the prefix is expanded after the
+        # remote login shell's startup files, so a value the user exports there wins.
+        env_out="$env_out CLAUDE_CODE_BASH_EDIT_DIFF=\${CLAUDE_CODE_BASH_EDIT_DIFF:-0}"
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"

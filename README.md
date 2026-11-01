@@ -346,6 +346,10 @@ remote-harness/
 - Claude 严格模式会设置 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0`，并阻止 `WorktreeCreate`、
   `EnterWorktree` 和 `ExitWorktree`。普通/嵌套 subagent 仍可使用；并行写入时应给 agents 分配互不
   重叠的文件范围。
+- Claude 会话默认设置 `CLAUDE_CODE_BASH_EDIT_DIFF=0`，关闭 Bash 执行后的自动差异展示：它靠 inotify
+  监听挂载点内的每个目录，而路由命令在项目主机上修改文件，SSHFS 不会产生对应事件，所以差异始终为空，
+  建立监听却会拖慢界面。需要时在远端 shell 启动文件中 `export CLAUDE_CODE_BASH_EDIT_DIFF=1`；
+  查看改动请用路由后的 `git diff`。
 
 ### 故障排查
 
@@ -731,6 +735,11 @@ remote-harness/
 - Claude strict mode sets `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0` and blocks `WorktreeCreate`,
   `EnterWorktree`, and `ExitWorktree`. Ordinary and nested subagents remain available; parallel
   writers need disjoint file ownership.
+- Claude sessions default to `CLAUDE_CODE_BASH_EDIT_DIFF=0`, turning off the automatic diff after
+  Bash calls: it relies on inotify watches on every directory in the mount, routed commands change
+  files on the project host, and SSHFS reports no events for those changes, so the diff stays empty
+  while setting up the watches slows the UI. To turn it back on, `export CLAUDE_CODE_BASH_EDIT_DIFF=1`
+  in a remote shell startup file; routed `git diff` shows changes.
 
 ### Troubleshooting
 

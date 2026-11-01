@@ -917,6 +917,12 @@ RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
 assert_grep "$tmp/inject-claude.out" "--settings '" "inject claude session settings"
 assert_grep "$tmp/inject-claude.out" "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0" "inject claude disables experimental agent teams"
+# Bash edit diff is off unless the remote login shell already exports a value.
+claude_launch_env=$(sed -n 's/^RH_LAUNCH_ENV=//p' "$tmp/inject-claude.out")
+[ "$(env -u CLAUDE_CODE_BASH_EDIT_DIFF sh -c "$claude_launch_env env" | grep '^CLAUDE_CODE_BASH_EDIT_DIFF=')" = CLAUDE_CODE_BASH_EDIT_DIFF=0 ] \
+  || fail "inject claude did not disable bash edit diff by default"
+[ "$(CLAUDE_CODE_BASH_EDIT_DIFF=1 sh -c "$claude_launch_env env" | grep '^CLAUDE_CODE_BASH_EDIT_DIFF=')" = CLAUDE_CODE_BASH_EDIT_DIFF=1 ] \
+  || fail "inject claude overrode an explicit bash edit diff setting"
 claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
 python3 - "$claude_settings" <<'PY'
@@ -947,6 +953,7 @@ assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex 
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 1 "$basic_ssh_cfg" > "$tmp/inject-opencode.out"
 assert_grep "$tmp/inject-opencode.out" "OPENCODE_CONFIG='" "inject opencode env quoted"
+refute_grep "$tmp/inject-opencode.out" "CLAUDE_CODE_BASH_EDIT_DIFF" "only claude sessions get the bash edit diff default"
 assert_grep "$tmp/inject-opencode.out" "RH_READY_FILE=" "inject opencode exposes a plugin readiness marker"
 opencode_session_key="$(printf '%s' "$tmp/mount-opencode" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 opencode_session_dir="$rh_home/.sessions/$opencode_session_key"

@@ -110,6 +110,15 @@ project host:
   while git kept remote reads the remote user's global configuration plus the shared repository
   `.git/config`. Repository-level settings therefore agree; user-level ones may differ.
 
+Claude Code's Bash edit diff is a scan that no shim can reach: on Linux it walks the work tree, adds
+one inotify watch per directory synchronously on the main thread, and reports the paths those watches
+saw change. Over SSHFS every directory costs FUSE round trips, and routed commands change files on
+the project host, which produces no inotify event on the remote host, so the diff stays empty. Its
+ignored-directory lookup and snapshot use a private `GIT_DIR`, which keeps them remote, and they time
+out over SSHFS, so ignored build caches are watched as well. Claude sessions therefore start with
+`CLAUDE_CODE_BASH_EDIT_DIFF=${CLAUDE_CODE_BASH_EDIT_DIFF:-0}`, expanded after the remote login shell's
+startup files; a value exported there turns the feature back on.
+
 ## Connections
 
 Routed commands and tool calls pass, on the command line only, `ServerAliveInterval=10`,
