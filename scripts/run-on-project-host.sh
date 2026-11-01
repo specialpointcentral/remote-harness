@@ -2,8 +2,21 @@
 # Route an encoded command to the project host, or execute its internal dispatch mode there.
 set -eu
 
+diagnostic_id=unknown
+diagnostic_log=""
+diagnostic_ready=0
+gateway_diagnostic_log=""
 fail() {
-  printf 'remote-harness: %s\n' "$*" >&2
+  # Framework diagnostics never share the project's streams. The optional log is prepared before
+  # SSH starts; project-host validation errors use the private gateway directory when available.
+  if [ "$diagnostic_ready" = 1 ]; then
+    printf '%s\n' "$*" >> "$diagnostic_log" 2>/dev/null || true
+  elif [ -n "$gateway_diagnostic_log" ] && [ ! -L "$gateway_diagnostic_log" ] \
+      && { [ ! -e "$gateway_diagnostic_log" ] || [ -f "$gateway_diagnostic_log" ]; }; then
+    (umask 077; if [ -f "$gateway_diagnostic_log" ]; then chmod 600 "$gateway_diagnostic_log" || exit 1; fi
+      printf '%s\n' "$*" >> "$gateway_diagnostic_log") 2>/dev/null || true
+  fi
+  printf 'remote-harness: category=framework exit=2 session=%s\n' "$diagnostic_id" >&2
   exit 2
 }
 
@@ -17,7 +30,7 @@ else
 fi
 
 decode_b64() {
-  printf '%s' "$1" | base64 "$BASE64_DECODE_FLAG"
+  printf '%s' "$1" | base64 "$BASE64_DECODE_FLAG" 2>/dev/null
 }
 
 encode_b64() {
@@ -218,17 +231,19 @@ make_agent_guard_path() {
     || fail "could not create the local no-agent guard"
   for _mag_name in claude codex opencode; do  # printf is a builtin: no process per stub
     printf '%s\n' '#!/usr/bin/env sh' \
-      "printf 'remote-harness: Agent processes must run on the remote agent host.\\n' >&2" \
+      "printf 'remote-harness: category=policy exit=126 session=unknown\\n' >&2" \
       'exit 126' > "$_mag_dir/$_mag_name"
   done
   chmod +x "$_mag_dir/claude" "$_mag_dir/codex" "$_mag_dir/opencode"
   printf '%s' "$_mag_dir"
 }
 
-# Both dispatch verbs: drop AI credentials, shadow agent CLIs with $guard_path, and always remove it.
+# Both dispatch verbs: drop AI credentials and connection metadata, shadow agent CLIs with
+# $guard_path, and always remove it.
 # A signal ends the dispatcher: carrying on after the guard is gone would run without it.
 start_agent_guard() {
   scrub_agent_credentials
+  scrub_host_metadata
   guard_path=$(make_agent_guard_path)
   active_command_pid="" active_command_helper="" active_command_claim=""
   trap cleanup_dispatch EXIT
@@ -280,10 +295,18 @@ resolve_target() {  # $1=project root b64 $2=relative cwd b64 -> target_physical
 }
 
 AGENT_CREDENTIAL_VARS="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY CODEX_API_KEY CODEX_HOME"
+# Incidental connection/session and explicit hostname values, not the developer's identity or
+# configuration. Keep HOME, USER, LOGNAME, SSH_AUTH_SOCK and toolchain variables available.
+HOST_METADATA_VARS="SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_ORIGINAL_COMMAND RH_GATEWAY_SESSION_DIR HOSTNAME HOST"
 
 scrub_agent_credentials() {
   # shellcheck disable=SC2086 # a fixed list of names.
   unset $AGENT_CREDENTIAL_VARS 2>/dev/null || true
+}
+
+scrub_host_metadata() {
+  # shellcheck disable=SC2086 # a fixed list of names; no shell-generated readonly parameters.
+  unset $HOST_METADATA_VARS 2>/dev/null || true
 }
 
 # Start "$@" in its own process group when the host offers a way to (setsid on Linux, perl on
@@ -469,8 +492,8 @@ SNAPSHOT_CAPTURE_SECONDS=30
 SNAPSHOT_CHECK_SECONDS=10
 SNAPSHOT_LOCK_STALE_MIN=2        # longer than any capture with its checks
 # Never restored: values that belong to one connection or process, and credentials commands never get.
-SNAPSHOT_SKIP_VARS="PWD OLDPWD SHLVL _ IFS SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_ORIGINAL_COMMAND"
-SNAPSHOT_SKIP_VARS="$SNAPSHOT_SKIP_VARS XDG_SESSION_ID KRB5CCNAME RH_GATEWAY_SESSION_DIR $AGENT_CREDENTIAL_VARS"
+SNAPSHOT_SKIP_VARS="PWD OLDPWD SHLVL _ IFS XDG_SESSION_ID KRB5CCNAME"
+SNAPSHOT_SKIP_VARS="$SNAPSHOT_SKIP_VARS $HOST_METADATA_VARS $AGENT_CREDENTIAL_VARS"
 snapshot_dir="" snapshot_file="" snapshot_work="" snapshot_lock="" shell_kind=""
 
 # The capture scripts run as `<shell> -lc <script> remote-harness <output> <names to skip> <shell>`,
@@ -619,6 +642,9 @@ capture_snapshot() {
     zsh) _cs_script=$(snapshot_capture_zsh) ;;
     *) snapshot_reason "$_cs_work" "unsupported shell: $shell"; return 1 ;;
   esac
+  # Reject a profile that makes a restricted name readonly instead of caching a snapshot which
+  # would bypass the same cleanup failure on the login-shell fallback path.
+  _cs_script="$environment_guard $_cs_script"
   _cs_status=0
   run_with_timeout "$SNAPSHOT_CAPTURE_SECONDS" "$_cs_work/timed-out" "$shell" -lc "$_cs_script" \
     remote-harness "$_cs_work/snapshot" "$SNAPSHOT_SKIP_VARS" "$shell" \
@@ -696,8 +722,8 @@ refresh_snapshot() {
 # RH_SHELL_SNAPSHOT=off at launch leaves shell-snapshot.off in the session directory.
 select_shell_snapshot() {
   snapshot_file=""
+  [ -n "$shell_kind" ] || return 0
   [ -n "$snapshot_dir" ] && [ -d "$snapshot_dir" ] || return 0
-  case "${shell##*/}" in bash|zsh) shell_kind=${shell##*/} ;; *) return 0 ;; esac
   [ ! -e "$snapshot_dir/shell-snapshot.off" ] || return 0
   _sss_file="$snapshot_dir/shell-snapshot.sh"
   if snapshot_usable "$_sss_file" || { refresh_snapshot && snapshot_usable "$_sss_file"; }; then
@@ -709,7 +735,6 @@ select_shell_snapshot() {
 dispatch() {
   # The gateway names this session's directory, which holds the snapshot; commands never see it.
   snapshot_dir=${RH_GATEWAY_SESSION_DIR:-}
-  unset RH_GATEWAY_SESSION_DIR
   [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || fail "internal dispatch needs project root, cwd, and command"
   watch_mode=0
   if [ "$#" -eq 4 ]; then
@@ -725,21 +750,33 @@ dispatch() {
   shell=${SHELL:-/bin/sh}
   case "$shell" in /*) ;; *) shell=/bin/sh ;; esac
   [ -x "$shell" ] || shell=/bin/sh
+  case "${shell##*/}" in bash|zsh) shell_kind=${shell##*/} ;; esac
+  # Profiles, snapshots and shell startup (bash's HOSTNAME, zsh's HOST) may reintroduce these names.
+  # Native zsh's `command` skips builtins. Other POSIX shells need it to keep a failed special
+  # builtin from exiting before our controlled diagnostic.
+  unset_command="command unset"
+  case "$shell_kind" in bash|zsh) unset_command="builtin unset" ;; esac
+  guard_failure="printf '%s\\n' 'remote-harness: category=environment exit=125 session=unknown' >&2; exit 125;"
+  environment_guard="$unset_command $AGENT_CREDENTIAL_VARS $HOST_METADATA_VARS 2>/dev/null || { $guard_failure };"
+  if [ "$shell_kind" = zsh ]; then
+    # Zsh aborts on a readonly unset even in an OR-list. Inspect types with builtins first;
+    # the default expansion also keeps absent names harmless under the profile's nounset option.
+    environment_guard="for __rh_unset_name in $AGENT_CREDENTIAL_VARS $HOST_METADATA_VARS; do case \${(tP)__rh_unset_name-} in *readonly*) $guard_failure ;; esac; done; builtin unset __rh_unset_name; $environment_guard"
+  fi
   export GIT_OPTIONAL_LOCKS=0
   start_agent_guard
   cd "$root_physical"
   select_shell_snapshot
   cd "$target_physical"
-  # Credentials are dropped again after the profile (or zsh's .zshenv), which may export them.
   quoted_guard=$(sq "$guard_path")
   loaded=""
-  guard="unset $AGENT_CREDENTIAL_VARS; PATH=$quoted_guard:\$PATH; export PATH;"
+  guard="$environment_guard PATH=$quoted_guard:\$PATH; export PATH;"
   if [ -n "$snapshot_file" ]; then
     # $loaded stays empty unless the snapshot loads completely, also when the shell dies loading it.
     # The command has not started then; the snapshot is dropped so the next command captures anew.
     loaded="$guard_path/snapshot-loaded"
     shell_flag=-c
-    guarded_command=": >| $quoted_guard/snapshot-loaded; . $(sq "$snapshot_file") && [ \"\${__rh_snapshot_complete:-}\" = 1 ] && printf ok >| $quoted_guard/snapshot-loaded || { printf '%s\\n' 'remote-harness: the login shell snapshot did not load and was discarded; run the command again' >&2; exit 125; }; unset __rh_snapshot_complete; $guard $command"
+    guarded_command=": >| $quoted_guard/snapshot-loaded; . $(sq "$snapshot_file") && [ \"\${__rh_snapshot_complete:-}\" = 1 ] && printf ok >| $quoted_guard/snapshot-loaded || { printf '%s\\n' 'remote-harness: category=snapshot exit=125 session=unknown' >&2; exit 125; }; unset __rh_snapshot_complete; $guard $command"
   else
     shell_flag=-lc
     guarded_command="$guard $command"
@@ -846,10 +883,18 @@ if [ "${1:-}" = "--find-tool" ]; then
   exit
 fi
 if [ "${1:-}" = "--dispatch" ]; then
+  if [ -n "${RH_GATEWAY_SESSION_DIR:-}" ] && [ -d "$RH_GATEWAY_SESSION_DIR" ] \
+      && [ ! -L "$RH_GATEWAY_SESSION_DIR" ]; then
+    gateway_diagnostic_log="$RH_GATEWAY_SESSION_DIR/framework.log"
+  fi
   shift
   dispatch "$@"
 fi
 if [ "${1:-}" = "--dispatch-tool" ]; then
+  if [ -n "${RH_GATEWAY_SESSION_DIR:-}" ] && [ -d "$RH_GATEWAY_SESSION_DIR" ] \
+      && [ ! -L "$RH_GATEWAY_SESSION_DIR" ]; then
+    gateway_diagnostic_log="$RH_GATEWAY_SESSION_DIR/framework.log"
+  fi
   shift
   dispatch_tool "$@"
 fi
@@ -884,13 +929,49 @@ while [ "$#" -gt 0 ]; do
     --tool) [ "$#" -ge 2 ] || fail "missing --tool value"; tool=$2; shift 2 ;;
     --args-b64) [ "$#" -ge 2 ] || fail "missing --args-b64 value"; tool_args=$2; shift 2 ;;
     --control-path) [ "$#" -ge 2 ] || fail "missing --control-path value"; control_path=$2; shift 2 ;;
+    --diagnostic-log) [ "$#" -ge 2 ] || fail "missing diagnostic log"; diagnostic_log=$2; shift 2 ;;
+    --diagnostic-id) [ "$#" -ge 2 ] || fail "missing diagnostic identity"; diagnostic_id=$2; shift 2 ;;
     --no-mux) use_mux=0; shift ;;
     --watch) watch_command=1; shift ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
 
+case "$diagnostic_id" in unknown) ;; *[!0-9a-f]*|"") diagnostic_id=unknown ;; esac
+[ "${#diagnostic_id}" = 32 ] || diagnostic_id=unknown
 [ -f "$ssh_config" ] || fail "session SSH config is unavailable"
+external_diagnostics=0
+if [ -n "$diagnostic_log" ]; then
+  external_diagnostics=1
+  [ ! -L "$diagnostic_log" ] && [ -f "$diagnostic_log" ] && [ -w "$diagnostic_log" ] \
+    || { diagnostic_log=""; fail "private diagnostics are unavailable"; }
+  chmod 600 "$diagnostic_log" 2>/dev/null || { diagnostic_log=""; fail "private diagnostics are unavailable"; }
+else
+  # Python callers prepare their own file and exec SSH below. This standalone fallback uses only
+  # the same small POSIX tool set as the no-Python launcher, and never changes the command's umask.
+  diagnostic_base=$(CDPATH= cd -- "$(dirname "$ssh_config")" 2>/dev/null && pwd -P) \
+    || fail "private diagnostics are unavailable"
+  diagnostic_dir="$diagnostic_base/runtime/diagnostics"
+  [ ! -L "$diagnostic_base/runtime" ] && [ ! -L "$diagnostic_dir" ] \
+    || fail "private diagnostics are unavailable"
+  (umask 077; mkdir -p "$diagnostic_dir" && chmod 700 "$diagnostic_dir" "${diagnostic_dir%/*}") 2>/dev/null \
+    || fail "private diagnostics are unavailable"
+  [ ! -L "$diagnostic_dir/public-id" ] || fail "private diagnostics are unavailable"
+  if [ -f "$diagnostic_dir/public-id" ]; then
+    diagnostic_id=$(cat "$diagnostic_dir/public-id" 2>/dev/null) || diagnostic_id=unknown
+    case "$diagnostic_id" in *[!0-9a-f]*|"") diagnostic_id=unknown ;; esac
+    [ "${#diagnostic_id}" = 32 ] || diagnostic_id=unknown
+  fi
+  diagnostic_sequence=0
+  while :; do
+    diagnostic_log="$diagnostic_dir/ssh.$$.$diagnostic_sequence"
+    if (umask 077; set -C; : > "$diagnostic_log") 2>/dev/null; then break; fi
+    diagnostic_sequence=$((diagnostic_sequence + 1))
+    [ "$diagnostic_sequence" -lt 100 ] || { diagnostic_log=""; fail "private diagnostics are unavailable"; }
+  done
+fi
+diagnostic_ready=1
+
 case "$alias_name" in ""|-*|*[!A-Za-z0-9._-]*) fail "unsafe SSH alias" ;; esac
 case "$project_root" in /*) ;; *) fail "project root must be absolute" ;; esac
 relative_decoded=$(decode_b64 "$relative_cwd") || fail "could not decode relative working directory"
@@ -917,12 +998,35 @@ fi
 # hanging every later call; ControlPersist lets an idle master exit on its own even if session cleanup
 # never runs (cleanup stops it at session end; an hour keeps it across normal pauses, since reopening
 # it costs a full SSH handshake on every first call after the idle period). A stale socket left by a killed master is unlinked automatically by ControlMaster=auto.
-set -- -F "$ssh_config" -T \
+set -- -E "$diagnostic_log" -F "$ssh_config" -T \
   -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=10 \
-  -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o Compression=yes
+  -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o Compression=yes -o LogLevel=ERROR \
+  -o ProxyCommand=none -o ProxyJump=none
 if [ "$use_mux" = 1 ] && [ -n "$control_path" ] && control_path_usable "$control_path"; then
   set -- "$@" -o ControlMaster=auto -o "ControlPath=$control_path" -o ControlPersist=3600
 else
   set -- "$@" -o ControlMaster=no -o ControlPath=none
 fi
-exec ssh "$@" "$alias_name" "$remote_command"
+if [ "$external_diagnostics" = 1 ]; then
+  exec ssh "$@" "$alias_name" "$remote_command"
+fi
+# Save stdin before starting the asynchronous command: dash replaces an async child's fd 0 with
+# /dev/null before applying <&0. A separate parent fd preserves the guard's held-open channel.
+# Forward cancellation and reap it; Python paths keep the original exec-only process shape.
+exec 3<&0
+ssh "$@" "$alias_name" "$remote_command" <&3 3<&- &
+diagnostic_ssh_pid=$!
+exec 3<&-
+trap 'kill -s TERM "$diagnostic_ssh_pid" 2>/dev/null || true' TERM
+trap 'kill -s INT "$diagnostic_ssh_pid" 2>/dev/null || true' INT
+trap 'kill -s HUP "$diagnostic_ssh_pid" 2>/dev/null || true' HUP
+diagnostic_status=0
+wait "$diagnostic_ssh_pid" 2>/dev/null || diagnostic_status=$?
+case "$diagnostic_status" in 1[2-9][0-9]|2[0-4][0-9]|25[0-5])
+  # A trapped wait can end before SSH; a second wait reaps it after forwarding the signal.
+  wait "$diagnostic_ssh_pid" 2>/dev/null || true ;;
+esac
+if [ "$diagnostic_status" = 255 ] && [ -s "$diagnostic_log" ]; then
+  printf 'remote-harness: category=ssh exit=%s session=%s\n' "$diagnostic_status" "$diagnostic_id" >&2
+fi
+exit "$diagnostic_status"

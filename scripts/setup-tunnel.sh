@@ -7,6 +7,8 @@
 # Generates an ed25519 key beside the session config if asked.
 # Prints KEY=VALUE lines on stdout; human notes on stderr.
 set -euo pipefail
+# This standalone setup process only creates harness state, never the agent or project commands.
+umask 077
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 note() { printf '%s\n' "$*" >&2; }
@@ -27,7 +29,10 @@ RH_HOME="${RH_HOME:-$HOME/.remote-harness}"
 # lives beside the session config; user-managed ~/.ssh keys are never created or modified.
 LOCK="$RH_HOME/.locks/keygen.lock"
 rh_lock() {
-  mkdir -p "$(dirname "$LOCK")" 2>/dev/null || true
+  [ ! -L "$(dirname "$LOCK")" ] && [ ! -L "$LOCK" ] && [ ! -L "$LOCK.d" ] \
+    || die "SSH key lock path is a symlink"
+  mkdir -p "$(dirname "$LOCK")" && chmod 700 "$(dirname "$LOCK")" \
+    || die "could not create private SSH key lock directory"
   if command -v flock >/dev/null 2>&1; then
     exec 9>"$LOCK" 2>/dev/null && flock -w 10 9 2>/dev/null || true
   else
@@ -48,7 +53,7 @@ listening_ports() {
     fi; } | sed -E 's/.*[:.]([0-9]+)$/\1/' | grep -E '^[0-9]+$' | sort -un
 }
 
-ALIAS="" PORT="" LUSER="" IDENTITY="" GEN_KEY=0 NAMESPACE="" CFG_OVERRIDE=""
+ALIAS="" PORT="" LUSER="" IDENTITY="" GEN_KEY=0 NAMESPACE="" CFG_OVERRIDE="" MANAGED_IDENTITY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --alias)     need_arg "$1" "${2-}"; ALIAS="$2"; shift 2;;
@@ -98,30 +103,66 @@ case "$CFG_OVERRIDE" in /*) ;; *) die "--config must be an absolute path: $CFG_O
 case "$CFG_OVERRIDE" in *'
 '*) die "--config contains a newline";; esac
 CFG="$CFG_OVERRIDE"
-mkdir -p "$(dirname "$CFG")" 2>/dev/null || true
-touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
+CFG_DIR="$(dirname "$CFG")"
+SESSION_PARENT="${RH_HOME%/}/.sessions"
+PRIVATE_TRANSPORT=0
+case "$CFG" in
+  "$SESSION_PARENT"/*/ssh_config)
+    transport_name=${CFG_DIR#"$SESSION_PARENT"/}
+    case "$transport_name" in
+      ''|.*|*/*) ;;
+      *)
+        [ ! -L "$SESSION_PARENT" ] || die "SSH session directory is a symlink"
+        PRIVATE_TRANSPORT=1
+        ;;
+    esac
+    ;;
+esac
+[ ! -L "$CFG_DIR" ] && [ ! -L "$CFG" ] || die "SSH config path is a symlink"
+mkdir -p "$CFG_DIR" 2>/dev/null || die "could not create SSH config directory"
+# Tighten reused transport directories only within the harness-owned session namespace. Custom
+# config and identity parents may be user-managed and keep their existing permissions.
+if [ "$PRIVATE_TRANSPORT" = 1 ]; then
+  [ -O "$SESSION_PARENT" ] && [ -O "$CFG_DIR" ] || die "SSH session directory is not owned by this user"
+  chmod 700 "$SESSION_PARENT" "$CFG_DIR" || die "could not protect SSH session directories"
+fi
+touch "$CFG"; chmod 600 "$CFG" || die "could not protect SSH config"
 RUNTIME_DIR="$(dirname "$CFG")/runtime"
+[ ! -L "$RUNTIME_DIR" ] || die "SSH runtime directory is a symlink"
 mkdir -p "$RUNTIME_DIR" 2>/dev/null || die "could not create SSH runtime directory"
-chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+chmod 700 "$RUNTIME_DIR" || die "could not protect SSH runtime directory"
 KH="$RUNTIME_DIR/known_hosts_${ALIAS}"
+[ ! -L "$KH" ] || die "SSH host-key file is a symlink"
+[ ! -f "$KH" ] || chmod 600 "$KH" || die "could not protect SSH host-key file"
 
 # --- pick / create a per-session identity key ------------------------------
 if [ -z "$IDENTITY" ]; then
   IDENTITY="$(dirname "$CFG")/id_ed25519"
+  MANAGED_IDENTITY=1
+fi
+if [ "$MANAGED_IDENTITY" = 1 ]; then
+  [ ! -L "$IDENTITY" ] && [ ! -L "$IDENTITY.pub" ] || die "SSH identity path is a symlink"
 fi
 if [ ! -f "$IDENTITY" ] && [ "$GEN_KEY" = 1 ]; then
+  [ ! -L "$IDENTITY" ] && [ ! -L "$IDENTITY.pub" ] || die "SSH identity generation path is a symlink"
   # Serialize keygen on a shared box account. Under the lock, generate only if the session key does
   # not already exist.
   rh_lock
   if [ ! -f "$IDENTITY" ]; then
     note "No per-session SSH key found; generating $IDENTITY (no passphrase)."
-    mkdir -p "$(dirname "$IDENTITY")" 2>/dev/null || true
-    chmod 700 "$(dirname "$IDENTITY")" 2>/dev/null || true
-    ssh-keygen -t ed25519 -N "" -f "$IDENTITY" -C "remote-harness@$(hostname 2>/dev/null || echo host)" >/dev/null
+    [ ! -L "$(dirname "$IDENTITY")" ] || die "SSH identity directory is a symlink"
+    mkdir -p "$(dirname "$IDENTITY")" || die "could not create SSH identity directory"
+    ssh-keygen -t ed25519 -N "" -f "$IDENTITY" -C remote-harness >/dev/null
   else
     note "SSH key appeared concurrently; reusing $IDENTITY."
   fi
   rh_unlock
+fi
+# Only the session-owned default key is managed here; explicit user identities keep their modes.
+if [ "$MANAGED_IDENTITY" = 1 ]; then
+  for key_file in "$IDENTITY" "$IDENTITY.pub"; do
+    [ ! -f "$key_file" ] || chmod 600 "$key_file" || die "could not protect session SSH identity"
+  done
 fi
 
 # --- ephemeral-floor sanity check ------------------------------------------
@@ -136,7 +177,10 @@ fi
 # --- write an idempotent managed block -------------------------------------
 BEGIN="# >>> remote-harness:${ALIAS} >>> (managed; edits here are overwritten)"
 END="# <<< remote-harness:${ALIAS} <<<"
-strip="$(mktemp "$(dirname "$CFG")/.rh-strip.XXXXXX" 2>/dev/null)" || strip="$CFG.rh-strip.$$"
+strip="$(mktemp "$(dirname "$CFG")/.rh-strip.XXXXXX" 2>/dev/null)" || {
+  strip="$CFG.rh-strip.$$"
+  (set -C; : > "$strip") || die "could not create private SSH config temp"
+}
 awk -v b="$BEGIN" -v e="$END" '
   index($0,"# >>> remote-harness:")==1 && index($0, b)==1 {skip=1}
   skip==0 {print}
@@ -146,7 +190,10 @@ awk -v b="$BEGIN" -v e="$END" '
 # Build the new config in a SAME-DIRECTORY temp, then rename over $CFG. The rename is atomic on one
 # filesystem, so a concurrent reader/writer of the same config (writes are not locked) sees
 # the old OR the fully-new file — never a half-written one, and at worst a lost update, not corruption.
-new="$(mktemp "$(dirname "$CFG")/.rh-cfg.XXXXXX" 2>/dev/null)" || new="$CFG.rh-new.$$"
+new="$(mktemp "$(dirname "$CFG")/.rh-cfg.XXXXXX" 2>/dev/null)" || {
+  new="$CFG.rh-new.$$"
+  (set -C; : > "$new") || die "could not create private SSH config temp"
+}
 {
   cat "$strip"
   printf '%s\n' "$BEGIN"
@@ -156,6 +203,7 @@ new="$(mktemp "$(dirname "$CFG")/.rh-cfg.XXXXXX" 2>/dev/null)" || new="$CFG.rh-n
   printf '    Port %s\n' "$PORT"
   printf '    User %s\n' "$(ssh_config_value "$LUSER")"
   [ -n "$IDENTITY" ] && printf '    IdentityFile %s\n' "$(ssh_config_value "$IDENTITY")"
+  printf '    IdentitiesOnly yes\n'
   printf '    UserKnownHostsFile %s\n' "$(ssh_config_value "$KH")"
   printf '    GlobalKnownHostsFile /dev/null\n'
   printf '    StrictHostKeyChecking accept-new\n'
@@ -165,7 +213,7 @@ new="$(mktemp "$(dirname "$CFG")/.rh-cfg.XXXXXX" 2>/dev/null)" || new="$CFG.rh-n
   printf '    ControlMaster no\n'
   printf '%s\n' "$END"
 } > "$new"
-chmod 600 "$new" 2>/dev/null || true
+chmod 600 "$new" || die "could not protect new SSH config"
 mv "$new" "$CFG"
 rm -f "$strip"
 emit STATUS configured
@@ -179,7 +227,7 @@ if [ -n "$IDENTITY" ] && [ -f "$IDENTITY.pub" ]; then
   emit PUBKEY "$(cat "$IDENTITY.pub")"
 else
   emit PUBKEY ""
-  note "No remote-harness public key available; the laptop must already accept agent/key auth,"
-  note "or re-run with --gen-key to create a key beside the session SSH config."
+  note "No remote-harness public key available; authentication is limited to the configured identity."
+  note "Pass --identity with an authorized key, or use --gen-key when the configured key is missing."
 fi
 note "Wrote Host '$ALIAS' to $CFG (managed block)."

@@ -220,8 +220,18 @@ resource_value() { # records are base64 values, never executable shell configura
 
 RESOURCE_FIELDS="TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID TUNNEL_START AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR LOCAL_SSHD_PID LOCAL_SSHD_START LOCAL_SSHD_CFG"
 
-write_local_resource_record() {
+private_local_dirs() (
+  umask 077
+  for _pld_dir in "$@"; do
+    [ ! -L "$_pld_dir" ] && mkdir -p "$_pld_dir" && chmod 700 "$_pld_dir" || exit 1
+  done
+)
+
+write_local_resource_record() (
+  umask 077
   [ -n "$LOCAL_SESSION_DIR" ] || return 0
+  [ ! -L "$LOCAL_SESSION_DIR" ] && [ ! -L "$LOCAL_SESSION_DIR/resources.env.tmp" ] \
+    && [ ! -L "$LOCAL_SESSION_DIR/resources.env" ] || return 1
   local _name _value
   {
     for _name in $RESOURCE_FIELDS; do
@@ -229,8 +239,9 @@ write_local_resource_record() {
       printf '%s=%s\n' "$_name" "$(printf '%s' "$_value" | base64 | tr -d '\n')"
     done
     printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" "$(proc_start "$$" | base64 | tr -d '\n')"
-  } > "$LOCAL_SESSION_DIR/resources.env.tmp" && mv "$LOCAL_SESSION_DIR/resources.env.tmp" "$LOCAL_SESSION_DIR/resources.env"
-}
+  } > "$LOCAL_SESSION_DIR/resources.env.tmp" && chmod 600 "$LOCAL_SESSION_DIR/resources.env.tmp" \
+    && mv "$LOCAL_SESSION_DIR/resources.env.tmp" "$LOCAL_SESSION_DIR/resources.env"
+)
 
 # Stop a recorded process only while it is still the same one (start time and command line match);
 # one that is gone, or whose pid now has another start time, counts as stopped.
@@ -282,7 +293,13 @@ release_local_resources() { # only release records whose exact remote config is 
 }
 
 sweep_local_resources() {
-  local _dir _file _pid _start _actual
+  local _dir _file _pid _start _actual _resume
+  # Match the remote reaper's resume-offer lifetime on the existing next-launch cleanup path.
+  _resume="$HOME/.remote-harness/.sessions/.resume"
+  if [ ! -L "${_resume%/*}" ] && [ -O "${_resume%/*}" ] \
+      && [ -d "$_resume" ] && [ ! -L "$_resume" ] && [ -O "$_resume" ]; then
+    find "$_resume" -maxdepth 1 -type f -mtime +7 -exec rm -f {} + 2>/dev/null || true
+  fi
   for _dir in "$HOME/.remote-harness/.sessions"/rev.*; do
     [ -f "$_dir/resources.env" ] && [ ! -L "$_dir" ] || continue
     if [ "$_dir" = "$LOCAL_SESSION_DIR" ] && [ "$CLEANED" != 1 ]; then continue; fi
@@ -308,9 +325,10 @@ GATEWAY_DIR="" GATEWAY_PATH="" GATEWAY_SESSION_DIR=""
 authkey_lock() {
   [ "$AUTHKEY_LOCK_HELD" = 1 ] && return 0
   AUTHKEY_LOCK_DIR="$HOME/.remote-harness/.locks/authorized_keys.lock.d"
-  mkdir -p "$(dirname "$AUTHKEY_LOCK_DIR")" 2>/dev/null || return 1
+  private_local_dirs "$(dirname "$AUTHKEY_LOCK_DIR")" 2>/dev/null || return 1
   _n=0
-  while ! mkdir "$AUTHKEY_LOCK_DIR" 2>/dev/null; do
+  while ! mkdir -m 700 "$AUTHKEY_LOCK_DIR" 2>/dev/null; do
+    [ ! -L "$AUTHKEY_LOCK_DIR" ] || return 1
     _n=$((_n + 1))
     [ "$_n" -ge 30 ] && return 1
     sleep 1
@@ -394,18 +412,22 @@ install_project_host_gateway() {
   GATEWAY_SESSION_DIR="$HOME/.remote-harness/.sessions/gateways/$AUTHKEY_TAG"
   GATEWAY_DIR="$GATEWAY_SESSION_DIR/bin"
   GATEWAY_PATH="$GATEWAY_DIR/project-host-gateway.sh"
-  mkdir -p "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || return 1
-  chmod 700 "$GATEWAY_DIR" "$GATEWAY_SESSION_DIR" 2>/dev/null || true
+  private_local_dirs "${GATEWAY_SESSION_DIR%/*}" "$GATEWAY_SESSION_DIR" "$GATEWAY_DIR" 2>/dev/null || return 1
+  [ ! -L "$GATEWAY_PATH" ] && [ ! -L "$GATEWAY_DIR/run-on-project-host.sh" ] || return 1
   # A reused session key keeps the same implementation; a new key gets its own snapshot.
   if [ ! -f "$GATEWAY_PATH" ]; then
-    cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" || return 1
-    cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh" || return 1
+    (umask 077
+      cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" \
+        && cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh") || return 1
   fi
   chmod 700 "$GATEWAY_PATH" "$GATEWAY_DIR/run-on-project-host.sh" 2>/dev/null || return 1
 }
 
-register_gateway_project() {
+register_gateway_project() (
+  umask 077
   [ -n "$GATEWAY_SESSION_DIR" ] || return 1
+  [ ! -L "$GATEWAY_SESSION_DIR" ] && [ ! -L "$GATEWAY_SESSION_DIR/project-root.b64" ] \
+    && [ ! -L "$GATEWAY_SESSION_DIR/shell-snapshot.off" ] || return 1
   _rgp_root=$(printf '%s' "$PROJ_DIR" | base64 | tr -d '\n')
   if [ -f "$GATEWAY_SESSION_DIR/project-root.b64" ] && [ "$(cat "$GATEWAY_SESSION_DIR/project-root.b64")" != "$_rgp_root" ]; then
     warn "session key is already registered for another project; refusing to change its gateway"
@@ -413,14 +435,14 @@ register_gateway_project() {
   fi
   printf '%s' "$_rgp_root" > "$GATEWAY_SESSION_DIR/project-root.b64" \
     || return 1
-  chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" 2>/dev/null || true
+  chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" || return 1
   # RH_SHELL_SNAPSHOT=off makes every routed command start a login shell instead of loading the
   # session's login shell snapshot (run-on-project-host.sh).
   case "${RH_SHELL_SNAPSHOT:-on}" in
     0|off|no|false) : > "$GATEWAY_SESSION_DIR/shell-snapshot.off" || return 1 ;;
     *) rm -f "$GATEWAY_SESSION_DIR/shell-snapshot.off" ;;
   esac
-}
+)
 
 append_managed_authorized_key() {
   _ak_file="$1"
@@ -470,8 +492,9 @@ update_authorized_key_locked() {
 
   install_project_host_gateway || return 1
 
-  mkdir -p "$AUTHKEY_REF_DIR" 2>/dev/null || return 1
-  printf 'pid=%s\nstarted=%s\n' "$$" "$(date 2>/dev/null || true)" > "$AUTHKEY_TOKEN" 2>/dev/null || return 1
+  private_local_dirs "${AUTHKEY_REF_DIR%/*}" "$AUTHKEY_REF_DIR" 2>/dev/null || return 1
+  [ ! -L "$AUTHKEY_TOKEN" ] || return 1
+  (umask 077; printf 'pid=%s\nstarted=%s\n' "$$" "$(date 2>/dev/null || true)" > "$AUTHKEY_TOKEN") || return 1
 
   # Only the ~/.ssh block is managed (reference-counted and removed on exit); the private file goes
   # away with its session directory.
@@ -530,10 +553,11 @@ release_authorized_key_locked() {
 # supervisor writes only tunnel.log, summarized after the session.
 TUNNEL_SUPERVISOR_PID=""
 TUNNEL_LOG=""
-tunnel_log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$TUNNEL_LOG" 2>/dev/null || true; }
+tunnel_log() (umask 077; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$TUNNEL_LOG" 2>/dev/null || true)
 tunnel_alive() { [ -n "$TUNNEL_PID" ] && [ -n "$TUNNEL_START" ] && [ "$(proc_start "$TUNNEL_PID")" = "$TUNNEL_START" ]; }
 
 tunnel_supervisor() {
+  umask 077  # This background supervisor only creates harness logs and resource records.
   local _owner_start _stop=0 _nap="" _wait=5 _delay=0 _i _sshd_warned=0
   _owner_start=$(proc_start "$$")
   # The launcher stops it with TERM; the flag lets a restart in progress record its ssh first.
@@ -583,7 +607,8 @@ tunnel_supervisor() {
 start_tunnel_supervisor() {
   [ -n "$TUNNEL_PID" ] && [ -n "$LOCAL_SESSION_DIR" ] || return 0  # a reused tunnel is not ours
   TUNNEL_LOG="$LOCAL_SESSION_DIR/tunnel.log"
-  : > "$TUNNEL_LOG" 2>/dev/null || return 0
+  [ ! -L "$TUNNEL_LOG" ] && [ ! -L "$TUNNEL_LOG.ssh" ] || return 1
+  (umask 077; : > "$TUNNEL_LOG"; chmod 600 "$TUNNEL_LOG") || return 1
   tunnel_supervisor </dev/null >/dev/null 2>&1 &
   TUNNEL_SUPERVISOR_PID=$!
 }
@@ -839,12 +864,13 @@ fi
 TARGET="${HOST:-${BOX_USER:-${V_USER:-box}}}-remote-harness"
 safe_target="$(printf '%s' "$TARGET" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | sed 's/^[._-]*//; s/[._-]*$//')"
 [ -n "$safe_target" ] || safe_target=box
-mkdir -p "$HOME/.remote-harness/.sessions" 2>/dev/null || true
+private_local_dirs "$HOME/.remote-harness/.sessions" 2>/dev/null || exit 2
 LOCAL_SESSION_DIR="$(mktemp -d "$HOME/.remote-harness/.sessions/rev.XXXXXX")" || exit 2
 RULE_SESSION_ID="$(basename "$LOCAL_SESSION_DIR")"
 LOCAL_SSH_CONFIG="$LOCAL_SESSION_DIR/ssh_config"
-CFG="$LOCAL_SSH_CONFIG"; touch "$CFG"; chmod 600 "$CFG" 2>/dev/null || true
-write_session_ssh_defaults "$LOCAL_SESSION_DIR" \
+CFG="$LOCAL_SSH_CONFIG"
+(umask 077; : > "$CFG") || exit 2
+(umask 077; write_session_ssh_defaults "$LOCAL_SESSION_DIR") \
   || { err "could not create session SSH runtime directory"; exit 1; }
 # How long the laptop's connections to the box (the tunnel, the agent terminal) wait for an
 # unresponsive server before giving up: RH_KEEPALIVE_TIMEOUT seconds (default 300, the recommended
@@ -903,8 +929,11 @@ trap 'cleanup; exit 143' TERM
 trap 'cleanup; exit 129' HUP
 if [ "$LOCAL_SSHD_MODE" = user ]; then
   LOCAL_SSHD_DIR="$LOCAL_SESSION_DIR/sshd"
+  _setup_umask=$(umask)
+  umask 077
   user_sshd_start "$LOCAL_SSHD_DIR" "$LAPTOP_USER"
   _usd_rc=$?
+  umask "$_setup_umask"
   if [ -n "$USER_SSHD_PID" ]; then
     LOCAL_SSHD_PID="$USER_SSHD_PID" LOCAL_SSHD_START="$USER_SSHD_START" LOCAL_SSHD_CFG="$USER_SSHD_CFG"
     write_local_resource_record
@@ -953,7 +982,7 @@ tunnel_alias_up() {
     if [ -x \"\$rh/scripts/check-tunnel.sh\" ]; then
       \"\$rh/scripts/check-tunnel.sh\" --alias $(sq "$BOX_ALIAS") --port $(sq "$_port")$(box_check_config_arg)
     else
-      ssh $(box_ssh_f_arg) -o BatchMode=yes -o ConnectTimeout=5 $(sq "$BOX_ALIAS") 'printf \"RH_OK %s %s\" \"\$(hostname 2>/dev/null)\" \"\$(id -un 2>/dev/null)\"'
+      ssh $(box_ssh_f_arg) -o BatchMode=yes -o ConnectTimeout=5 $(sq "$BOX_ALIAS") remote-harness-health
     fi
   " 2>/dev/null || true)
   if printf '%s\n' "$out" | grep -q '^SSH=up'; then
@@ -965,10 +994,15 @@ tunnel_alias_up() {
   else
     return 1
   fi
-  local_host=$(hostname 2>/dev/null || true)
-  local_user=$(id -un 2>/dev/null || true)
-  [ -z "$laptop_host" ] || [ -z "$local_host" ] || [ "$laptop_host" = "$local_host" ] || return 1
-  [ -z "$laptop_user" ] || [ -z "$local_user" ] || [ "$laptop_user" = "$local_user" ] || return 1
+  # New gateways return status only. Retain the optional identity checks for older helpers.
+  if [ -n "$laptop_host" ]; then
+    local_host=$(hostname 2>/dev/null || true)
+    [ -z "$local_host" ] || [ "$laptop_host" = "$local_host" ] || return 1
+  fi
+  if [ -n "$laptop_user" ]; then
+    local_user=$(id -un 2>/dev/null || true)
+    [ -z "$local_user" ] || [ "$laptop_user" = "$local_user" ] || return 1
+  fi
   return 0
 }
 
@@ -1283,6 +1317,7 @@ inject_remote_cmd="$(transport_settings_env) \"\${RH_HOME:-\$HOME/.remote-harnes
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
 inject_err="$LOCAL_SESSION_DIR/inject.err"
+[ ! -L "$inject_err" ] && (umask 077; : > "$inject_err"; chmod 600 "$inject_err") || exit 1
 rh_rc=0
 rh_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
      "if command -v timeout >/dev/null 2>&1; then exec timeout -k 5 120 $inject_shell; else exec $inject_shell; fi" \
@@ -1489,7 +1524,10 @@ launch_remote_agent
 CLAUDE_EXIT=$?
 stop_tunnel_supervisor
 if [ "$CLAUDE_EXIT" = 255 ]; then
-  mkdir -p "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null && date +%s > "$LOCAL_RESUME_MARKER" 2>/dev/null || true
+  (umask 077
+    private_local_dirs "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null \
+      && [ ! -L "$LOCAL_RESUME_MARKER" ] && date +%s > "$LOCAL_RESUME_MARKER" \
+      && chmod 600 "$LOCAL_RESUME_MARKER") || true
 fi
 
 # ===========================================================================

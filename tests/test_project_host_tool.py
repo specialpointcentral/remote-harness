@@ -55,7 +55,7 @@ class ToolTests(unittest.TestCase):
         self.mount.mkdir()
         self.args = types.SimpleNamespace(mount_root=str(self.mount), project_root='/project/root',
             tool='rg', warm_socket='', control_path='', concurrency='6',
-            slots_dir=str(Path(self.tmp.name) / 'slots'), runner='unused-runner', ssh_config='unused',
+            slots_dir=str(Path(self.tmp.name) / 'slots'), runner='unused-runner', ssh_config=str(Path(self.tmp.name) / 'ssh_config'),
             alias='project')
         self.ctx = tool.Context(self.args)
         self.old = '/project/root'
@@ -299,14 +299,14 @@ class ToolTests(unittest.TestCase):
             self.assertEqual([json.loads(record) for record in output.splitlines()], expected)
             self.assertFalse(output.endswith(b'\n'))
 
-    def test_small_diagnostics_map_paths_without_becoming_visible(self):
+    def test_small_project_stderr_keeps_exact_bytes_without_becoming_visible(self):
         self.ctx.root, self.ctx.used_mount = self.old, self.new
         stream = Stream()
         with mock.patch.object(tool.sys, 'stderr', stream):
             errors = tool.DiagnosticCapture(self.ctx)
             errors.feed(b'rg: /project/ro')
             errors.feed(b'ot/missing: not found\n')
-            self.assertEqual(errors.finish(), ('rg: ' + self.new + '/missing: not found\n').encode())
+            self.assertEqual(errors.finish(), b'rg: /project/root/missing: not found\n')
         self.assertFalse(errors.emitted)
         self.assertEqual(stream.buffer.getvalue(), b'')
 
@@ -317,7 +317,6 @@ class ToolTests(unittest.TestCase):
             for _ in range(128):
                 errors.feed(b'x' * 65536)
                 self.assertLessEqual(len(errors.pending), errors.LIMIT)
-                self.assertLessEqual(len(errors.rewriter.record), errors.LIMIT)
             self.assertEqual(errors.finish(), b'')
         self.assertTrue(errors.emitted)
         self.assertEqual(stream.count, 8 * 1024 * 1024)
@@ -336,10 +335,8 @@ class ToolTests(unittest.TestCase):
             errors.feed(overflow)
             self.assertEqual(errors.finish(), b'')
         self.assertTrue(errors.emitted)
-        self.assertEqual(stream.buffer.getvalue(),
-                         prefix.replace(self.old.encode(), self.new.encode(), 1) + overflow)
+        self.assertEqual(stream.buffer.getvalue(), prefix + overflow)
         self.assertEqual(errors.pending, b'')
-        self.assertEqual(errors.rewriter.record, b'')
 
     def test_cold_attempt_streams_both_outputs_and_keeps_error_status(self):
         stdout, stderr = CountingStream(), CountingStream()
@@ -375,7 +372,7 @@ class ToolTests(unittest.TestCase):
         return module, held
 
     def test_visible_warm_stderr_prevents_cold_retry(self):
-        def run(_held, _request, _stdout, stderr):
+        def run(_held, _request, _stdout, stderr, **_options):
             stderr(b'e' * 65536)
             stderr(b'e' * 65536)
             return 255
@@ -400,8 +397,12 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(captured, tool.missing_message('rg'))
         self.assertEqual(stderr.buffer.getvalue(), b'')
         self.args.control_path = 'fake-mux'
-        with mock.patch.object(tool, 'run_attempt', side_effect=[
-            (255, False, b'mux: session open refused: no more sessions'), (0, False, b'')]) as attempts, \
+        def capacity_attempt(_command, _rewriter, ctx):
+            ctx.transport_failure = not getattr(ctx, 'capacity_attempted', False)
+            ctx.capacity_attempted = True
+            ctx.transport_detail = b'mux: session open refused: no more sessions'
+            return (255 if ctx.transport_failure else 0), False, b''
+        with mock.patch.object(tool, 'run_attempt', side_effect=capacity_attempt) as attempts, \
              mock.patch.object(tool, 'stop_master') as stop, mock.patch.object(tool.sys, 'stderr', Stream()):
             self.assertEqual(tool.route(self.ctx, str(self.mount), ['x']), 0)
             self.assertEqual(attempts.call_count, 2)
@@ -411,7 +412,7 @@ class ToolTests(unittest.TestCase):
             tool.route(self.ctx, str(self.mount), ['x'])
 
     def test_warm_missing_tool_is_detected_and_visible_stdout_does_not_retry(self):
-        def missing(_held, _request, _stdout, stderr):
+        def missing(_held, _request, _stdout, stderr, **_options):
             stderr(tool.missing_message('rg'))
             return 127
         module, _ = self.fake_warm_pool(missing)
@@ -419,7 +420,7 @@ class ToolTests(unittest.TestCase):
              mock.patch.object(tool, 'run_attempt') as cold, self.assertRaises(tool.ToolMissing):
             tool.route(self.ctx, str(self.mount), ['x'])
         cold.assert_not_called()
-        def partial(_held, _request, stdout, _stderr):
+        def partial(_held, _request, stdout, _stderr, **_options):
             stdout(b'partial output')
             return 255
         module, _ = self.fake_warm_pool(partial)

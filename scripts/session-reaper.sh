@@ -37,13 +37,23 @@ HEARTBEAT_INTERVAL="${RH_HEARTBEAT_INTERVAL:-30}"
 HEARTBEAT_TIMEOUT="${RH_HEARTBEAT_TIMEOUT:-600}"
 RESOURCE_LOCK_HELD=0
 
+# Keep setup private even when this library is sourced by a caller with a permissive umask.
+# Only the explicitly named harness directories change mode; never recurse into project files.
+private_session_dirs() (
+  umask 077
+  for _psd_dir in "$@"; do
+    [ ! -L "$_psd_dir" ] && mkdir -p "$_psd_dir" && chmod 700 "$_psd_dir" || exit 1
+  done
+)
+
 # All mount registration, release and GC decisions use this lock. A missing owner record is
 # treated as uncertain; never steal a lock merely because its holder is slow.
 resource_lock() {
-  mkdir -p "$SESSIONS" || return 1
+  private_session_dirs "$SESSIONS" || return 1
   RESOURCE_LOCK="$SESSIONS/.resources.lock"
   _rl_i=0
-  while ! mkdir "$RESOURCE_LOCK" 2>/dev/null; do
+  while ! mkdir -m 700 "$RESOURCE_LOCK" 2>/dev/null; do
+    [ ! -L "$RESOURCE_LOCK" ] || return 1
     _rl_pid=$(kv "$RESOURCE_LOCK/owner" PID)
     case "$_rl_pid" in
       ''|*[!0-9]*) ;;
@@ -59,7 +69,7 @@ resource_lock() {
     [ "$_rl_i" -lt 30 ] || return 1
     sleep 1
   done
-  printf 'PID=%s\nSTART=%s\n' "$$" "$(printf '%s' "$(process_start "$$")" | base64 | tr -d '\n')" > "$RESOURCE_LOCK/owner"
+  (umask 077; printf 'PID=%s\nSTART=%s\n' "$$" "$(printf '%s' "$(process_start "$$")" | base64 | tr -d '\n')" > "$RESOURCE_LOCK/owner") || return 1
   RESOURCE_LOCK_HELD=1
 }
 
@@ -89,14 +99,17 @@ reference_live() {
 }
 
 # Register the actual mount transport separately from the session's command transport.
-register_mount_lease() { # session id, physical mountpoint, command config, mount config, alias
+register_mount_lease() ( # session id, physical mountpoint, command config, mount config, alias
+  umask 077
   _rml_dir=$(lease_dir "$1") || return 1
   [ ! -f "$_rml_dir/lease.env" ] || return 1
   _rml_record=$(mount_record "$2")
   if [ -f "$_rml_record" ] && { [ "$(kv_b64 "$_rml_record" MOUNTPOINT)" != "$2" ] || [ "$(kv_b64 "$_rml_record" SSH_CONFIG)" != "$4" ]; }; then
     return 1
   fi
-  mkdir -p "$_rml_dir" "$SESSIONS/.mounts" || return 1
+  private_session_dirs "$_rml_dir" "$SESSIONS/.mounts" || return 1
+  [ ! -L "$_rml_dir/lease.env" ] && [ ! -L "$_rml_record" ] || return 1
+  [ ! -f "$_rml_record" ] || chmod 600 "$_rml_record" || return 1
   {
     printf 'MOUNTPOINT=%s\n' "$(printf '%s' "$2" | base64 | tr -d '\n')"
     printf 'SSH_CONFIG=%s\n' "$(printf '%s' "$3" | base64 | tr -d '\n')"
@@ -108,7 +121,7 @@ register_mount_lease() { # session id, physical mountpoint, command config, moun
       "$(printf '%s' "$4" | base64 | tr -d '\n')" \
       "$(printf '%s' "$5" | base64 | tr -d '\n')" > "$_rml_record"
   fi
-}
+)
 
 # Probed once: b64d mostly runs inside $(...), where a lazily cached flag would be lost.
 if printf '' | base64 --decode >/dev/null 2>&1; then B64D_FLAG=--decode
@@ -225,11 +238,13 @@ resume_marker() {  # $1=session dir
   printf '%s/.resume/%s.%s' "$SESSIONS" "$(printf '%s' "$_rm_mp" | tr '/+=' '_.-')" "$_rm_agent"
 }
 
-mark_disconnected() {  # $1=session dir $2=reason
+mark_disconnected() (  # $1=session dir $2=reason
+  umask 077
   _md_file=$(resume_marker "$1") || return 0
-  mkdir -p "$SESSIONS/.resume" 2>/dev/null || return 0
-  printf 'REASON=%s\nTIME=%s\n' "$2" "$(date +%s)" > "$_md_file.tmp" && mv "$_md_file.tmp" "$_md_file"
-}
+  private_session_dirs "$SESSIONS/.resume" 2>/dev/null || return 1
+  [ ! -L "$_md_file.tmp" ] && [ ! -L "$_md_file" ] || return 1
+  printf 'REASON=%s\nTIME=%s\n' "$2" "$(date +%s)" > "$_md_file.tmp" && chmod 600 "$_md_file.tmp" && mv "$_md_file.tmp" "$_md_file"
+)
 
 terminate_owner() {
   owner_record "$1"
@@ -351,6 +366,9 @@ remove_ssh_config() {  # mirrors the local launcher's box-side cleanup
   fi
   kill_session_processes "" "$1"
   rm -f "$1" "$_rsc_dir/id_ed25519" "$_rsc_dir/id_ed25519.pub" 2>/dev/null || true
+  # Setup can die between creating a private config temp and its atomic rename. These are the
+  # only additional files this transport owns; retain unrelated files rather than removing the dir.
+  rm -f "$_rsc_dir"/.rh-strip.* "$_rsc_dir"/.rh-cfg.* "$1".rh-strip.* "$1".rh-new.* 2>/dev/null || true
   rm -rf "$_rsc_dir/runtime" 2>/dev/null || true
   rmdir "$_rsc_dir" 2>/dev/null || true
 }
@@ -408,11 +426,13 @@ reap() {  # $1=session dir $2=--session-only?
 }
 
 # A mount lease that never became an agent session gets a session.env so reap can release it.
-lease_session_env() {  # $1=lease dir
+lease_session_env() (  # $1=lease dir
+  umask 077
+  [ ! -L "$1" ] && [ ! -L "$1/session.env" ] || return 1
   printf 'MOUNTPOINT=%s\nSSH_CONFIG=%s\nLEASE_DIR=%s\nMOUNT_SSH_CONFIG=%s\n' \
     "$(kv "$1/lease.env" MOUNTPOINT)" "$(kv "$1/lease.env" SSH_CONFIG)" \
     "$(printf '%s' "$1" | base64 | tr -d '\n')" "$(kv "$1/lease.env" MOUNT_SSH_CONFIG)" > "$1/session.env"
-}
+)
 
 release_session() {
   resource_lock || return 1
@@ -472,7 +492,7 @@ watch() {
 }
 
 gc() {
-  mkdir -p "$SESSIONS" 2>/dev/null || return 0
+  private_session_dirs "$SESSIONS" 2>/dev/null || return 1
   resource_lock || return 0
   trap resource_unlock EXIT
   trap 'resource_unlock; exit 1' HUP INT TERM

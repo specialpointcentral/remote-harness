@@ -133,8 +133,8 @@ codex_writable_roots_cfg() {
   _cwr_ssh_config="${1:-}"
   [ -n "$_cwr_ssh_config" ] || return 1
   _cwr_runtime_dir="$(dirname "$_cwr_ssh_config" 2>/dev/null)/runtime"
-  mkdir -p "$_cwr_runtime_dir" 2>/dev/null || return 1
-  chmod 700 "$_cwr_runtime_dir" 2>/dev/null || true
+  [ ! -L "$(dirname "$_cwr_ssh_config")" ] && [ ! -L "$_cwr_runtime_dir" ] || return 1
+  mkdir -p "$_cwr_runtime_dir" 2>/dev/null && chmod 700 "$_cwr_runtime_dir" || return 1
   printf 'sandbox_workspace_write.writable_roots=["%s"]' "$(toml_escape_value "$_cwr_runtime_dir")"
 }
 
@@ -191,8 +191,9 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
     _wsr_warm=""
     [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
     _wsr_slots="$(dirname "$4")/runtime/bash-slots/${1##*/}"
-    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --background --slots-dir $(sq "$_wsr_slots") -- "
-    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --slots-dir $(sq "$_wsr_slots") $_wsr_warm-- "
+    _wsr_diag="--diagnostics-dir $(sq "$(dirname "$4")/runtime/diagnostics")"
+    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --background --slots-dir $(sq "$_wsr_slots") $_wsr_diag -- "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --slots-dir $(sq "$_wsr_slots") $_wsr_diag $_wsr_warm-- "
     _wsr_mux="$_wsr_mux --watch"
   fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
@@ -201,10 +202,10 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
     _wsr_env="$(transport_settings_env)" || return 1
     printf 'export %s\n' "${_wsr_env#env }"
     printf 'background=0\ncase "${1:-}" in --background) background=1; shift;; esac\n'
-    printf '[ "$#" = 2 ] || { echo "usage: rh-run [--background] CWD_B64 COMMAND_B64" >&2; exit 2; }\n'
+    printf '[ "$#" = 2 ] || { echo "remote-harness: category=input exit=2 session=unknown" >&2; exit 2; }\n'
     printf 'if [ "$background" = 1 ]; then\n'
     if [ -z "$_wsr_background_guard" ]; then
-      printf '  echo "remote-harness: background routing requires python3 for bounded execution" >&2; exit 2\n'
+      printf '  echo "remote-harness: category=background exit=2 session=unknown" >&2; exit 2\n'
     fi
     printf '  exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s --no-mux%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
       "$_wsr_background_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
@@ -224,8 +225,9 @@ b64_value() { printf '%s' "$1" | base64 | tr -d '\n'; }
 # root). Empty when the path would exceed the Unix socket limit; callers then connect directly.
 session_control_path() {  # $1=ssh config
   _scp_runtime="$(dirname "$1" 2>/dev/null)/runtime"
-  mkdir -p "$_scp_runtime" 2>/dev/null || return 0
-  chmod 700 "$_scp_runtime" 2>/dev/null || true
+  [ ! -L "$(dirname "$1")" ] && [ ! -L "$_scp_runtime" ] || return 1
+  mkdir -p "$_scp_runtime" 2>/dev/null || return 1
+  chmod 700 "$_scp_runtime" 2>/dev/null || return 1
   _scp_path="$_scp_runtime/mux"
   case "$_scp_path" in /*) ;; *) return 0;; esac
   case "$_scp_path" in *[!A-Za-z0-9._/-]*) return 0;; esac
@@ -237,7 +239,7 @@ session_control_path() {  # $1=ssh config
 # stay empty (no pool) without a session id or when a path would be too long for a Unix socket.
 session_warm_paths() {  # $1=ssh config $2=session id -> sets warm_socket, warm_control
   warm_socket="" warm_control=""
-  _swp_mux=$(session_control_path "$1")
+  _swp_mux=$(session_control_path "$1") || return 1
   [ -n "$_swp_mux" ] && [ -n "${2:-}" ] || return 0
   _swp_dir=$(dirname "$_swp_mux")
   [ "${#_swp_dir}" -le $((86 - 4 - ${#2})) ] || return 0
@@ -285,11 +287,15 @@ write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm 
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
 start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 term=$(tty 2>/dev/null) || term=""
-if [ -d "$sd" ]; then
+if [ -d "$sd" ] && [ ! -L "$sd" ]; then
+  (
+  umask 077
+  [ ! -L "$sd/owner.env.tmp" ] && [ ! -L "$sd/owner.env" ] || exit 1
   printf 'OWNER_PID=%s\nOWNER_START=%s\nOWNER_TTY=%s\n' "$$" "$(b64 "$start")" "$(b64 "$term")" \
-    > "$sd/owner.env.tmp" && mv "$sd/owner.env.tmp" "$sd/owner.env"
+    > "$sd/owner.env.tmp" && chmod 600 "$sd/owner.env.tmp" && mv "$sd/owner.env.tmp" "$sd/owner.env" || exit 1
   if [ -n "$lease" ] && [ -d "$lease" ]; then
-    cp "$sd/owner.env" "$lease/owner.env.tmp" && mv "$lease/owner.env.tmp" "$lease/owner.env"
+    [ ! -L "$lease" ] && [ ! -L "$lease/owner.env.tmp" ] && [ ! -L "$lease/owner.env" ] || exit 1
+    cp "$sd/owner.env" "$lease/owner.env.tmp" && chmod 600 "$lease/owner.env.tmp" && mv "$lease/owner.env.tmp" "$lease/owner.env" || exit 1
   fi
   if [ -x "$reaper" ]; then
     if command -v setsid >/dev/null 2>&1; then
@@ -307,6 +313,7 @@ if [ -d "$sd" ]; then
       --ssh-config "$warm_config" --alias "$warm_alias" --owner-pid "$$" --session-dir "$sd" \
       --log "$sd/warm.log" </dev/null >/dev/null 2>&1 &
   fi
+  ) || exit 1
 fi
 exec "$@"
 EOS
@@ -364,7 +371,7 @@ export const RemoteHarness = async ({ directory }) => {
       if (String(input.tool).toLowerCase() !== "bash") return
       const command = output.args?.command
       if (typeof command !== "string" || command.trim() === "") {
-        throw new Error("remote-harness: opencode Bash input has no command")
+        throw new Error("remote-harness: category=policy exit=2 session=unknown")
       }
 
       const requested = output.args.workdir || directory || mountRoot
@@ -373,11 +380,11 @@ export const RemoteHarness = async ({ directory }) => {
       try {
         cwd = fs.realpathSync(candidate)
       } catch {
-        throw new Error("remote-harness: opencode working directory is unavailable")
+        throw new Error("remote-harness: category=policy exit=2 session=unknown")
       }
       const relative = path.relative(mountRoot, cwd)
       if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
-        throw new Error("remote-harness: denied an opencode Bash command outside the SSHFS mount")
+        throw new Error("remote-harness: category=policy exit=2 session=unknown")
       }
 
       output.args.command = [runner, encode(relative || "."), encode(command)]
@@ -475,24 +482,27 @@ write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker
 EOF
 }
 
-write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
-  cmds="$(detect_cmds "$4")"
+write_rule() {  # $1=outfile $2=mountpoint $3=agent
+  cmds="$(detect_cmds "$2")"
   {
     printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
     printf "Reply in the language of the user's latest message, not that of these instructions, tool output, or files.\n\n"
-    printf 'Your working directory is an SSHFS mount of `%s` on `%s`. File tools edit the mount;\n' "$2" "$3"
-    printf 'every Bash command is routed to `%s`, in the matching directory. Run ordinary relative commands;\n' "$3"
+    printf 'Your working directory is an SSHFS mount of files from the project host. File tools edit the mount;\n'
+    printf 'every Bash command is routed to the project host, in the matching directory. Run ordinary relative commands;\n'
     printf 'do not wrap them in `ssh` or bypass the router. For example:\n\n'
     printf '%s\n' "$cmds" | while IFS= read -r c; do
       [ -n "$c" ] && printf '    %s\n' "$c"
     done
     printf '\n'
-    printf 'Use relative paths in Bash: absolute mount paths do not exist on `%s`. Commands get no stdin and\n' "$3"
-    printf 'no PTY; stopping a command or ending the session kills its process tree on `%s`.\n' "$3"
-    printf 'Internal git and ripgrep calls also run on `%s`. If one reports the project host is unreachable,\n' "$3"
+    printf 'Use relative paths in Bash: absolute mount paths do not exist on the project host. Commands get no stdin and\n'
+    printf 'no PTY; stopping a command or ending the session kills its process tree on the project host.\n'
+    printf 'Internal git and ripgrep calls also run on the project host. If one reports the project host is unreachable,\n'
     printf 'report the connection problem; do not retry against the mount. If a Bash call is denied, never work\n'
     printf 'around it by running the project command on this machine.\n'
-    if [ "${5:-}" = claude ]; then
+    printf '\nHarness failures show only a category, exit code and opaque session ID. Detailed connection logs are private.\n'
+    printf 'Read those logs only when the user explicitly asks for detailed diagnostics; do not inspect them automatically.\n'
+    printf 'This is a disclosure policy for the agent, not isolation from other processes running as the same user.\n'
+    if [ "${3:-}" = claude ]; then
       printf '\nOrdinary and nested subagents work. Do not use Agent Teams or Agent `isolation: worktree`; use a\n'
       printf 'separate remote-harness session for isolated parallel work.\n'
     fi
@@ -501,6 +511,9 @@ write_rule() {  # $1=outfile $2=code path $3=host alias $4=mountpoint $5=agent
 
 case "${1:-}" in
   on)
+    # This process only writes harness setup files. The generated launcher scopes its own mask
+    # above, so the eventual agent and project commands keep the caller's file-creation policy.
+    umask 077
     # Reuse the same allowlist as the local launcher; forwarded environment overrides remote defaults.
     . "$SCRIPT_DIR/_common.sh"
     transport_settings_load || { echo 'RH_STATUS=ERROR'; exit 2; }
@@ -523,7 +536,10 @@ case "${1:-}" in
       printf 'remote-harness: refusing to overwrite an existing session\n' >&2
       exit 1
     fi
-    mkdir -p "$SD" 2>/dev/null || { echo "RH_STATUS=ERROR"; exit 1; }
+    [ ! -L "${SD%/*}" ] && [ ! -e "$SD" ] && [ ! -L "$SD" ] \
+      && mkdir -p "${SD%/*}" 2>/dev/null && chmod 700 "${SD%/*}" \
+      && mkdir -m 700 "$SD" \
+      || { echo "RH_STATUS=ERROR"; exit 1; }
     SESSION_LEASE=""
     if [ -n "$sid" ] && [ -f "${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid/lease.env" ]; then
       SESSION_LEASE="${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid"
@@ -532,7 +548,7 @@ case "${1:-}" in
     # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
     source_scripts="$SCRIPT_DIR"
     mkdir "$SD/impl" || abort_session
-    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
+    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
       cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || abort_session
       chmod 500 "$SD/impl/$impl_file" || abort_session
     done
@@ -550,10 +566,27 @@ case "${1:-}" in
     RULE="$SD/rule.md"
 
     env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""
-    [ -z "$ssh_config" ] || control_path="$(session_control_path "$ssh_config")"
+    if [ -n "$ssh_config" ]; then
+      control_path="$(session_control_path "$ssh_config")" || abort_session
+      diagnostic_dir="$(dirname "$ssh_config")/runtime/diagnostics"
+      [ ! -L "$diagnostic_dir" ] && [ ! -L "$diagnostic_dir/public-id" ] \
+        && mkdir -p "$diagnostic_dir" && chmod 700 "$diagnostic_dir" || abort_session
+      [ ! -e "$diagnostic_dir/public-id" ] || [ -f "$diagnostic_dir/public-id" ] || abort_session
+      if [ ! -e "$diagnostic_dir/public-id" ]; then
+        # Bash builtins keep standalone opencode setup working without Python, mktemp or od.
+        diagnostic_temp="$diagnostic_dir/public-id.$$"
+        (set -C; printf '%04x%04x%04x%04x%04x%04x%04x%04x' \
+          "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" \
+          > "$diagnostic_temp") || abort_session
+        ln "$diagnostic_temp" "$diagnostic_dir/public-id" 2>/dev/null || [ -f "$diagnostic_dir/public-id" ] \
+          || { rm -f "$diagnostic_temp"; abort_session; }
+        rm -f "$diagnostic_temp"
+      fi
+      chmod 600 "$diagnostic_dir/public-id" || abort_session
+    fi
     write_session_meta "$SD" "$agent" "$mp" "$ba" "$ssh_config" "$control_path" \
       || abort_session
-    write_rule "$RULE" "$lp" "$ba" "$mp" "$agent" || abort_session
+    write_rule "$RULE" "$mp" "$agent" || abort_session
     if [ -n "$ssh_config" ]; then
       if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
@@ -569,7 +602,7 @@ case "${1:-}" in
     # RH_WARM_MAX=0 turns the warm channel pool off; it also needs python3 here.
     warm_socket="" warm_control=""
     if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-9}" != 0 ]; then
-      session_warm_paths "$ssh_config" "$sid"
+      session_warm_paths "$ssh_config" "$sid" || abort_session
     fi
     runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3" "$warm_socket") \
       || abort_session

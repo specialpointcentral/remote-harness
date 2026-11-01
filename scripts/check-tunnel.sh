@@ -75,12 +75,16 @@ err="$(mktemp "$RH_HOME/.sessions/rh-check-tunnel.XXXXXX" 2>/dev/null)" || err="
 TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 20"
 out=$($TO ssh "${SSH_ARGS[@]}" -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$ALIAS" \
         remote-harness-health 2>"$err") || true
-if printf '%s' "$out" | grep -q '^RH_OK'; then
+case "$out" in
+RH_OK|RH_OK\ *)
   emit SSH up
-  emit LAPTOP_HOSTNAME "$(printf '%s' "$out" | awk '{print $2}')"
-  emit LAPTOP_USER "$(printf '%s' "$out" | awk '{print $3}')"
-else
+  # Preserve the legacy output keys without copying identity fields from older gateways.
+  emit LAPTOP_HOSTNAME ""
+  emit LAPTOP_USER ""
+  ;;
+*)
   emit SSH down
   emit ERROR "$(tr '\n' ' ' < "$err" 2>/dev/null | sed 's/  */ /g' | cut -c1-300)"
-fi
+  ;;
+esac
 rm -f "$err" 2>/dev/null || true

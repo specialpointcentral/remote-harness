@@ -46,6 +46,7 @@ class Claim:
     def __init__(self, conn: socket.socket, fds: list[int]) -> None:
         self.conn = conn
         self.stdin, self.stdout, self.stderr = fds
+        self.transport_failure = False
         for fd in fds:
             os.set_inheritable(fd, False)
 
@@ -88,7 +89,9 @@ def claim(path: str, wait_seconds: float = 0.0) -> Claim | None:
                     fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
             if data == b"OK\n" and len(fds) == 3:
                 conn.settimeout(None)
-                return Claim(conn, list(fds))
+                held = Claim(conn, list(fds))
+                held.diagnostics_directory = os.path.join(os.path.dirname(path), "diagnostics")
+                return held
         except OSError:
             pass
         for fd in fds:
@@ -100,7 +103,7 @@ def claim(path: str, wait_seconds: float = 0.0) -> Claim | None:
         time.sleep(min(0.02, remaining))
 
 
-def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
+def run(held: Claim, request: str, on_stdout, on_stderr, diagnostics=None, report_failures=True) -> int:
     """Send `request` (one line) on the claimed channel, pass its output to on_stdout/on_stderr until
     both streams end and the broker reports the exit status, and return that status.
 
@@ -111,6 +114,26 @@ def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
     Exceptions from the callbacks (BrokenPipeError) propagate.
     """
     import select
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import diagnostics as diagnostic_helpers
+
+    if diagnostics is None and getattr(held, "diagnostics_directory", ""):
+        try:
+            diagnostics = diagnostic_helpers.Diagnostics(held.diagnostics_directory)
+        except diagnostic_helpers.Unavailable:
+            on_stderr(diagnostic_helpers.summary("diagnostics", 255))
+            # Nothing was sent. Failing here rather than falling back avoids a command with no log.
+            return 255
+
+    def failure(category: str, detail: bytes = b"") -> None:
+        held.transport_failure = True
+        if diagnostics and detail:
+            try:
+                diagnostics.record(detail)
+            except diagnostic_helpers.Unavailable:
+                category = "diagnostics"
+        if report_failures:
+            on_stderr(diagnostic_helpers.summary(category, 255, diagnostics.session if diagnostics else "unknown"))
 
     line = request.encode() + b"\n"
     try:
@@ -127,6 +150,7 @@ def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
     acked = False
     status = None
     reply = b""
+    broker_failure = ""
 
     def acknowledge(rest: bytes) -> None:
         nonlocal acked
@@ -151,24 +175,27 @@ def run(held: Claim, request: str, on_stdout, on_stderr) -> int:
                     head += data
                     if head.startswith(GOT):
                         acknowledge(head[len(GOT):])
+                    # Unexpected pre-ACK output is an uncertain delivery too. It cannot justify
+                    # replaying Bash or copying framework output into the project's stream.
                     elif not GOT.startswith(head):
-                        acknowledge(head)  # not the protocol: treat it as delivered, never retry
+                        failure("delivery_uncertain", head + b"".join(early_err))
+                        return 255
                 continue
             data = held.conn.recv(64)
             reply += data
             if not data or reply.endswith(b"\n"):
                 poller.unregister(fd)
                 parts = reply.split()
-                status = int(parts[1]) if len(parts) == 2 and parts[0] == b"EXIT" and parts[1].isdigit() else 255
+                status = int(parts[1]) if len(parts) in (2, 3) and parts[0] == b"EXIT" and parts[1].isdigit() else 255
+                if len(parts) == 3 and parts[2] == b"SSH":
+                    broker_failure = "ssh"
                 if acked and not data and not reply:
-                    on_stderr(b"remote-harness: the warm channel pool stopped before the command finished\n")
+                    broker_failure = "pool"
     if not acked:
-        detail = b"".join(early_err).decode("utf-8", "replace").strip()[-200:]
-        on_stderr(("remote-harness: warm request delivery is uncertain; the complete request was sent "
-                   "but no acknowledgment arrived; not retrying Bash\n").encode())
-        if detail:
-            on_stderr((detail + "\n").encode())
+        failure("delivery_uncertain", head + b"".join(early_err))
         return 255
+    if broker_failure:
+        failure(broker_failure)
     return status
 
 
@@ -212,7 +239,22 @@ def serve(argv: list[str]) -> int:
         return 0
 
     os.umask(0o077)
-    log_file = open(opt["log"], "ab", buffering=0)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import diagnostics as diagnostic_helpers
+    diagnostic_store = diagnostic_helpers.Diagnostics(os.path.join(os.path.dirname(sock_path), "diagnostics"))
+    def private_opener(path: str, flags: int) -> int:
+        import stat
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise diagnostic_helpers.Unavailable()
+            os.fchmod(fd, 0o600)
+        except (OSError, diagnostic_helpers.Unavailable):
+            os.close(fd)
+            raise
+        return fd
+
+    log_file = open(opt["log"], "ab", buffering=0, opener=private_opener)
 
     def log(message: str) -> None:
         try:
@@ -223,7 +265,7 @@ def serve(argv: list[str]) -> int:
         except OSError:
             pass
 
-    lock = open(sock_path + ".lock", "w")
+    lock = open(sock_path + ".lock", "w", opener=private_opener)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -261,10 +303,10 @@ def serve(argv: list[str]) -> int:
     # shorter still, because these keepalives queue behind SSHFS traffic in the same reverse tunnel.
     ssh_base = ["ssh", "-F", opt["ssh_config"], "-T", "-o", "ClearAllForwardings=yes", "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3",
-                "-o", f"ControlPath={control}"]
+                "-o", "LogLevel=ERROR", "-o", "ProxyJump=none", "-o", f"ControlPath={control}"]
 
     class Channel:
-        def __init__(self, proc: subprocess.Popen, now: float) -> None:
+        def __init__(self, proc: subprocess.Popen, now: float, diagnostic_log: str) -> None:
             self.proc, self.started, self.ready_at = proc, now, 0.0
             self.state = "new"  # -> opening -> ready -> handed, or -> closing
             self.number = state["sequence"]
@@ -272,6 +314,7 @@ def serve(argv: list[str]) -> int:
             self.out = b""
             self.err = b""
             self.conn: socket.socket | None = None
+            self.diagnostic_log = diagnostic_log
 
     sel = selectors.DefaultSelector()
     wake_r, wake_w = os.pipe()
@@ -311,7 +354,8 @@ def serve(argv: list[str]) -> int:
         owned.pop(control, None)
         stop_old_master()
         state["master"] = subprocess.Popen(
-            ssh_base + ["-N", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "Compression=yes",
+            ssh_base + ["-E", diagnostic_store.new_log(), "-N", "-o", "ProxyCommand=none",
+                        "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "Compression=yes",
                         opt["alias"]],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_file)
         state["master_started"] = now
@@ -355,7 +399,9 @@ def serve(argv: list[str]) -> int:
         if ch.proc.poll() is None:
             ch.proc.terminate()
         if was == "opening":
-            detail = ch.err.decode("utf-8", "replace").strip().splitlines()
+            with open(ch.diagnostic_log, "rb") as source:
+                raw = source.read(65536)
+            detail = (ch.err + raw).decode("utf-8", "replace").strip().splitlines()
             detail_text = detail[-1] if detail else ""
             if "unsupported SSH command" in detail_text:
                 state["disabled"] = True
@@ -372,11 +418,12 @@ def serve(argv: list[str]) -> int:
     def spawn(now: float) -> None:
         # OpenSSH otherwise silently falls back to a fresh TCP connection if the mux session is
         # refused. The existing master is tried first; false prevents only that new-connection path.
-        proc = subprocess.Popen(ssh_base + ["-o", "ControlMaster=no", "-o", "ProxyCommand=false",
+        diagnostic_log = diagnostic_store.new_log()
+        proc = subprocess.Popen(ssh_base + ["-E", diagnostic_log, "-o", "ControlMaster=no", "-o", "ProxyCommand=false",
                                            opt["alias"], "remote-harness-wait"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         state["sequence"] += 1
-        ch = Channel(proc, now)
+        ch = Channel(proc, now, diagnostic_log)
         for stream, which in ((proc.stdout, "out"), (proc.stderr, "err")):
             os.set_blocking(stream.fileno(), False)
             sel.register(stream, selectors.EVENT_READ, (which, ch))
@@ -466,7 +513,8 @@ def serve(argv: list[str]) -> int:
                 continue
             if ch.state == "handed" and ch.conn is not None:
                 try:
-                    ch.conn.sendall(f"EXIT {code if 0 <= code <= 255 else 255}\n".encode())
+                    suffix = " SSH" if code == 255 and os.path.getsize(ch.diagnostic_log) else ""
+                    ch.conn.sendall(f"EXIT {code if 0 <= code <= 255 else 255}{suffix}\n".encode())
                 except OSError:
                     pass
                 ch.conn.close()
@@ -600,6 +648,11 @@ def serve(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["serve"]:
-        raise SystemExit(serve(sys.argv[2:]))
+        try:
+            status = serve(sys.argv[2:])
+        except Exception:
+            sys.stderr.write("remote-harness: category=framework exit=255 session=unknown\n")
+            status = 255
+        raise SystemExit(status)
     sys.stderr.write(USAGE + "\n")
     raise SystemExit(2)

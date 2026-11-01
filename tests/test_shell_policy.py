@@ -68,7 +68,7 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertEqual(hook['permissionDecision'], 'deny', hook)
         result = self.dispatch(command)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('Agent processes must run on the remote', result.stderr)
+        self.assertEqual(result.stderr, 'remote-harness: category=framework exit=2 session=unknown\n')
         self.assertFalse(self.started.exists())
 
     def use_bash(self):
@@ -118,7 +118,7 @@ class ShellPolicyTests(unittest.TestCase):
                 self.assertEqual(self.route(command)['permissionDecision'], 'deny')
                 result = self.dispatch(command)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('could not safely parse', result.stderr)
+                self.assertEqual(result.stderr, 'remote-harness: category=framework exit=2 session=unknown\n')
                 self.assertFalse(self.started.exists())
 
     def test_ansi_c_encoded_data_preserves_bash_behavior(self):
@@ -150,7 +150,7 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertEqual(self.route(command)['permissionDecision'], 'deny')
         result = self.dispatch(command)
         self.assertEqual(result.returncode, 2)
-        self.assertIn('could not safely parse', result.stderr)
+        self.assertEqual(result.stderr, 'remote-harness: category=framework exit=2 session=unknown\n')
 
     def test_quoted_heredoc_accepts_apostrophes_and_literal_agent_names(self):
         body = "can't do this\nclaude -p example\ncodex exec example\nopencode run\n"
@@ -219,7 +219,7 @@ class ShellPolicyTests(unittest.TestCase):
                 self.assertEqual(self.route(command)['permissionDecision'], 'deny')
                 result = self.dispatch(command)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('could not safely parse', result.stderr)
+                self.assertEqual(result.stderr, 'remote-harness: category=framework exit=2 session=unknown\n')
 
     def test_hook_check_only_does_not_execute_commands(self):
         command = 'touch ' + shlex.quote(str(self.started))
@@ -235,7 +235,7 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertEqual(self.route(command)['permissionDecision'], 'allow')
         result = self.dispatch(command)
         self.assertEqual(result.returncode, 126)
-        self.assertIn('Agent processes must run on the remote', result.stderr)
+        self.assertEqual(result.stderr, 'remote-harness: category=policy exit=126 session=unknown\n')
         self.assertFalse(self.started.exists())
 
 

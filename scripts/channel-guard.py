@@ -27,6 +27,13 @@ import sys
 child: subprocess.Popen | None = None
 held = None  # the claimed warm channel, while one is in use
 cancelled = 0
+diagnostics = None
+
+
+def diagnostic_helpers():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import diagnostics as helpers
+    return helpers
 
 B64 = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
@@ -67,7 +74,8 @@ def run_warm(socket_path: str, request: str, wait_seconds: float = 0.25) -> int 
     try:
         if cancelled:
             return 128 + cancelled
-        return warm_pool.run(held, request, lambda data: write_all(1, data), lambda data: write_all(2, data))
+        return warm_pool.run(held, request, lambda data: write_all(1, data), lambda data: write_all(2, data),
+                             diagnostics=diagnostics)
     except warm_pool.NotDelivered:
         return None
     except BrokenPipeError:
@@ -138,7 +146,7 @@ def main() -> int:
         if argv[0] == "--background":
             background = True
             argv = argv[1:]
-        elif argv[0] in ("--warm", "--warm-request", "--slots-dir") and len(argv) >= 2:
+        elif argv[0] in ("--warm", "--warm-request", "--slots-dir", "--diagnostics-dir") and len(argv) >= 2:
             options[argv[0]] = argv[1]
             argv = argv[2:]
         else:
@@ -146,10 +154,16 @@ def main() -> int:
     if argv[:1] == ["--"]:
         argv = argv[1:]
     if not argv:
-        sys.stderr.write("usage: channel-guard.py [--background] [--slots-dir PATH] "
-                         "[--warm SOCKET --warm-request LINE] -- <command> [args...]\n")
+        sys.stderr.write("remote-harness: category=input exit=2 session=unknown\n")
         return 2
-    global child
+    global child, diagnostics
+    helpers = diagnostic_helpers()
+    if options.get("--diagnostics-dir"):
+        try:
+            diagnostics = helpers.Diagnostics(options["--diagnostics-dir"])
+        except helpers.Unavailable:
+            write_all(2, helpers.summary("diagnostics", 255))
+            return 255
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, forward)
     warm = not background and options.get("--warm") and valid_request(options.get("--warm-request", ""))
@@ -169,11 +183,13 @@ def main() -> int:
             if status is not None:
                 return status
             if slot is None:
-                kind = "background" if background else "foreground fallback"
-                sys.stderr.write(f"remote-harness: too many concurrent {kind} project-host calls\n")
+                write_all(2, helpers.summary("capacity", 255, diagnostics.session if diagnostics else "unknown"))
                 return 255
         if cancelled:
             return 128 + cancelled
+        log = diagnostics.new_log() if diagnostics else None
+        if log:
+            argv += ["--diagnostic-log", log, "--diagnostic-id", diagnostics.session]
         child = subprocess.Popen(argv, stdin=subprocess.PIPE)
         while child.poll() is None:
             if cancelled:
@@ -191,6 +207,9 @@ def main() -> int:
         status = child.returncode
         if child.stdin is not None:
             child.stdin.close()
+        normalized = 128 + cancelled if cancelled else (status if status >= 0 else 128 - status)
+        if diagnostics and normalized == 255 and not cancelled and os.path.getsize(log):
+            diagnostics.emit("ssh", normalized)
     finally:
         if slot is not None:
             os.close(slot)
@@ -200,4 +219,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        result = main()
+    except Exception:
+        helpers = diagnostic_helpers()
+        if diagnostics:
+            try:
+                import traceback
+                diagnostics.record(traceback.format_exc().encode())
+            except helpers.Unavailable:
+                pass
+        write_all(2, helpers.summary("framework", 255, diagnostics.session if diagnostics else "unknown"))
+        result = 255
+    raise SystemExit(result)

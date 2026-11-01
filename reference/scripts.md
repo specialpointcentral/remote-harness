@@ -19,8 +19,11 @@
   first and adopts the tunnel it last started. A tunnel reused from another launch is not supervised.
   The session Host's keepalives tolerate `RH_KEEPALIVE_TIMEOUT` seconds (default 300) of silence.
 - `simple-local-setup.sh`, `local-setup.sh`: compatibility stubs that reject local-agent execution.
-- `setup-tunnel.sh`: creates remote session SSH config and a per-session key.
-- `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`.
+- `setup-tunnel.sh`: creates remote session SSH config and a per-session key. `IdentitiesOnly yes`
+  limits authentication to configured keys; new key comments do not contain a hostname.
+- `check-tunnel.sh`: checks the forced gateway through `remote-harness-health`. Successful replies
+  are status-only; existing `LAPTOP_HOSTNAME`/`LAPTOP_USER` output keys remain empty, including when
+  contacting an older gateway. SSH failure diagnostics remain available.
 - `mount-project.sh`: mounts the local project on the remote Agent host through SSHFS over one SFTP
   connection (`RH_SSHFS_MAX_CONNS>1` opts into parallel connections where sshfs supports them; on a
   ~360ms link they made concurrent lookups about 7x slower), and (libfuse sshfs) caches lookups,
@@ -47,6 +50,14 @@
   hook for opencode that adds it to the latest user message in memory only. The rule alone sits at
   the start of the context, so long English tool output used to pull replies into English.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
+- `diagnostics.py`: agent-host helper for private routed-command diagnostics. OpenSSH's own errors
+  go to owner-only files under the SSH config's `runtime/diagnostics` directory; framework summaries
+  contain only a category, exit code and opaque transport-session identifier (`unknown` before one
+  is available). Sessions sharing a transport share this identifier. Logs remain until its normal
+  cleanup, since a persistent SSH master may still write after its initiating call has returned.
+  Agents must not read or attach raw logs automatically; detailed log access requires an explicit
+  user request. This policy does not isolate processes sharing the same OS account. Local-terminal
+  bootstrap and tunnel setup keep their operator diagnostics.
 - `run-on-project-host.sh`: validates and executes the local project command (in `watch` mode with
   `/dev/null` stdin, its own process group, and a channel-EOF watchdog), or runs an allowlisted
   `git`/`rg` directly (no shell, fixed PATH) and stops it when the SSH channel closes. Its client
@@ -63,8 +74,11 @@
   retried after 10 minutes or a startup file change; until then, and whenever the snapshot is
   unusable (another shell, unsafe permissions, another command capturing), the command runs as a
   login shell. A snapshot that fails to load at run time refuses that one command (status 125) and is
-  discarded. `RH_SHELL_SNAPSHOT=off` at launch disables it. Either way the AI credentials are unset
-  again after the profile. Not carried over: non-exported shell variables and zsh aliases (bash does
+  discarded. `RH_SHELL_SNAPSHOT=off` at launch disables it. Both dispatch verbs remove common AI
+  credentials, `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`, `SSH_ORIGINAL_COMMAND`,
+  `RH_GATEWAY_SESSION_DIR`, `HOSTNAME` and `HOST` from the command environment. Shell commands repeat
+  the cleanup after the profile or snapshot; a readonly variable that prevents cleanup refuses the
+  command with status 125. Not carried over: non-exported shell variables and zsh aliases (bash does
   not expand aliases in commands anyway).
 - `project-host-gateway.sh`: forced SSH command accepting only SFTP, health, the fixed exec protocol,
   the `git`/`rg` tool verb, and `remote-harness-wait`, which prints `RH_WAIT_READY`, reads one complete
@@ -109,9 +123,11 @@
   match beginning with that same prefix is ambiguous and receives the same mapping. JSON mapping
   decodes one whole record in memory and changes only `data.path.text` or its base64 `bytes` variant;
   content and match offsets retain their values, while JSON formatting may change. Git discovery
-  paths are mapped one newline/NUL record at a time. rg text rewriting uses bounded memory. stderr
-  captures at most 64 KiB for path mapping and retry decisions, then streams overflow unchanged;
-  visible stdout or stderr prevents retries.
+  paths are mapped one newline/NUL record at a time. rg text rewriting uses bounded memory. Project
+  stderr is preserved byte for byte, with at most 64 KiB held for the missing-tool protocol before
+  streaming overflow. Project stderr also prevents retries when a command returns 255; private SSH
+  diagnostics supply transport and capacity information separately. Existing stdout path mapping is
+  unchanged.
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is
   gone (or its terminal was hung up), it stops the multiplexing master and leftover routed processes,
   unmounts the session mount unless another live session uses it, and removes the session dir and the
@@ -127,6 +143,11 @@
   counts as using a config only while its mountpoint is still mounted. Failure keeps local tunnel,
   config and authorization records for retry. Runtime entries use per-session `impl` copies; local
   gateway implementations use per-key copies.
+  Existing cleanup removes abandoned SSH-config temporary files along with an unused transport,
+  while preserving live/shared transports and implementation copies still referenced by mounts.
+  Local and remote resume markers use the same seven-day expiry condition during existing cleanup
+  passes. These are watcher/next-launch checks, not a new timed deletion service; uncertain releases
+  keep the records needed for a safe retry.
 
 Runtime state belongs under `~/.remote-harness/.sessions`. The only `~/.ssh` write is the tagged,
 loopback-scoped, forced-command `authorized_keys` block (none with the user-mode sshd, whose
@@ -134,6 +155,11 @@ authorization lives in its session directory). Session cleanup removes authoriza
 gateway registration, remote private key, mount, hooks, and temporary configs. If the local side
 dies first, the remote watcher or the next launch's GC performs the remote part of that cleanup;
 the stale local `authorized_keys` block is then inert because its private key no longer exists.
+
+Setup writers create private directories and data files even with a permissive caller umask;
+generated launchers preserve the agent's original umask. Permission changes target harness-owned
+artifacts and do not recursively change mounted project files. Rule text omits concrete project-host
+paths and aliases; runtime runners and SSH configs retain the routing values they need.
 
 The SFTP allowance is account-level rather than chrooted to the registered project. Use a dedicated
 local OS account when project-only filesystem isolation is required.

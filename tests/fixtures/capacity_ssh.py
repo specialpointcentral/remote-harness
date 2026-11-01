@@ -46,7 +46,8 @@ if not mux_only:
 if mode == 'capacity' or not Path(control).exists():
     if mux_only:
         event('capacity-refused')
-        sys.stderr.write('mux_client_request_session: session request failed: Session open refused by peer\n')
+        with open(args[args.index('-E') + 1], 'a') as log:
+            log.write('mux_client_request_session: session request failed: Session open refused by peer\n')
         raise SystemExit(255)
     event('hidden-fresh-connection')
 if mode == 'early-stderr-eof':

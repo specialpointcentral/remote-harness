@@ -138,6 +138,24 @@ Turing-complete, and SFTP is not a project chroot. An absolute guarantee require
 project-host gateway under a dedicated OS account that has no AI credentials or agent installation
 and can access only the intended project.
 
+Project commands also clear SSH connection metadata and `HOST`/`HOSTNAME` before shell startup and
+again after loading the profile or snapshot. These values are excluded from snapshots; direct
+`git`/`rg` calls receive the same cleanup. Health replies contain only `RH_OK`, and tunnel checks
+do not repeat hostnames or usernames from older replies. This reduces incidental disclosure;
+commands can still inspect the operating system, files and network. Project output is preserved,
+as are `HOME`, `USER`, `LOGNAME`, `PATH` and `SSH_AUTH_SOCK`.
+
+Injected agent instructions use generic host roles and relative-command guidance, without including
+the project host's absolute project path or SSH alias. Routing still uses those values in private
+session files. Harness files are created with private permissions without changing the agent's or
+project commands' file-creation mask. These permissions do not isolate processes sharing one OS account.
+
+For agent-facing routed commands, framework errors show only a failure category, exit code and opaque
+session identifier. Raw SSH diagnostics stay in private logs. Do not automatically read these logs or
+add them to the conversation after a failure; read them only when the user explicitly requests detailed
+diagnostics. Project commands' own stdout, stderr and exit codes remain available, including an exit
+code of 255. Bootstrap and tunnel setup in the user's terminal retain their operator diagnostics.
+
 ## Claude Multi-Agent
 
 Ordinary, named, and nested Claude subagents are supported. Claude settings hooks continue inside

@@ -28,8 +28,10 @@ def decision(kind: str, **values: object) -> dict[str, object]:
     }
 
 
-def deny(reason: str) -> dict[str, object]:
-    return decision("deny", permissionDecisionReason=reason)
+def deny(category: str) -> dict[str, object]:
+    # Exceptions may contain session/config paths. Detailed policy guidance lives in the injected
+    # instructions; a failed hook returns only its category, status and unavailable correlation ID.
+    return decision("deny", permissionDecisionReason=f"remote-harness: category={category} exit=2 session=unknown")
 
 
 def launches_agent(command: str) -> bool:
@@ -46,50 +48,44 @@ def launches_agent(command: str) -> bool:
 def route(runner_arg: str, mount_root_arg: str) -> dict[str, object]:
     try:
         event = json.load(sys.stdin)
-    except (OSError, json.JSONDecodeError) as error:
-        return deny(f"remote-harness could not parse hook input: {error}")
+    except (OSError, json.JSONDecodeError):
+        return deny("input")
 
     tool_name = event.get("tool_name")
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
-        return deny("remote-harness tool input is not an object")
+        return deny("input")
     if tool_name == "Agent":
         if tool_input.get("isolation") == "worktree":
-            return deny(
-                "remote-harness does not support Claude subagent worktree isolation; "
-                "use an ordinary subagent or a separate harness session"
-            )
+            return deny("worktree")
         return {}
     if tool_name != "Bash":
-        return deny("remote-harness only routes Bash and validates Agent tool calls")
+        return deny("input")
 
     command = tool_input.get("command")
     if not isinstance(command, str) or not command.strip():
-        return deny("remote-harness Bash input has no string command")
+        return deny("input")
     try:
         if launches_agent(command):
-            return deny(
-                "Agent processes must run on the remote agent host; "
-                "use the Agent tool or another remote-harness session"
-            )
-    except ValueError as error:
-        return deny(f"remote-harness could not safely parse the Bash command: {error}")
+            return deny("local_agent")
+    except ValueError:
+        return deny("command_parse")
 
     runner = os.path.realpath(os.path.expanduser(runner_arg))
     if not os.path.isfile(runner) or not os.access(runner, os.X_OK):
-        return deny("remote-harness session runner is missing or not executable")
+        return deny("runner")
 
     mount_root = os.path.realpath(os.path.expanduser(mount_root_arg))
     requested_cwd = tool_input.get("workdir") or event.get("cwd")
     if not isinstance(requested_cwd, str) or not requested_cwd:
-        return deny("remote-harness hook input has no working directory")
+        return deny("input")
     cwd = os.path.realpath(os.path.expanduser(requested_cwd))
     try:
         inside_mount = os.path.commonpath([mount_root, cwd]) == mount_root
     except ValueError:
         inside_mount = False
     if not inside_mount:
-        return deny("remote-harness denied a Bash command outside the SSHFS mount")
+        return deny("outside_mount")
 
     relative_cwd = os.path.relpath(cwd, mount_root)
     updated_input = dict(tool_input)
@@ -117,8 +113,8 @@ def main() -> int:
     try:
         args = parse_args(sys.argv[1:])
         result = route(args["--runner"], args["--mount-root"])
-    except Exception as error:  # Keep hook execution fail-closed after Python starts.
-        result = deny(f"remote-harness command routing failed: {error}")
+    except Exception:  # Keep hook execution fail-closed after Python starts.
+        result = deny("framework")
     json.dump(result, sys.stdout)
     return 0
 

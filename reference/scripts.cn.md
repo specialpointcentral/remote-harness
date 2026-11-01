@@ -19,8 +19,11 @@
   启动的隧道。复用其它启动建立的隧道时不做守护。会话 Host 的 keepalive 能容忍 `RH_KEEPALIVE_TIMEOUT` 秒
   （默认 300）无响应。
 - `simple-local-setup.sh`、`local-setup.sh`：拒绝本机 Agent 的兼容 stub。
-- `setup-tunnel.sh`：创建远端会话 SSH config 和每会话 key。
-- `check-tunnel.sh`：通过 `remote-harness-health` 检查 forced gateway。
+- `setup-tunnel.sh`：创建远端会话 SSH config 和每会话 key。`IdentitiesOnly yes` 将认证限制为已配置
+  的密钥；新密钥的注释不包含主机名。
+- `check-tunnel.sh`：通过 `remote-harness-health` 检查 forced gateway。成功时只报告状态；旧有输出键
+  `LAPTOP_HOSTNAME`/`LAPTOP_USER` 保留为空，即使对端是旧版 gateway 也不转述身份信息。SSH 失败
+  诊断仍会保留。
 - `mount-project.sh`：在远端 Agent 主机通过 SSHFS 挂载本机项目，默认只用一条 SFTP 连接（`RH_SSHFS_MAX_CONNS`
   设为大于 1 时，在 sshfs 支持的情况下启用并行连接；在约 360ms 的线路上实测，它会让并发查询慢约 7 倍）；libfuse 版 sshfs
   还会在内核里缓存路径查找、文件属性和「文件不存在」的结果 `RH_SSHFS_CACHE_SECONDS` 秒（默认 20，设为 `0`
@@ -41,6 +44,12 @@
   `experimental.chat.messages.transform` 插件钩子，只在内存中附加到最新一条用户消息上。只靠规则时，
   它位于上下文开头，大量英文工具输出会让回复逐渐变成英文。
 - `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。
+- `diagnostics.py`：Agent 主机上的路由诊断 helper。OpenSSH 自身的错误写入 SSH config 旁
+  `runtime/diagnostics` 下仅属主可读写的文件；框架摘要只包含失败类别、退出码和不含主机信息的通道会话
+  编号（尚不可用时为 `unknown`），共享通道的会话共用该编号。日志保留到通道的正常清理，因为持久 SSH
+  master 在发起调用返回后仍可能写入。Agent 不得自动读取
+  原始日志或带入上下文，只有用户明确要求详细诊断时才可读取。这是工作流程约定，无法隔离同一 OS
+  账号下的进程。本机终端中的 bootstrap 和隧道设置保留面向操作者的诊断。
 - `run-on-project-host.sh`：校验并执行本机项目命令（watch 模式下 stdin 为 `/dev/null`、使用独立
   进程组和通道 EOF 看门狗），或直接运行白名单内的 `git`/`rg`（不经 shell、
   固定 PATH），SSH 通道关闭时终止该工具。客户端一侧设置每连接 keepalive 和可选的复用 master。
@@ -53,8 +62,10 @@
   等）变化后重新抓取。抓取失败或超过 30 秒记入 `shell-snapshot.failed`，10 分钟后或启动文件变化后再试；
   在此之前，以及快照不可用时（其它 shell、权限不安全、另一条命令正在抓取），命令用登录 shell 执行。
   运行时快照加载失败，则拒绝这一条命令（状态 125）并丢弃快照。启动时设置 `RH_SHELL_SNAPSHOT=off`
-  可关闭。两种方式都会在 profile 之后再次清除 AI 凭据。不会带过来的：未导出的 shell 变量和 zsh 的 alias
-  （bash 本来就不在命令里展开 alias）。
+  可关闭。两个 dispatch 动词都会从命令环境清除常见 AI 凭据及 `SSH_CLIENT`、`SSH_CONNECTION`、
+  `SSH_TTY`、`SSH_ORIGINAL_COMMAND`、`RH_GATEWAY_SESSION_DIR`、`HOSTNAME` 和 `HOST`。shell 命令
+  在 profile 或快照加载后再次清理；若只读变量阻止清理，则以状态 125 拒绝执行命令。不会带过来的：
+  未导出的 shell 变量和 zsh 的 alias（bash 本来就不在命令里展开 alias）。
 - `project-host-gateway.sh`：只接受 SFTP、health、固定 exec 协议、`git`/`rg` 工具动词和
   `remote-harness-wait` 的 forced SSH command。`remote-harness-wait` 先输出 `RH_WAIT_READY`，从通道读一行
   完整的 exec 或 tool 请求，以 `RH_WAIT_GOT` 确认，然后按同样的 SSH 命令处理。它把自己的会话目录传给
@@ -89,8 +100,9 @@
   rg 文本始终映射行首的项目根路径前缀，包括单个绝对路径文件的 `--vimgrep` 输出。仅含内容的匹配若以相同
   前缀开头，就无法与文件名区分，也会接受同样的映射。JSON 映射在内存中逐条解码完整记录，只修改
   `data.path.text` 或 base64 编码的 `bytes` 变体；内容和匹配偏移的值不变，但 JSON 格式可能变化。
-  Git 发现输出按换行/NUL 分隔的记录逐条映射路径。rg 文本改写使用有界内存。stderr 最多捕获 64 KiB
-  以映射路径和判断是否重试，之后将溢出部分原样流式输出；stdout 或 stderr 一旦可见便不再重试。
+  Git 发现输出按换行/NUL 分隔的记录逐条映射路径。rg 文本改写使用有界内存。项目 stderr 逐字节保留，
+  最多缓存 64 KiB 以识别工具缺失协议，超出后流式输出。即使命令返回 255，只要有项目 stderr 就不再
+  重试；传输错误和容量信息由独立的私有 SSH 诊断提供，stdout 的既有路径映射不变。
 - `session-reaper.sh`：远端每会话 watcher 加启动时 GC。Agent 进程消失（或其终端已挂断）时，
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录
   以及会话 SSH config 和 private key。经隧道的心跳检查连续失败满 `RH_HEARTBEAT_TIMEOUT` 秒后结束 Agent；
@@ -101,10 +113,17 @@
   配置及实现。`release-config` 仅在具体通道可回收后返回 `USED=0`；sshfs 进程（及其 sftp ssh）只在其挂载点
   仍处于挂载状态时才算正在使用该配置。失败时保留本地隧道、配置和
   授权记录，供后续重试。运行入口使用每会话 `impl` 副本，本机 gateway 按密钥保存副本。
+  现有清理流程会随闲置通道一同删除遗留的 SSH config 临时副本，保留活跃或共享的通道，以及仍被挂载
+  引用的实现副本。本机和远端的恢复标记在现有清理中使用相同的七天过期条件。这些检查由 watcher
+  或下次启动触发，没有增加定时删除服务；无法确认释放状态时，继续保留安全重试所需的记录。
 
 运行状态位于 `~/.remote-harness/.sessions`。`~/.ssh` 下唯一写入是带标签、仅回环、forced-command
 的 `authorized_keys` 块（用户态 sshd 模式不写，授权放在其会话目录中）。清理会删除授权、gateway 登记、远端 private key、挂载、hook 和临时 config。若本地一侧先断开，
 远端 watcher 或下次启动的 GC 会完成其中远端部分；残留的本机 `authorized_keys` 块随之失效，
 因为对应 private key 已不存在。
+
+设置脚本即使在调用者使用宽松 umask 时也会创建私有目录和数据文件；生成的 launcher 保留 Agent 原有
+的 umask。权限修改只针对框架自己的文件，不递归修改挂载项目。规则文本不包含具体项目主机路径和别名，
+运行时 runner 与 SSH config 仍保留路由所需的真实值。
 
 SFTP 授权是账号级访问，并没有 chroot 到登记项目。需要项目级文件隔离时，应使用独立本机 OS 账号。

@@ -124,6 +124,21 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 shell 代码仍是图灵完备的，SFTP 也不是项目 chroot。若要绝对保证，需要让 project-host gateway 使用
 没有 AI 凭据和 Agent 安装、且只能访问目标项目的独立 OS 账号。
 
+项目命令还会在 shell 启动前、加载 profile 或快照后清除 SSH 连接信息及 `HOST`/`HOSTNAME`。
+这些值不写入快照，直接调用的 `git`/`rg` 也执行同样的清理。健康检查只返回 `RH_OK`，隧道检查
+也不会转述旧版回复中的主机名和用户名。这能减少信息意外暴露；命令仍可读取操作系统、文件和网络
+信息。项目输出保持原样，`HOME`、`USER`、`LOGNAME`、`PATH` 和
+`SSH_AUTH_SOCK` 也会保留。
+
+注入给 Agent 的说明使用通用主机角色和相对命令指引，不包含项目主机的项目绝对路径或 SSH 别名。
+路由仍使用私有会话文件中的真实值。框架文件创建时即使用私有权限，不改变 Agent 或项目命令的
+文件创建掩码。这些权限无法隔离同一 OS 账号下的进程。
+
+面向 Agent 的路由命令只展示框架错误的失败类别、退出码和不含主机信息的会话编号，原始 SSH 诊断
+保存在私有日志中。发生错误后，不要自动读取这些日志或加入对话；只有用户明确要求详细诊断时才读取。
+项目命令自己的 stdout、stderr 和退出码仍正常返回，包括命令自己返回的 255。用户终端中的 bootstrap
+和隧道设置保留面向操作者的诊断信息。
+
 ## Claude 多 Agent
 
 支持普通、具名和嵌套 Claude subagent。Claude settings hook 会继续在 subagent 内运行，因此其 Bash

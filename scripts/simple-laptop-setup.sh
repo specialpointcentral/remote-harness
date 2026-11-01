@@ -154,8 +154,10 @@ cache_get() {
   sed -n "s/^${_key}=//p" "$_cache" | tail -1
 }
 
-cache_save() {
+cache_save() (
+  umask 077
   _cache="$(cache_file)"
+  [ ! -L "$(dirname "$_cache")" ] && [ ! -L "$_cache" ] || return 1
   mkdir -p "$(dirname "$_cache")" 2>/dev/null || true
   _tmp="$(mktemp "${_cache}.XXXXXX" 2>/dev/null)" || return 0
   if [ -f "$_cache" ]; then
@@ -173,8 +175,8 @@ cache_save() {
 '*|LAST_LOCAL_SSHD=auto) continue;; esac
     printf '%s\n' "$_kv" >> "$_tmp"
   done
-  mv "$_tmp" "$_cache" 2>/dev/null && chmod 600 "$_cache" 2>/dev/null || true
-}
+  chmod 600 "$_tmp" && mv "$_tmp" "$_cache" 2>/dev/null
+)
 
 VIA="" LAUNCH="codex" APPROVAL=""
 NAMESPACE="" PROJECT_DIR="" REMOTE_MP="" ASSUME_YES=0
@@ -361,7 +363,8 @@ setup_out="$(
     -o BatchMode=yes -o ConnectTimeout=10 $VIA "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
     parent=\"\$rh/.sessions\"
-    mkdir -p \"\$parent\" 2>/dev/null || exit 1
+    umask 077
+    [ ! -L \"\$parent\" ] && mkdir -p \"\$parent\" && chmod 700 \"\$parent\" || exit 1
     sd=\$(mktemp -d \"\$parent/simple.XXXXXX\") || exit 1
     cfg=\"\$sd/ssh_config\"
     [ -x \"\$rh/scripts/setup-tunnel.sh\" ] || { printf 'ERROR=missing setup-tunnel.sh\n'; exit 2; }

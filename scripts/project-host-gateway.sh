@@ -4,7 +4,15 @@ set -eu
 set -f
 
 fail() {
-  printf 'remote-harness gateway: %s\n' "$*" >&2
+  # No identity, connection target or implementation path belongs in agent-facing failures.
+  if [ -n "${session_dir:-}" ] && [ -d "$session_dir" ] && [ ! -L "$session_dir" ] \
+      && [ ! -L "$session_dir/framework.log" ] \
+      && { [ ! -e "$session_dir/framework.log" ] || [ -f "$session_dir/framework.log" ]; }; then
+    (umask 077; if [ -f "$session_dir/framework.log" ]; then chmod 600 "$session_dir/framework.log" || exit 1; fi
+      printf '%s\n' "$*" >> "$session_dir/framework.log") \
+      2>/dev/null || true
+  fi
+  printf 'remote-harness: category=gateway exit=2 session=unknown\n' >&2
   exit 2
 }
 
@@ -39,6 +47,9 @@ else
 fi
 root_file="$session_dir/project-root.b64"
 original=${SSH_ORIGINAL_COMMAND:-}
+# Keep the request in this shell only. SFTP and project commands do not need the SSH connection
+# addresses, terminal, or original request in their environment.
+unset SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_ORIGINAL_COMMAND
 
 # Every exec/tool request must name this session's registered project root, and the dispatcher that
 # re-validates it on the project host must be in place.
@@ -66,7 +77,7 @@ fi
 
 case "$original" in
   remote-harness-health)
-    printf 'RH_OK %s %s' "$(hostname 2>/dev/null || printf unknown)" "$(id -un 2>/dev/null || printf unknown)"
+    printf 'RH_OK\n'
     ;;
   remote-harness-exec\ *)
     set -- $original

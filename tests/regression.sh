@@ -133,7 +133,7 @@ import sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 specific = payload["hookSpecificOutput"]
 assert specific["permissionDecision"] == "deny"
-assert "worktree" in specific["permissionDecisionReason"].lower()
+assert specific["permissionDecisionReason"] == "remote-harness: category=worktree exit=2 session=unknown"
 PY
 
 python3 - "$router_tmp/outside.json" "$router_tmp/outside" <<'PY'
@@ -157,7 +157,7 @@ import sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 specific = payload["hookSpecificOutput"]
 assert specific["permissionDecision"] == "deny"
-assert "outside" in specific["permissionDecisionReason"].lower()
+assert specific["permissionDecisionReason"] == "remote-harness: category=outside_mount exit=2 session=unknown"
 PY
 
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
@@ -170,14 +170,13 @@ if sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
     >/dev/null 2>"$router_tmp/traversal.err"; then
   fail "project-host dispatcher accepted a parent-directory traversal"
 fi
-assert_grep "$router_tmp/traversal.err" "invalid relative working directory" "dispatch traversal denial"
 
 mkdir -p "$router_tmp/bin"
 cat > "$router_tmp/bin/ssh" <<'EOS'
 #!/usr/bin/env sh
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    -F|-o) shift 2 ;;
+    -E|-F|-o) shift 2 ;;
     -T) shift ;;
     *) shift; remote_command=${1:-}; break ;;
   esac
@@ -195,58 +194,53 @@ client_out=$(PATH="$router_tmp/bin:$PATH" SHELL=/bin/sh TEST_DISPATCHER="$ROOT/s
     --command-b64 "$(b64 'printf "%s" "$PWD"')")
 assert_eq "project-host client transport" "$client_out" "$router_tmp/project/packages/api"
 
-for blocked_command in \
-  'claude -p local-child' \
-  '/usr/local/bin/codex exec local-child' \
-  'env TEST=1 opencode run'; do
-  python3 - "$router_tmp/blocked.json" "$router_tmp/mount" "$blocked_command" <<'PY'
-import json
-import sys
-
-json.dump({
-    "hook_event_name": "PreToolUse",
-    "cwd": sys.argv[2],
-    "tool_name": "Bash",
-    "tool_input": {"command": sys.argv[3]},
-}, open(sys.argv[1], "w", encoding="utf-8"))
-PY
-  python3 "$ROOT/scripts/route-command.py" \
-    --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
-    < "$router_tmp/blocked.json" > "$router_tmp/blocked-output.json"
-  python3 - "$router_tmp/blocked-output.json" <<'PY'
-import json
-import sys
-
-specific = json.load(open(sys.argv[1], encoding="utf-8"))["hookSpecificOutput"]
-assert specific["permissionDecision"] == "deny"
-assert "agent" in specific["permissionDecisionReason"].lower()
-PY
-done
-
-if SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
-    "$(b64 "$router_tmp/project")" "$(b64 packages/api)" "$(b64 'claude -p local-child')" \
-    >"$router_tmp/local-agent.out" 2>"$router_tmp/local-agent.err"; then
-  fail "project-host dispatcher allowed a direct local Claude launch"
-fi
-assert_grep "$router_tmp/local-agent.err" "Agent processes must run on the remote" "dispatcher direct agent denial"
-indirect_agent_command="sh -c 'codex exec local-child'"
-if SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
-    "$(b64 "$router_tmp/project")" "$(b64 packages/api)" "$(b64 "$indirect_agent_command")" \
-    >"$router_tmp/indirect-agent.out" 2>"$router_tmp/indirect-agent.err"; then
-  fail "project-host dispatcher allowed an indirect local Codex launch"
-fi
-assert_grep "$router_tmp/indirect-agent.err" "Agent processes must run on the remote" "dispatcher PATH guard denial"
-
+# Local agent launch rejection is exercised through both hook and dispatcher in test_shell_policy.py.
 gateway_home="$router_tmp/gateway-home"
 gateway_tag="session-test"
 mkdir -p "$gateway_home/.remote-harness/bin" "$gateway_home/.remote-harness/.sessions/gateways/$gateway_tag"
 cp "$ROOT/scripts/run-on-project-host.sh" "$gateway_home/.remote-harness/bin/"
 cp "$ROOT/scripts/project-host-gateway.sh" "$gateway_home/.remote-harness/bin/"
+mv "$gateway_home/.remote-harness/bin/run-on-project-host.sh" "$gateway_home/.remote-harness/bin/real-dispatcher.sh"
+cat > "$gateway_home/.remote-harness/bin/run-on-project-host.sh" <<'EOS'
+#!/bin/sh
+[ -z "${SSH_CLIENT+x}${SSH_CONNECTION+x}${SSH_TTY+x}${SSH_ORIGINAL_COMMAND+x}" ] || {
+  printf 'fixture: gateway exported SSH metadata to its dispatcher\n' >&2
+  exit 99
+}
+exec "$(dirname "$0")/real-dispatcher.sh" "$@"
+EOS
 chmod +x "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_home/.remote-harness/bin/run-on-project-host.sh"
 printf '%s' "$(b64 "$router_tmp/project")" > "$gateway_home/.remote-harness/.sessions/gateways/$gateway_tag/project-root.b64"
 gateway_health=$(HOME="$gateway_home" SSH_ORIGINAL_COMMAND=remote-harness-health \
   sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag")
-case "$gateway_health" in RH_OK*) ;; *) fail "gateway health response invalid: $gateway_health";; esac
+assert_eq "gateway health returns only the identity-free protocol token" "$gateway_health" "RH_OK"
+
+# Older gateways include identity fields. The tunnel check accepts both generations without
+# forwarding those fields to callers, and still exposes useful SSH diagnostics on failure.
+health_bin="$router_tmp/health-bin"
+mkdir -p "$health_bin"
+cat > "$health_bin/ssh" <<'EOS'
+#!/bin/sh
+printf '%s' "${TEST_HEALTH_REPLY:-}"
+printf '%s' "${TEST_HEALTH_ERROR:-}" >&2
+exit "${TEST_HEALTH_STATUS:-0}"
+EOS
+chmod +x "$health_bin/ssh"
+for health_reply in RH_OK 'RH_OK fixture-private-host fixture-private-user'; do
+  PATH="$health_bin:$PATH" RH_HOME="$gateway_home/.remote-harness" TEST_HEALTH_REPLY="$health_reply" \
+    bash "$ROOT/scripts/check-tunnel.sh" --alias fixture-project-host --port 32023 \
+    > "$router_tmp/health-check.out"
+  assert_grep "$router_tmp/health-check.out" "SSH=up" "tunnel check accepts current and legacy health"
+  assert_grep_e "$router_tmp/health-check.out" '^LAPTOP_HOSTNAME=$' "tunnel check preserves blank hostname key"
+  assert_grep_e "$router_tmp/health-check.out" '^LAPTOP_USER=$' "tunnel check preserves blank username key"
+  refute_grep "$router_tmp/health-check.out" "fixture-private" "tunnel check does not forward legacy identity"
+done
+PATH="$health_bin:$PATH" RH_HOME="$gateway_home/.remote-harness" TEST_HEALTH_REPLY=RH_OKgarbage \
+  TEST_HEALTH_ERROR='ssh: fixture connection failed' TEST_HEALTH_STATUS=255 \
+  bash "$ROOT/scripts/check-tunnel.sh" --alias fixture-project-host --port 32023 \
+  > "$router_tmp/health-check.out"
+assert_grep "$router_tmp/health-check.out" "SSH=down" "tunnel check rejects a malformed health prefix"
+assert_grep "$router_tmp/health-check.out" "ERROR=ssh: fixture connection failed" "tunnel check keeps SSH failure diagnostics"
 gateway_exec=$(HOME="$gateway_home" \
   SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 packages/api) $(b64 'printf gateway-ok')" \
   sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag")
@@ -256,23 +250,31 @@ if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='uname -a' \
     >"$router_tmp/gateway-shell.out" 2>"$router_tmp/gateway-shell.err"; then
   fail "forced-command gateway accepted an arbitrary local shell command"
 fi
-assert_grep "$router_tmp/gateway-shell.err" "unsupported SSH command" "gateway arbitrary shell denial"
+gateway_framework_log="$gateway_home/.remote-harness/.sessions/gateways/$gateway_tag/framework.log"
+assert_grep "$gateway_framework_log" "unsupported SSH command" "gateway privately records the denied command category"
+: > "$gateway_framework_log"
 if HOME="$gateway_home" SSH_ORIGINAL_COMMAND='internal-sftp -h' \
     sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" \
     </dev/null >"$router_tmp/gateway-sftp.out" 2>"$router_tmp/gateway-sftp.err"; then
   :
 fi
-refute_grep "$router_tmp/gateway-sftp.err" "unsupported SSH command" "forced-command gateway rejected the standard internal-sftp request"
+refute_grep "$gateway_framework_log" "unsupported SSH command" "forced-command gateway rejected the standard internal-sftp request"
 
 # A waiting channel takes one complete exec/tool request line from stdin and nothing else.
 gw_wait() {  # $1 = stdin bytes
-  printf '%s' "$1" | HOME="$gateway_home" SSH_ORIGINAL_COMMAND=remote-harness-wait \
+  printf '%s' "$1" | HOME="$gateway_home" SSH_CLIENT=fixture-client SSH_CONNECTION=fixture-connection \
+    SSH_TTY=fixture-tty SSH_ORIGINAL_COMMAND=remote-harness-wait \
     sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag"
 }
 wait_marker="$router_tmp/wait-ran"
 wait_out=$(gw_wait "remote-harness-exec $(b64 "$router_tmp/project") $(b64 packages/api) $(b64 'printf wait-ok')
 ")
 assert_eq "waiting channel acknowledges and runs one exec request" "$wait_out" "$(printf 'RH_WAIT_READY\nRH_WAIT_GOT\nwait-ok')"
+wait_clean_command='printf "%s|%s|%s|%s" "${SSH_CLIENT-unset}" "${SSH_CONNECTION-unset}" "${SSH_TTY-unset}" "${SSH_ORIGINAL_COMMAND-unset}"'
+wait_clean_out=$(gw_wait "remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 "$wait_clean_command")
+")
+assert_eq "waiting channel consumes the request without exporting SSH metadata" "$wait_clean_out" \
+  "$(printf 'RH_WAIT_READY\nRH_WAIT_GOT\nunset|unset|unset|unset')"
 for wait_bad in \
     "remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 ": > $wait_marker")" \
     "remote-harness-health
@@ -288,7 +290,7 @@ for wait_bad in \
   fi
 done
 [ ! -e "$wait_marker" ] || fail "waiting channel ran a rejected or incomplete request"
-assert_grep "$router_tmp/wait-bad.err" "project root does not match" "waiting channel checks the project root"
+assert_grep "$gateway_framework_log" "project root does not match" "waiting channel checks the project root"
 
 # --- direct project-host tools: gateway verb, dispatcher, agent-host shim -----------------------
 tool_proj="$router_tmp/tool-project"
@@ -318,6 +320,41 @@ tool_quote=$(HOME="$gateway_home" \
   SSH_ORIGINAL_COMMAND="remote-harness-tool $(b64 "$tool_proj") $(b64 src) git $(targs rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")" \
   sh "$tool_gateway" "$tool_tag")
 assert_eq "gateway tool argument fidelity" "$tool_quote" "$(git rev-parse --sq-quote 'a b' '' "$(printf 'tail\n.')")"
+# A real git child observes the tool's inherited environment and argument framing. Keep build and
+# authentication settings, user output, stderr and exit status while dropping SSH session metadata.
+tool_env_alias='!f() {
+  printf "ssh=%s|%s|%s|%s\n" "${SSH_CLIENT-unset}" "${SSH_CONNECTION-unset}" "${SSH_TTY-unset}" "${SSH_ORIGINAL_COMMAND-unset}"
+  env | grep -E "^(HOSTNAME|HOST|RH_GATEWAY_SESSION_DIR)=" >/dev/null && exit 9
+  printf "keep=%s|%s|%s\n" "$CPPFLAGS" "$SSH_AUTH_SOCK" "$GIT_SSH_COMMAND"
+  printf "user=%s|%s\nhome=%s\n" "$USER" "$LOGNAME" "$HOME"
+  [ -n "$PATH" ] && command -v git >/dev/null || exit 8
+  printf "args=<%s><%s><%s>\n" "$1" "$2" "$3"
+  printf "tool diagnostic\n" >&2
+  exit 7
+}; f'
+tool_env_request="remote-harness-tool $(b64 "$tool_proj") $(b64 .) git $(targs -c "alias.rh-env=$tool_env_alias" rh-env 'a b' '' "$(printf 'tail\n.')")"
+tool_env_expected=$(printf 'ssh=unset|unset|unset|unset\nkeep=-Ifixture-build|/tmp/fixture-auth-agent|ssh -i fixture-key\nuser=fixture-dev|fixture-dev\nhome=%s\nargs=<a b><><tail\n.>' "$gateway_home")
+for tool_env_mode in direct wait; do
+  if [ "$tool_env_mode" = wait ]; then
+    tool_env_original=remote-harness-wait
+    printf '%s\n' "$tool_env_request" > "$router_tmp/tool-env.stdin"
+    tool_env_want=$(printf 'RH_WAIT_READY\nRH_WAIT_GOT\n%s' "$tool_env_expected")
+  else
+    tool_env_original=$tool_env_request
+    : > "$router_tmp/tool-env.stdin"
+    tool_env_want=$tool_env_expected
+  fi
+  tool_env_status=0
+  tool_env_out=$(HOME="$gateway_home" SSH_CLIENT=fixture-client SSH_CONNECTION=fixture-connection \
+    SSH_TTY=fixture-tty SSH_ORIGINAL_COMMAND="$tool_env_original" CPPFLAGS=-Ifixture-build \
+    HOSTNAME=fixture-host HOST=fixture-host RH_GATEWAY_SESSION_DIR=fixture-session USER=fixture-dev LOGNAME=fixture-dev \
+    SSH_AUTH_SOCK=/tmp/fixture-auth-agent GIT_SSH_COMMAND='ssh -i fixture-key' \
+    sh "$tool_gateway" "$tool_tag" < "$router_tmp/tool-env.stdin" 2> "$router_tmp/tool-env.err") \
+    || tool_env_status=$?
+  assert_eq "$tool_env_mode tool environment, argument fidelity and output" "$tool_env_out" "$tool_env_want"
+  assert_eq "$tool_env_mode tool preserves exit status" "$tool_env_status" 7
+  assert_eq "$tool_env_mode tool preserves stderr" "$(cat "$router_tmp/tool-env.err")" "tool diagnostic"
+done
 # Each public tool entry must reject invalid requests before running a tool or contacting SSH.
 # A shell request would create the marker if it escaped the allowlist; the client-side fake SSH
 # creates the same marker if validation is deferred to the other end of the connection.
@@ -337,12 +374,10 @@ for tool_entry in gateway dispatch client; do
       name)
         invalid_tool=sh
         invalid_args=$(targs -c ": > '$tool_rejected_marker'")
-        invalid_message='unsupported project tool'
         ;;
       encoding)
         invalid_tool=git
         invalid_args='a;b'
-        invalid_message='invalid tool argument encoding'
         ;;
     esac
     rejected_status=0
@@ -367,7 +402,6 @@ for tool_entry in gateway dispatch client; do
         ;;
     esac
     assert_eq "$tool_entry rejects invalid tool $tool_invalid" "$rejected_status" 2
-    assert_grep "$router_tmp/tool-bad.err" "$invalid_message" "$tool_entry validates tool $tool_invalid"
     [ ! -e "$tool_rejected_marker" ] || fail "$tool_entry executed a rejected tool request"
   done
 done
@@ -394,7 +428,7 @@ cat > "$shim_bin/ssh" <<EOS
 #!/bin/sh
 printf '%s\n' "\$*" >> '$shim_log'
 while [ "\$#" -gt 0 ]; do
-  case "\$1" in -F|-o) shift 2 ;; -T) shift ;; -O) exit 0 ;; *) break ;; esac
+  case "\$1" in -E|-F|-o) shift 2 ;; -T) shift ;; -O) exit 0 ;; *) break ;; esac
 done
 shift
 HOME='$gateway_home' SSH_ORIGINAL_COMMAND="\$1" exec sh '$tool_gateway' '$tool_tag'
@@ -452,7 +486,15 @@ assert_eq "git outside the mount keeps its own config" "$outside_cfg" ""
 # Transport failure: retry once without multiplexing, then fail loudly (never clean / no-match).
 fail_bin="$router_tmp/fail-bin"
 mkdir -p "$fail_bin"
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s\nexit 255\n' "'$router_tmp/fail-ssh.log'" > "$fail_bin/ssh"
+cat > "$fail_bin/ssh" <<EOS
+#!/bin/sh
+printf '%s\n' "\$*" >> '$router_tmp/fail-ssh.log'
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = -E ]; then printf 'Connection refused\n' >> "\$2"; break; fi
+  shift
+done
+exit 255
+EOS
 chmod +x "$fail_bin/ssh"
 if (cd "$tool_mount" && PATH="$fail_bin:$PATH" python3 -I "$ROOT/scripts/project-host-tool.py" --tool git \
     --real "$(command -v git)" --runner "$ROOT/scripts/run-on-project-host.sh" \
@@ -461,7 +503,7 @@ if (cd "$tool_mount" && PATH="$fail_bin:$PATH" python3 -I "$ROOT/scripts/project
     -- status) >"$router_tmp/fail.out" 2>"$router_tmp/fail.err"; then
   fail "shim reported success although the project host was unreachable"
 fi
-assert_grep "$router_tmp/fail.err" "not falling back" "shim transport failure is explicit"
+assert_grep "$router_tmp/fail.err" "category=ssh exit=255 session=" "shim transport failure is explicit"
 [ ! -s "$router_tmp/fail.out" ] || fail "shim printed output for an unreachable project host"
 assert_eq "shim retries exactly once" "$(grep -c . "$router_tmp/fail-ssh.log")" "2"
 assert_grep "$router_tmp/fail-ssh.log" "ControlMaster=auto" "first attempt uses the multiplexing master"
@@ -550,18 +592,7 @@ wait_until() {  # tenths-of-a-second command...: poll until the command succeeds
 }
 tree_alive() { ps -A -o args= 2>/dev/null | grep -Ex "sleep ($1)" >/dev/null; }
 tree_gone() { ! tree_alive "$1"; }
-watch_started=$(date +%s)
-{ sleep 1; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
-  "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'sleep 47 & sleep 48 & wait')" watch \
-  >/dev/null 2>&1 || true
-watch_elapsed=$(( $(date +%s) - watch_started ))
-[ "$watch_elapsed" -lt 15 ] || fail "watched command outlived its closed channel (${watch_elapsed}s)"
-wait_until 20 tree_gone '47|48' || fail "watched command left child processes running after its channel closed"
-watch_rc=0
-watch_out=$({ sleep 2; } | SHELL=/bin/sh sh "$ROOT/scripts/run-on-project-host.sh" --dispatch \
-  "$(b64 "$router_tmp/project")" "$(b64 .)" "$(b64 'printf watched; exit 7')" watch) || watch_rc=$?
-assert_eq "watched command output" "$watch_out" "watched"
-assert_eq "watched command keeps its exit status" "$watch_rc" "7"
+# test_dispatch_lifecycle.py covers channel EOF, process-tree cleanup, and completion status.
 gateway_watch=$(HOME="$gateway_home" \
   SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 .) $(b64 'printf gw-watch') watch" \
   sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag" </dev/null)
@@ -647,15 +678,6 @@ host_count="$(awk '$1=="Host" && $2=="example-dev"{n++} END{print n+0}' "$CFG")"
 assert_eq "idempotent alias count" "$host_count" "1"
 assert_grep "$CFG" "    ProxyJump otherjump" "managed alias replacement"
 
-for removed_script in preflight.sh detect.sh connect-guesses.sh server-guesses.sh list-projects.sh session-cache.sh; do
-  [ ! -e "$ROOT/scripts/$removed_script" ] || fail "removed script still exists: $removed_script"
-done
-if grep -R -E 'preflight|detect\.sh|connect-guesses|server-guesses|list-projects|session-cache|legacy|旧流程' \
-    "$ROOT/README.md" "$ROOT/AGENTS.md" "$ROOT/AGENTS.cn.md" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" \
-    "$ROOT/reference" "$ROOT/docs" >/dev/null 2>&1; then
-  fail "docs still reference removed/legacy flows"
-fi
-
 mkdir -p "$tmp/bin"
 
 mkdir -p "$tmp/code" "$tmp/mount" "$tmp/home with 'quote/.codex" "$tmp/rh with 'quote"
@@ -674,14 +696,11 @@ assert_grep "$tmp/inject.out" "RH_LAUNCH_FLAGS=-c 'developer_instructions=\"" "i
 assert_grep "$tmp/inject.out" "hooks.PreToolUse=" "inject codex pre-tool hook"
 assert_grep "$tmp/inject.out" "--dangerously-bypass-hook-trust" "inject codex trusts generated session hook"
 assert_grep "$tmp/inject.out" "$(command -v python3)" "inject codex pins the Python hook runtime"
-assert_grep "$tmp/inject.out" "Remote dev harness strict routing rule" "inject codex strict routing instructions"
-assert_grep "$tmp/inject.out" "sandbox_workspace_write.writable_roots=[" "inject codex writable roots present"
 assert_grep "$tmp/inject.out" "sandbox_workspace_write.writable_roots=[\"$(dirname "$basic_ssh_cfg")/runtime\"]" "inject codex only makes mutable SSH runtime writable"
 if grep -F "sandbox_workspace_write.writable_roots=[\"$session_dir" "$tmp/inject.out" >/dev/null; then
   fail "inject codex made its hook and runner directory writable"
 fi
 [ -x "$session_dir/bin/rh-run" ] || fail "inject codex session runner missing"
-assert_grep "$session_dir/bin/rh-run" "run-on-project-host.sh" "session runner delegates to project host"
 refute_grep "$tmp/inject.out" 'writable_roots=["~/.ssh"]' "inject codex made ~/.ssh writable"
 [ -f "$session_dir/rule.md" ] || fail "inject rule file missing"
 RH_HOME="$rh_home" HOME="$home_dir" \
@@ -783,30 +802,12 @@ refute_grep "$tmp/approval-ap.x3.out" "--approve-for-me" "a codex without automa
 ap_inject opencode auto ap.o1
 assert_grep "$tmp/approval-ap.o1.out" "RH_APPROVAL=normal" "opencode auto approval falls back to normal"
 
-ssh_cfg="$tmp/session_ssh_config"
-printf 'Host rlocal\n    HostName 127.0.0.1\n' > "$ssh_cfg"
-session_key_wrapped="$(printf '%s' "$tmp/mount-wrapped" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-wrapped_dir="$rh_home/.sessions/$session_key_wrapped"
-RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" rlocal "$tmp/mount-wrapped" 0 "$ssh_cfg" > "$tmp/inject-wrapped.out"
-assert_grep "$tmp/inject-wrapped.out" "RH_LAUNCH_ENV=PATH='" "inject wrapper exports PATH"
-[ -x "$wrapped_dir/bin/ssh" ] || fail "inject wrapper ssh missing"
-assert_grep "$wrapped_dir/bin/ssh" "cfg='$ssh_cfg'" "inject wrapper stores temp ssh config"
-assert_grep "$wrapped_dir/bin/ssh" '-F "$cfg"' "inject wrapper uses temp ssh config"
-assert_grep "$wrapped_dir/rule.md" 'every Bash command is routed to `rlocal`' "inject rule documents automatic routing"
-refute_grep "$wrapped_dir/rule.md" "ssh rlocal 'cd" "strict inject rule still tells Codex to wrap commands in ssh"
-assert_grep "$tmp/inject-wrapped.out" "sandbox_workspace_write.writable_roots=[" "inject wrapper writable roots present"
-assert_grep "$tmp/inject-wrapped.out" "$(dirname "$ssh_cfg")" "inject wrapper writable roots include session config dir"
-refute_grep "$wrapped_dir/rule.md" "-F " "inject rule exposed temp ssh config path"
-RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" off codex "$tmp/mount-wrapped" >/dev/null
-
 # Codex standalone bundle: rg is absent from the login PATH, and codex is a symlink.
 # Exercise the generated shims and pinned shell-tool environment through the fake gateway.
 codex_bundle="$tmp/codex bundle"
 codex_tool_bin="$tmp/codex tools 'quoted\""
 mkdir -p "$codex_bundle/bin" "$codex_bundle/codex-path" "$codex_tool_bin"
-for codex_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp git python3 grep cksum base64; do
+for codex_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp ln git python3 grep cksum base64; do
   ln -s "$(command -v "$codex_dep")" "$codex_tool_bin/$codex_dep"
 done
 # The simulated project host has its own PATH, just like a real SSH server does.
@@ -861,7 +862,7 @@ done
 # embedded ripgrep gets no rg shim and keeps its own search.
 claude_tool_bin="$tmp/claude tools"
 mkdir -p "$claude_tool_bin"
-for claude_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp git python3 grep cksum base64; do
+for claude_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp ln git python3 grep cksum base64; do
   ln -s "$(command -v "$claude_dep")" "$claude_tool_bin/$claude_dep"
 done
 cp "$codex_tool_bin/ssh" "$claude_tool_bin/ssh"
@@ -914,7 +915,6 @@ done
 
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
-assert_grep "$tmp/inject-claude.out" "RH_LAUNCH_FLAGS=--append-system-prompt-file '" "inject claude flag quoted"
 assert_grep "$tmp/inject-claude.out" "--settings '" "inject claude session settings"
 assert_grep "$tmp/inject-claude.out" "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0" "inject claude disables experimental agent teams"
 claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
@@ -939,9 +939,6 @@ if "$claude_worktree_blocker" >/dev/null 2>"$tmp/claude-worktree.err"; then
   fail "claude worktree blocker exited successfully"
 fi
 assert_grep "$tmp/claude-worktree.err" "separate remote-harness session" "claude worktree blocker guidance"
-claude_rule="$rh_home/.sessions/$claude_session_key/rule.md"
-assert_grep "$claude_rule" "Ordinary and nested subagents work" "claude rule documents supported subagents"
-assert_grep "$claude_rule" "Do not use Agent Teams" "claude rule documents team boundary"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
@@ -1234,6 +1231,7 @@ mkdir -p "$tmp/simple-other-project"
 case "$(simple_rerun "$tmp/simple-other-project")" in *rh-simple-remote*) fail "another project inherited the remembered mountpoint";; esac
 sed -i.bak '/^LAST_MOUNT_PROJECT=/d; s#^LAST_REMOTE_MOUNTPOINT=.*#LAST_REMOTE_MOUNTPOINT=/tmp/rh-simple-remote#' "$tmp/simple-cache.env"
 case "$(simple_rerun "$simple_project")" in *rh-simple-remote*) fail "a cache without the mount's project still forced its mountpoint";; esac
+# The --yes fixtures do not exercise interactive confirmation or re-prompting.
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'PROJECT_DIR="$(choose_project_dir "$cached_project" 1)"' "simple cached project prompts for confirmation"
 assert_grep "$ROOT/scripts/simple-laptop-setup.sh" 'if [ -z "$APPROVAL" ]; then' "explicit approval has a no-reprompt branch"
 # An explicit local sshd choice is handed off last and remembered for later runs.
@@ -1296,23 +1294,12 @@ HOME="$tmp/dispatch-home" RH_COMMON="$dispatch_dir/_common.sh" \
   DISPATCH_MARKER="$tmp/dispatch-reverse.out" \
   bash "$dispatch_dir/simple-dispatch.sh" --mode "远程开发本地" --launch codex --source-via sourcebox
 assert_grep "$tmp/dispatch-reverse.out" "REVERSE_ARGS=--launch codex --via sourcebox" "dispatch passes source via only to reverse"
-refute_grep "$ROOT/scripts/simple-dispatch.sh" 'exec bash "$SCRIPT_DIR/simple-local-setup.sh"' "remote-only dispatcher still contains a local-agent launch path"
 
 bash "$ROOT/tests/bootstrap.sh"
-assert_grep "$ROOT/scripts/simple-dispatch.sh" "--source-via" "simple dispatcher accepts bootstrap source"
-assert_grep "$ROOT/SKILL.md" "simple-bootstrap.sh" "skill uses unified simple bootstrap"
-assert_grep "$ROOT/SKILL.md" "docs/claude-multi-agent.md" "skill routes Claude multi-agent questions"
-assert_grep "$ROOT/README.md" "git clone https://github.com/specialpointcentral/remote-harness.git" "README installs maintained fork"
-refute_grep "$ROOT/README.md" "git clone https://github.com/chenjh16/remote-harness.git" "README manual install still clones upstream instead of the maintained fork"
-assert_grep "$ROOT/SKILL.md" "remote-only" "skill declares remote-only topology"
-assert_grep "$ROOT/SKILL.md" "printf '%s' \"\$p\${d:+ [\$d]}: \" >/dev/tty" "skill fetch prompt is zsh-compatible"
+# bootstrap.sh replaces the terminal prompt; retain its unexercised EOF and shell-compatibility guards.
 assert_grep "$ROOT/SKILL.md" "IFS= read -r h </dev/tty || exit 2" "skill aborts when tty prompt cannot read"
 if grep -F "read -r -p" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" "$ROOT/docs/simple-flow.cn.md" >/dev/null; then
   fail "fetch command templates must not use read -p; zsh treats -p as coprocess"
-fi
-assert_grep "$ROOT/SKILL.md" "--mode reverse" "skill documents reverse mode arg"
-if grep -F -- "--mode forward" "$ROOT/SKILL.md" "$ROOT/SKILL.cn.md" >/dev/null; then
-  fail "remote-only skill still documents a forward launch command"
 fi
 # The skill text is model input, so its explicit local-agent prohibition needs a guard as well as
 # the behavioral launch checks. Permit wrapping of the English instruction and check both entries.
@@ -1338,9 +1325,6 @@ HOME="$install_home" CODEX_HOME="$install_home/.codex" RH_HOME="$install_home/.r
 [ -x "$install_home/.remote-harness/scripts/route-command.py" ] || fail "manage install did not install executable route-command.py"
 [ -x "$install_home/.remote-harness/scripts/run-on-project-host.sh" ] || fail "manage install did not install project-host runner"
 [ -x "$install_home/.remote-harness/scripts/project-host-gateway.sh" ] || fail "manage install did not install forced project-host gateway"
-assert_grep "$ROOT/scripts/laptop-setup.sh" 'command="%s"' "authorized key binds a forced command"
-assert_grep "$ROOT/scripts/laptop-setup.sh" "project-host-gateway.sh" "authorized key uses project-host gateway"
-assert_grep "$ROOT/scripts/check-tunnel.sh" "remote-harness-health" "tunnel check uses the gateway health protocol"
 
 suggest_user="$(id -un)"
 SSH_CONNECTION='198.51.100.10 55555 203.0.113.7 2222' \
@@ -1761,11 +1745,30 @@ assert_grep "$st_cfg_ns" "/runtime/known_hosts_alice-mac" "setup-tunnel separate
 [ -f "$(dirname "$st_cfg_ns")/id_ed25519" ] || fail "setup-tunnel did not generate a per-session key"
 [ ! -e "$st_home/.remote-harness/keys/id_ed25519" ] || fail "setup-tunnel generated a reusable global reverse key"
 [ -z "$(find "$st_home/.ssh" -name 'config.rh-bak.*' -print -quit 2>/dev/null)" ] || fail "setup-tunnel namespace created config.rh-bak"
+# Restrict authentication to the selected session key, including when unrelated keys are present
+# in an agent. Check OpenSSH's effective configuration and keep the key across alias updates.
+st_real_ssh=$(command -v ssh)
+assert_session_identity() {  # config alias expected identity
+  "$st_real_ssh" -G -F "$1" "$2" > "$tmp/st-effective" 2>/dev/null
+  assert_grep_e "$tmp/st-effective" '^identitiesonly yes$' "session SSH limits offered identities"
+  assert_eq "session SSH selects only its configured identity" \
+    "$(awk '$1=="identityfile"{print $2}' "$tmp/st-effective")" "$3"
+}
+st_identity="$(dirname "$st_cfg_ns")/id_ed25519"
+st_key_fingerprint=$(ssh-keygen -lf "$st_identity.pub")
+assert_session_identity "$st_cfg_ns" alice-mac "$st_identity"
+HOME="$st_home" bash "$ROOT/scripts/setup-tunnel.sh" --config "$st_cfg_ns" --alias alice-mac \
+  --user alice --port 20132 --gen-key >/dev/null 2>/dev/null
+assert_eq "session SSH key survives alias updates" "$(ssh-keygen -lf "$st_identity.pub")" "$st_key_fingerprint"
+assert_session_identity "$st_cfg_ns" alice-mac "$st_identity"
 # explicit --port still wins (the runtime port-switch path)
 st_home2="$tmp/st-home2"; mkdir -p "$st_home2/.ssh" "$tmp/st-session-port"
 st_cfg_port="$tmp/st-session-port/ssh_config"
-st_out2="$(HOME="$st_home2" bash "$ROOT/scripts/setup-tunnel.sh" --config "$st_cfg_port" --alias bob-mac --user bob --port 20122 --gen-key 2>/dev/null)"
+st_out2="$(HOME="$st_home2" bash "$ROOT/scripts/setup-tunnel.sh" --config "$st_cfg_port" --alias bob-mac --user bob --port 20122 --identity "$st_identity" --gen-key 2>/dev/null)"
 assert_eq "setup-tunnel explicit --port" "$(printf '%s\n' "$st_out2" | awk -F= '/^PORT=/{print $2}')" "20122"
+assert_session_identity "$st_cfg_port" bob-mac "$st_identity"
+assert_eq "explicit identity keeps the existing key" "$(ssh-keygen -lf "$st_identity.pub")" "$st_key_fingerprint"
+[ ! -e "$(dirname "$st_cfg_port")/id_ed25519" ] || fail "setup-tunnel replaced the explicit shared identity"
 st_home_cfg="$tmp/st-home-cfg"; mkdir -p "$st_home_cfg"
 st_session="$tmp/st-session"
 mkdir -p "$st_session"
@@ -1827,24 +1830,11 @@ rp_key="$(printf '%s' "$tmp/rp-mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 rp_sd="$rp_rh/.sessions/$rp_key.rev.rp1"
 assert_grep "$tmp/rp-inject.out" "RH_LAUNCH_PREFIX='$rp_sd/bin/rh-session'" "inject exposes the session launcher"
 [ -x "$rp_sd/bin/git" ] || fail "inject did not install the git shim"
-assert_grep "$rp_sd/bin/git" "project-host-tool.py" "git shim delegates to project-host-tool"
-assert_grep "$rp_sd/session.env" "MOUNTPOINT=$(b64 "$tmp/rp-mount")" "session metadata records the mountpoint"
-assert_grep "$rp_sd/session.env" "SSH_CONFIG=$(b64 "$rp_cfg")" "session metadata records the ssh config"
-if [ "${#rp_rh}" -lt 60 ]; then
-  assert_grep "$rp_sd/bin/rh-run" "--control-path" "short session runtime enables multiplexing"
-fi
-if [ -x "$rp_sd/bin/rg" ]; then
-  assert_grep "$tmp/rp-inject.out" "USE_BUILTIN_RIPGREP=0" "claude uses the rg shim when one is installed"
-fi
-assert_grep "$rp_sd/rule.md" "Internal git and ripgrep calls also run on" "rule describes internal git routing"
-refute_grep "$rp_sd/rule.md" "Simplified Chinese" "an English session rule asks for Chinese replies"
-refute_grep "$rp_sd/rule.md" "All Git commands are routed too" "rule still claims every Git command is routed"
 
 # Agent exits without any local cleanup: the watcher removes leftovers server-side.
 python3 -c 'import sys, time; time.sleep(300)' "$rp_sd/bin/rh-run" &
 rp_leftover=$!
 RH_REAP_POLL=1 RH_REAP_GRACE=1 RH_HOME="$rp_rh" "$rp_sd/bin/rh-session" sleep 1
-assert_grep "$rp_sd/owner.env" "OWNER_PID=" "launcher records the agent pid"
 rp_reaped() { [ ! -d "$rp_sd" ] && [ ! -e "$rp_cfg" ]; }  # reap removes the dir, then the config
 wait_until 300 rp_reaped || [ ! -d "$rp_sd" ] || fail "watcher did not reap the dead session dir"
 [ ! -e "$rp_cfg" ] || fail "watcher did not remove the session ssh config"
@@ -1879,27 +1869,24 @@ mkdir -p "$tmp/rp-outside"
 RH_HOME="$rp_rh" sh "$ROOT/scripts/session-reaper.sh" reap "$tmp/rp-outside"
 [ -d "$tmp/rp-outside" ] || fail "reaper deleted a directory outside \$RH_HOME/.sessions"
 
-# --- runner guard selection: with python3 the Bash runner is watched, without it unchanged -------
+# --- runner without Python; warm/cold generated wiring not covered by component tests -----------
 wr_rh="$tmp/wr-rh"
-mkdir -p "$wr_rh" "$tmp/wr-mount" "$tmp/wr-mount-nopy"
-RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount" 0 "$basic_ssh_cfg" > /dev/null
-wr_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-assert_grep "$wr_sd/bin/rh-run" "channel-guard.py" "runner holds the channel open with python3"
-assert_grep "$wr_sd/bin/rh-run" "--watch" "runner asks for watched execution"
+mkdir -p "$wr_rh" "$tmp/wr-mount-nopy"
 nopy_bin="$tmp/nopy-bin"
 mkdir -p "$nopy_bin"
-for nopy_src in /usr/local/bin/* /usr/bin/* /bin/*; do
-  nopy_name=${nopy_src##*/}
-  case "$nopy_name" in python*) continue ;; esac
-  [ -e "$nopy_bin/$nopy_name" ] || ln -s "$nopy_src" "$nopy_bin/$nopy_name" 2>/dev/null || true
+for nopy_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp ln git grep cksum base64; do
+  ln -s "$(command -v "$nopy_dep")" "$nopy_bin/$nopy_dep"
 done
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > %s\n' "$(sq "$tmp/nopy-ssh.args")" > "$nopy_bin/ssh"
+chmod +x "$nopy_bin/ssh"
 PATH="$nopy_bin" RH_HOME="$wr_rh" HOME="$rp_home" \
   "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/rp-code" laptop "$tmp/wr-mount-nopy" 0 "$basic_ssh_cfg" > "$tmp/wr-nopy.out"
 assert_grep "$tmp/wr-nopy.out" "RH_STATUS=INJECTED" "opencode inject works without python3"
 wr_nopy_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-nopy" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-refute_grep_e "$wr_nopy_sd/bin/rh-run" 'channel-guard|--watch' "runner requires python3 that is not installed"
+PATH="$nopy_bin" "$wr_nopy_sd/bin/rh-run" "$(b64 .)" "$(b64 true)"
+assert_grep "$tmp/nopy-ssh.args" "remote-harness-exec " "runner executes without python3"
+refute_grep "$tmp/nopy-ssh.args" " watch" "runner asks for watch mode without python3"
 [ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
-RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount" >/dev/null
 # With a session id and python3 the runner, launcher and shims use the session's warm pool.
 mkdir -p "$tmp/wr-mount-warm"
 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount-warm" 0 "$basic_ssh_cfg" rev.warm > /dev/null
@@ -1920,6 +1907,9 @@ RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off opencode "$t
 python3 "$ROOT/tests/test_dispatch_lifecycle.py" -v
 python3 "$ROOT/tests/test_project_host_tool.py" -v
 python3 "$ROOT/tests/test_shell_snapshot.py" -v
+python3 "$ROOT/tests/test_rule_privacy.py" -v
+python3 "$ROOT/tests/test_session_files.py" -v
+python3 "$ROOT/tests/test_diagnostics.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"

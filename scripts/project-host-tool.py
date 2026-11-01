@@ -573,12 +573,10 @@ def stop_master(args: Args) -> None:
 
 
 class DiagnosticCapture:
-    """Hold small transport diagnostics for retry decisions, stream larger stderr immediately.
+    """Hold small project stderr for missing-tool detection; stream overflow without changing bytes.
 
-    Once stderr is visible, retrying would duplicate diagnostics (and possibly completed work).
-    The caller treats this just like visible stdout. Gateway missing-tool/capacity messages fit in
-    the bounded capture and retain the original retry behavior. Only the captured prefix is path
-    mapped; overflow streams unchanged so an arbitrarily long diagnostic cannot grow a record buffer.
+    Any project stderr inhibits transport retries, including a small pending buffer. SSH's own
+    diagnostics go to a separate file and never enter this stream.
     """
 
     LIMIT = 65536
@@ -586,7 +584,6 @@ class DiagnosticCapture:
     def __init__(self, ctx: Context) -> None:
         self.pending = bytearray()
         self.emitted = False
-        self.rewriter = OutputRewriter(ctx.root, ctx.used_mount, False, anywhere=True)
 
     def _write(self, chunk: bytes) -> None:
         if chunk:
@@ -599,26 +596,27 @@ class DiagnosticCapture:
             self.pending.extend(chunk)
             return
         if self.pending:
-            for data in self.rewriter.feed(bytes(self.pending)):
-                self._write(data)
-            for data in self.rewriter.flush():
-                self._write(data)
+            self._write(bytes(self.pending))
             self.pending.clear()
-        # Do not put an unbounded, newline-free diagnostic into the discovery record buffer.
-        # Overflow streams unchanged; small transport diagnostics still get path mapping below.
         self._write(chunk)
 
     def finish(self) -> bytes:
         if self.emitted:
             return b""
-        parts = list(self.rewriter.feed(bytes(self.pending)))
-        parts.extend(self.rewriter.flush())
+        output = bytes(self.pending)
         self.pending.clear()
-        return b"".join(parts)
+        return output
 
 
 def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> tuple[int, bool, bytes]:
     global current_proc
+    if not getattr(ctx, "diagnostics", None):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import diagnostics
+        ctx.diagnostics = diagnostics.from_config(ctx.args.ssh_config)
+    log = ctx.diagnostics.new_log()
+    if command[0] == ctx.args.runner:
+        command += ["--diagnostic-log", log, "--diagnostic-id", ctx.diagnostics.session]
     proc = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,  # held open: closing it tells the project host to stop the tool
@@ -668,6 +666,11 @@ def run_attempt(command: list[str], rewriter: OutputRewriter, ctx: Context) -> t
         pass
     current_proc = None
     stderr = errors.finish()
+    ctx.transport_failure = bool(status == TRANSPORT_FAILURE and os.path.getsize(log))
+    ctx.transport_detail = b""
+    if ctx.transport_failure:
+        with open(log, "rb") as source:
+            ctx.transport_detail = source.read(65536)
     return status, emitted or errors.emitted, stderr
 
 
@@ -700,7 +703,8 @@ def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewrite
             emitted = True
 
     try:
-        status = warm_pool.run(held, request, on_stdout, errors.feed)
+        status = warm_pool.run(held, request, on_stdout, errors.feed, diagnostics=ctx.diagnostics,
+                               report_failures=False)
         for tail in rewriter.flush():
             out.write(tail)
             out.flush()
@@ -714,11 +718,22 @@ def warm_attempt(ctx: Context, relative: str, spec: str, rewriter: OutputRewrite
         held.close()
         current_claim = None
     stderr = errors.finish()
+    ctx.transport_failure = getattr(held, "transport_failure", False)
+    ctx.transport_detail = b""
     return status, emitted or errors.emitted, stderr
 
 
 def route(ctx: Context, effective: str, routed: list[str]) -> int:
     args = ctx.args
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import diagnostics as diagnostic_helpers
+    try:
+        ctx.diagnostics = diagnostic_helpers.from_config(args.ssh_config)
+    except diagnostic_helpers.Unavailable:
+        sys.stderr.buffer.write(diagnostic_helpers.summary("diagnostics", 255))
+        return TRANSPORT_FAILURE
+    ctx.transport_failure = False
+    ctx.transport_detail = b""
     relative = os.path.relpath(os.path.realpath(effective), ctx.mount_real)
     spec = encode_args(routed)
     json_mode = args.tool == "rg" and ctx.rg_json
@@ -736,18 +751,18 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
         limit, queue_seconds = 6, 600.0
     slot = acquire_slot(args.slots_dir, limit, queue_seconds)
     if slot is None:
-        sys.stderr.write(f"remote-harness: too many concurrent project-host {args.tool} calls\n")
+        ctx.diagnostics.emit("capacity", TRANSPORT_FAILURE)
         return TRANSPORT_FAILURE
     try:
         # A warm channel first. The call is read-only, so one that failed on its transport without
         # output is safe to run again on a new channel.
         result = warm_attempt(ctx, relative, spec, rewriter())
-        if result is None or (result[0] == TRANSPORT_FAILURE and not result[1]):
+        if result is None or (ctx.transport_failure and not result[1] and not result[2]):
             result = run_attempt(runner_command(args, relative, spec, True), rewriter(), ctx)
-            if result[0] == TRANSPORT_FAILURE and not result[1] and args.control_path:
+            if ctx.transport_failure and not result[1] and not result[2] and args.control_path:
                 # A capacity refusal says the master is alive. Leave its running sessions and
                 # future callers alone; only other transport failures retire a possibly wedged one.
-                error = result[2].lower()
+                error = ctx.transport_detail.lower()
                 if b"session open refused" not in error and b"no more sessions" not in error:
                     stop_master(args)
                 result = run_attempt(runner_command(args, relative, spec, False), rewriter(), ctx)
@@ -758,11 +773,8 @@ def route(ctx: Context, effective: str, routed: list[str]) -> int:
         raise ToolMissing()
     sys.stderr.buffer.write(stderr)
     sys.stderr.flush()
-    if status == TRANSPORT_FAILURE and not emitted:
-        sys.stderr.write(
-            f"remote-harness: could not run {args.tool} on the project host; "
-            "not falling back to scanning the SSHFS mount\n"
-        )
+    if ctx.transport_failure:
+        ctx.diagnostics.emit("ssh", status)
     return status
 
 
@@ -778,7 +790,7 @@ def missing_marker(args: Args) -> str:
 def run_local(ctx: Context, argv: list[str]) -> int:
     real = ctx.args.real
     if not real:
-        sys.stderr.write(f"{ctx.args.tool}: command not found on the agent host\n")
+        sys.stderr.write("remote-harness: category=tool exit=127 session=unknown\n")
         return 127
     extra: list[str] = []
     if ctx.args.tool == "git":
@@ -838,13 +850,13 @@ class Args:
 def main() -> int:
     raw = sys.argv[1:]
     if "--" not in raw:
-        sys.stderr.write("remote-harness: project-host-tool needs '--' before tool arguments\n")
+        sys.stderr.write("remote-harness: category=input exit=2 session=unknown\n")
         return 2
     split = raw.index("--")
     try:
         args = Args(raw[:split])
-    except ValueError as error:
-        sys.stderr.write(f"remote-harness: project-host-tool: {error}\n")
+    except ValueError:
+        sys.stderr.write("remote-harness: category=input exit=2 session=unknown\n")
         return 2
     argv = raw[split + 1:]
     ctx = Context(args)
@@ -880,6 +892,18 @@ def main() -> int:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(signum, signal.SIG_DFL)
         return run_local(ctx, argv)
+    except Exception:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import diagnostics
+        store = getattr(ctx, "diagnostics", None)
+        if store:
+            try:
+                import traceback
+                store.record(traceback.format_exc().encode())
+            except diagnostics.Unavailable:
+                pass
+        sys.stderr.buffer.write(diagnostics.summary("framework", 255, store.session if store else "unknown"))
+        return 255
 
 
 if __name__ == "__main__":

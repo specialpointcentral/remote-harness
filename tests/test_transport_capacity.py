@@ -191,7 +191,7 @@ class RoutingTests(unittest.TestCase):
         restricted = self.home / 'restricted-bin'
         restricted.mkdir()
         for name in ('bash', 'sh', 'dirname', 'mkdir', 'chmod', 'sed', 'tr', 'awk', 'cat',
-                     'rm', 'cp', 'git', 'python3', 'grep', 'cksum', 'base64'):
+                     'rm', 'cp', 'ln', 'git', 'python3', 'grep', 'cksum', 'base64'):
             (restricted / name).symlink_to(shutil.which(name))
         fake_ssh = restricted / 'ssh'
         fake_ssh.write_text('#!/bin/sh\nexit 23\n')
@@ -232,7 +232,7 @@ class RoutingTests(unittest.TestCase):
         fake = fake_bin / 'ssh'
         fake.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
                         'with open(os.environ["SSH_TEST_LOG"],"a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n'
-                        'sys.stderr.write("mux_client_request_session: session request failed: Session open refused by peer\\n")\n'
+                        'with open(sys.argv[sys.argv.index("-E")+1],"a") as f: f.write("mux_client_request_session: session request failed: Session open refused by peer\\n")\n'
                         'sys.exit(255)\n')
         fake.chmod(0o700)
         env = dict(self.env, PATH=str(fake_bin)+':'+self.env['PATH'], SSH_TEST_LOG=str(log))
@@ -287,7 +287,7 @@ class RoutingTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertEqual(blocked.returncode, 255)
         self.assertNotIn('running', blocked.stdout)
-        self.assertIn('too many concurrent background', blocked.stderr)
+        self.assertIn('category=capacity', blocked.stderr)
         self.assertGreaterEqual(elapsed, .8)
         self.assertLess(elapsed, 2.5)
         held[0].terminate()
