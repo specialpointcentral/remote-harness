@@ -271,7 +271,7 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
 - **远端 Agent 服务器需要 `sshfs` + FUSE**：
   - Linux/WSL：`sudo apt-get install -y sshfs`（FUSE 通常已就绪；脚本会按发行版给正确命令）。
   - **macOS：用 FUSE-T——无内核扩展、无需降低系统安全级**：
-    `brew install macos-fuse-t/homebrew-cask/fuse-t && brew install macos-fuse-t/homebrew-cask/sshfs-fuse-t`。
+    `brew install macos-fuse-t/cask/fuse-t && brew install macos-fuse-t/cask/sshfs-fuse-t`。
     **不要用 macFUSE**（它要求降低安全策略）。FUSE-T 保留 sshfs 的同步写，编辑会先落到代码所在机器
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
 - Claude/Codex 严格路由要求远端 Agent 主机有 `python3`；opencode 要求支持
@@ -651,7 +651,7 @@ See the full template, verification commands, and rollback notes in
   - Linux/WSL: `sudo apt-get install -y sshfs` (FUSE usually present; the script gives the right
     per-distro command).
   - **macOS: use FUSE-T — no kernel extension, no reduced system security**:
-    `brew install macos-fuse-t/homebrew-cask/fuse-t && brew install macos-fuse-t/homebrew-cask/sshfs-fuse-t`.
+    `brew install macos-fuse-t/cask/fuse-t && brew install macos-fuse-t/cask/sshfs-fuse-t`.
     Avoid macFUSE (it requires lowering security). FUSE-T keeps sshfs's synchronous writes, so edits
     land on the host before remote builds. (Kext-less fallback: `rclone nfsmount`, but its writes are
     async — prefer FUSE-T for this edit-here/build-on-host workflow.)

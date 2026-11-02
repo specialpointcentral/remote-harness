@@ -24,9 +24,11 @@ safe_ssh_token() {
   esac
 }
 
+# Homebrew 6 loads a third-party formula only once trusted; installing it by its canonical
+# user/tap/name trusts that one item, but the repository spelling (homebrew-cask) is refused.
 sshfs_install_hint(){   # the right install command for THIS machine's OS / package manager
   case "$(uname -s 2>/dev/null)" in
-    Darwin) printf 'brew install macos-fuse-t/homebrew-cask/fuse-t && brew install macos-fuse-t/homebrew-cask/sshfs-fuse-t  (no kernel extension / no reduced security)';;
+    Darwin) printf 'brew install macos-fuse-t/cask/fuse-t && brew install macos-fuse-t/cask/sshfs-fuse-t  (no kernel extension / no reduced security)';;
     *) if   command -v apt-get >/dev/null 2>&1; then printf 'sudo apt-get install -y sshfs'
        elif command -v dnf     >/dev/null 2>&1; then printf 'sudo dnf install -y fuse-sshfs'
        elif command -v pacman  >/dev/null 2>&1; then printf 'sudo pacman -S --noconfirm sshfs'
@@ -58,7 +60,7 @@ case "$SSH_CONFIG" in *'
 [ -n "$MP" ] || MP="$PWD"
 
 OS="$(uname -s 2>/dev/null || echo unknown)"
-# The sshfs binary. On macOS the no-kext FUSE-T build (brew macos-fuse-t/homebrew-cask/sshfs-fuse-t)
+# The sshfs binary. On macOS the no-kext FUSE-T build (brew macos-fuse-t/cask/sshfs-fuse-t)
 # may install as `sshfs` or `sshfs-fuse-t`; prefer plain `sshfs` if present.
 SSHFS_BIN=""; for c in sshfs sshfs-fuse-t; do command -v "$c" >/dev/null 2>&1 && { SSHFS_BIN="$c"; break; }; done
 
