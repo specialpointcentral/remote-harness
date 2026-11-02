@@ -63,7 +63,8 @@ emit PORT "${PORT:-}"
 
 # Is something listening on that loopback port? (best-effort diagnostic; the login test below is
 # the authoritative check, so a tool-less box that reports "down" here still proceeds.)
-if [ -n "$PORT" ] && listening_ports | grep -qx "$PORT"; then
+# The list is read whole first: under pipefail, grep -q's early exit could SIGPIPE the producer.
+if [ -n "$PORT" ] && grep -qx "$PORT" <<<"$(listening_ports)"; then
   emit LISTENER up
 else
   emit LISTENER down

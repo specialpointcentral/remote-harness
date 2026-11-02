@@ -241,6 +241,16 @@ PATH="$health_bin:$PATH" RH_HOME="$gateway_home/.remote-harness" TEST_HEALTH_REP
   > "$router_tmp/health-check.out"
 assert_grep "$router_tmp/health-check.out" "SSH=down" "tunnel check rejects a malformed health prefix"
 assert_grep "$router_tmp/health-check.out" "ERROR=ssh: fixture connection failed" "tunnel check keeps SSH failure diagnostics"
+# The listener is found although more ports than a pipe buffer holds follow it in the list.
+listen_bin="$router_tmp/listen-bin"
+mkdir -p "$listen_bin"
+printf '#!/bin/sh\nexec awk %s\n' \
+  "'BEGIN { for (p = 1; p <= 65000; p++) print \"LISTEN 0 128 127.0.0.1:\" p \" 0.0.0.0:*\" }'" > "$listen_bin/ss"
+chmod +x "$listen_bin/ss"
+PATH="$listen_bin:$health_bin:$PATH" RH_HOME="$gateway_home/.remote-harness" TEST_HEALTH_REPLY=RH_OK \
+  bash "$ROOT/scripts/check-tunnel.sh" --alias fixture-project-host --port 32023 \
+  > "$router_tmp/health-check.out"
+assert_grep "$router_tmp/health-check.out" "LISTENER=up" "tunnel check finds a listener in a long port list"
 gateway_exec=$(HOME="$gateway_home" \
   SSH_ORIGINAL_COMMAND="remote-harness-exec $(b64 "$router_tmp/project") $(b64 packages/api) $(b64 'printf gateway-ok')" \
   sh "$gateway_home/.remote-harness/bin/project-host-gateway.sh" "$gateway_tag")
@@ -780,8 +790,11 @@ ap_inject() {  # agent approval session-id; output in $tmp/approval-<session-id>
     "$tmp/code" laptop "$tmp/mount-approval" "$2" "$basic_ssh_cfg" "$3" > "$tmp/approval-$3.out"
   RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" off "$1" "$tmp/mount-approval" "$3" >/dev/null
 }
-printf '#!/bin/sh\necho "  --permission-mode <mode>  (choices: \\"auto\\", \\"manual\\")"\n' > "$ap_bin/claude"
-printf '#!/bin/sh\necho "      --approve-for-me"\n' > "$ap_bin/codex"
+# The supported mode comes first, then more help than any pipe buffer holds: a probe whose grep -q
+# exits early under pipefail would see the CLI die of SIGPIPE and fall back to normal approvals.
+ap_more="exec awk 'BEGIN { for (i = 0; i < 8000; i++) print \"      --other-option-\" i }'"
+printf '#!/bin/sh\necho "  --permission-mode <mode>  (choices: \\"auto\\", \\"manual\\")"\n%s\n' "$ap_more" > "$ap_bin/claude"
+printf '#!/bin/sh\necho "      --approve-for-me"\n%s\n' "$ap_more" > "$ap_bin/codex"
 chmod +x "$ap_bin/claude" "$ap_bin/codex"
 ap_inject claude auto ap.c1
 assert_grep "$tmp/approval-ap.c1.out" "--permission-mode auto" "auto approval starts claude in auto mode"
@@ -856,6 +869,19 @@ PY
   RH_HOME="$rh_home" HOME="$home_dir" \
     "$ROOT/scripts/inject-rule.sh" off codex "$tool_mount" "codex.$codex_yolo" >/dev/null
 done
+# More output than a pipe buffer holds after the version line still identifies the bundled ripgrep.
+mv "$codex_bundle/codex-path/rg" "$tmp/codex-path-rg.saved"
+printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\nexec awk %s\n' \
+  "'BEGIN { for (i = 0; i < 8000; i++) print \"feature-\" i }'" > "$codex_bundle/codex-path/rg"
+chmod +x "$codex_bundle/codex-path/rg"
+PATH="$codex_tool_bin" RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" on codex "$tool_proj" project-host "$tool_mount" 0 \
+    "$router_tmp/shim_ssh_config" codex.verbose > "$tmp/codex-verbose.out"
+codex_tool_sd="$rh_home/.sessions/$(printf '%s' "$tool_mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').codex.verbose"
+[ -x "$codex_tool_sd/bin/rg" ] || fail "a Codex bundled rg with long version output got no shim"
+RH_HOME="$rh_home" HOME="$home_dir" "$ROOT/scripts/inject-rule.sh" off codex "$tool_mount" codex.verbose >/dev/null
+rm -f "$codex_bundle/codex-path/rg"
+mv "$tmp/codex-path-rg.saved" "$codex_bundle/codex-path/rg"
 
 # Native Claude install: no rg in the login PATH, but the claude binary serves ripgrep. Claude's
 # Grep/Glob then use the session rg shim, which searches on the project host. A claude without an
@@ -866,10 +892,15 @@ for claude_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp ln git python
   ln -s "$(command -v "$claude_dep")" "$claude_tool_bin/$claude_dep"
 done
 cp "$codex_tool_bin/ssh" "$claude_tool_bin/ssh"
-for claude_variant in native plain; do
+for claude_variant in native verbose plain; do
   rm -f "$claude_tool_bin/claude"
   if [ "$claude_variant" = plain ]; then
     printf '#!/bin/sh\nprintf "2.0.0 (Claude Code)\\n"\n' > "$claude_tool_bin/claude"
+    chmod +x "$claude_tool_bin/claude"
+  elif [ "$claude_variant" = verbose ]; then
+    # More output than a pipe buffer holds after the version line still identifies ripgrep.
+    printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\nexec awk %s\n' \
+      "'BEGIN { for (i = 0; i < 8000; i++) print \"feature-\" i }'" > "$claude_tool_bin/claude"
     chmod +x "$claude_tool_bin/claude"
   elif [ -n "$rg_real" ]; then
     ln -s "$rg_real" "$claude_tool_bin/claude"
@@ -899,9 +930,9 @@ if variant == "plain":
     assert not os.path.exists(os.path.join(session_bin, "rg")), "rg shim without an rg-capable claude"
     assert "USE_BUILTIN_RIPGREP=0" not in launch_env, launch_env
     sys.exit(0)
-assert os.access(os.path.join(session_bin, "rg"), os.X_OK), "native claude rg did not get a shim"
+assert os.access(os.path.join(session_bin, "rg"), os.X_OK), f"{variant} claude rg did not get a shim"
 assert "USE_BUILTIN_RIPGREP=0" in launch_env, launch_env
-if rg_real:
+if rg_real and variant == "native":
     # The same calls Claude's Grep and Glob make, relative to the project directory.
     found = subprocess.check_output(["rg", "-l", "--null", "hello", "."], cwd=mount, env=env)
     assert found == b"./src/a.txt\0", found
@@ -1951,10 +1982,11 @@ if [ -d /proc/self ] && command -v perl >/dev/null 2>&1; then
   }
   ds_fake ds_idle "$ds_title" 0; ds_fake ds_sftp "/usr/bin/ssh -F $ds_cfg -x box -s sftp" 0; sleep 0.5
   # Neither the unmounted daemon nor its sftp ssh keeps the session SSH config in use.
-  RH_HOME="$tmp/ds-rh" sh "$ROOT/scripts/session-reaper.sh" config-used "$ds_cfg" | grep -qx USED=0 \
+  grep -qx USED=0 <<<"$(RH_HOME="$tmp/ds-rh" sh "$ROOT/scripts/session-reaper.sh" config-used "$ds_cfg")" \
     || fail "an sshfs whose mount is gone kept its SSH config in use"
   kill "$ds_sftp" 2>/dev/null || true; wait "$ds_sftp" 2>/dev/null || true
-  RH_PROGRESS_FD=3 RH_SSHFS_IDLE_SECONDS=2 ds_unmount 3>"$tmp/ds-progress" | grep -qx STATUS=unmounted || fail "detached sshfs unmount status"
+  grep -qx STATUS=unmounted <<<"$(RH_PROGRESS_FD=3 RH_SSHFS_IDLE_SECONDS=2 ds_unmount 3>"$tmp/ds-progress")" \
+    || fail "detached sshfs unmount status"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=unmounted" "unmount reports detach progress"
   assert_grep "$tmp/ds-progress" "RH_PROGRESS=sshfs-wait" "unmount reports waiting for a lingering sshfs"
   wait_gone "$ds_idle" 20 || fail "idle detached sshfs kept running although no FUSE superblock of ours was left"
@@ -1997,7 +2029,7 @@ if [ -n "$fm_sftp" ] && [ -c /dev/fuse ] && command -v sshfs >/dev/null 2>&1 \
     fm_daemon=$(fm_pid)
     (cd "$fm_mp" && exec 9>>held && exec sleep 60) & fm_holder=$!; sleep 0.5
     # The holder's cwd/fd now read "/" and "/held": invisible to any path scan of the old mountpoint.
-    fm_run | grep -qx STATUS=unmounted || fail "busy real sshfs mount was not lazily detached"
+    grep -qx STATUS=unmounted <<<"$(fm_run)" || fail "busy real sshfs mount was not lazily detached"
     kill -0 "$fm_daemon" 2>/dev/null || fail "real sshfs was stopped while a process still used its detached mount"
     ls "/proc/$fm_holder/cwd/" >/dev/null 2>&1 || fail "the detached mount stopped serving its holder"
     # A second unmount no longer knows the device number: our unlisted live superblock keeps it.
@@ -2008,7 +2040,7 @@ if [ -n "$fm_sftp" ] && [ -c /dev/fuse ] && command -v sshfs >/dev/null 2>&1 \
     # A clean unmount still ends the daemon.
     if fm_mount; then
       fm_daemon=$(fm_pid)
-      fm_run | grep -qx STATUS=unmounted || fail "idle real sshfs mount was not unmounted"
+      grep -qx STATUS=unmounted <<<"$(fm_run)" || fail "idle real sshfs mount was not unmounted"
       wait_gone "$fm_daemon" 50 || fail "real sshfs kept running after a clean unmount"
     fi
   else

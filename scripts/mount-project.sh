@@ -68,8 +68,11 @@ is_mounted() {
   _mp="$1"
   _canon="$(canon_mountpoint "$_mp")"
   if command -v mountpoint >/dev/null 2>&1; then mountpoint -q "$1" && return 0; fi
-  mount 2>/dev/null | grep -qF " $_mp " && return 0
-  [ "$_canon" != "$_mp" ] && mount 2>/dev/null | grep -qF " $_canon " && return 0
+  # Read a command's whole output before grep: under pipefail, `cmd | grep -q` fails when grep's
+  # early exit stops cmd with SIGPIPE, although the line was there.
+  _mounts="$(mount 2>/dev/null)"
+  grep -qF " $_mp " <<<"$_mounts" && return 0
+  [ "$_canon" != "$_mp" ] && grep -qF " $_canon " <<<"$_mounts" && return 0
   return 1
 }
 canon_mountpoint() {
@@ -410,7 +413,7 @@ fi
 # such a burst of small lookups. Only sshfs builds that advertise the option get it.
 MAX_CONNS="${RH_SSHFS_MAX_CONNS:-1}"
 case "$MAX_CONNS" in ''|*[!0-9]*) MAX_CONNS=1;; esac
-if [ "$MAX_CONNS" -gt 1 ] && "$SSHFS_BIN" --help 2>&1 | grep -q 'max_conns'; then
+if [ "$MAX_CONNS" -gt 1 ] && grep -q 'max_conns' <<<"$("$SSHFS_BIN" --help 2>&1)"; then
   [ "$MAX_CONNS" -le 16 ] || MAX_CONNS=16
   SSHFS_OPTS="$SSHFS_OPTS,max_conns=$MAX_CONNS"
 fi

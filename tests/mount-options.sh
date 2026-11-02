@@ -6,13 +6,15 @@ fixture=$(mktemp -d /tmp/rh-mount-options.XXXXXX)
 fixture=$(cd "$fixture" && pwd -P)
 real_mp="$fixture/real-mount"
 OS=$(uname -s)
-# macOS has no mountpoint(1); FUSE-T mounts appear in mount(8) by their real path. No bare `return`:
-# called from the EXIT trap, it would report the status from before the trap.
+# macOS has no mountpoint(1); FUSE-T mounts appear in mount(8) by their real path. The table is read
+# whole: under pipefail, `mount | grep -q` fails when grep's early exit stops mount with SIGPIPE (and
+# GNU grep exits early for output to /dev/null too). No bare `return`: called from the EXIT trap, it
+# would report the status from before the trap.
 real_mounted() {
   if command -v mountpoint >/dev/null 2>&1; then
     mountpoint -q "$real_mp" 2>/dev/null
   else
-    mount 2>/dev/null | grep -F " $real_mp " >/dev/null
+    grep -qF " $real_mp " <<<"$(mount 2>/dev/null)"
   fi
 }
 cleanup() {
@@ -40,11 +42,13 @@ unset RH_SSHFS_FOLLOW_SYMLINKS
 mc_bin="$fixture/bin"
 mkdir -p "$mc_bin" "$fixture/mount"
 : > "$fixture/ssh_config"
+# Fake help and mount table put the line a probe looks for first, then more than any pipe buffer:
+# a probe whose grep -q exits early under pipefail then fails deterministically on SIGPIPE.
 cat > "$mc_bin/sshfs" <<'SH'
 #!/bin/sh
 if [ "$1" = --help ]; then
   [ -n "${MC_NO_MAX:-}" ] || printf '%s\n' '-o max_conns=N'
-  exit 0
+  exec awk 'BEGIN { for (i = 0; i < 8000; i++) print "    -o other_option_" i "=VALUE" }'
 fi
 printf '%s\n' "$@" > "$MC_LOG"
 exit 1
@@ -55,7 +59,12 @@ if [ "$1" = -s ] && [ -n "${MC_OS:-}" ]; then printf '%s\n' "$MC_OS"
 else exec "$REAL_UNAME" "$@"; fi
 SH
 printf '#!/bin/sh\nexit 1\n' > "$mc_bin/mountpoint"
-printf '#!/bin/sh\nexit 0\n' > "$mc_bin/mount"
+cat > "$mc_bin/mount" <<'SH'
+#!/bin/sh
+[ -n "${MC_MOUNTED:-}" ] || exit 0
+printf 'box:/p on %s type fuse.sshfs (rw)\n' "$MC_MOUNTED"
+exec awk 'BEGIN { for (i = 0; i < 8000; i++) print "tmpfs on /run/filler-" i " type tmpfs (rw)" }'
+SH
 chmod +x "$mc_bin/"*
 mc_opts() {  # arguments from the existing fake-SSHFS mount fixture
   : > "$MC_LOG"
@@ -80,6 +89,10 @@ case "$(MC_OS=Linux RH_SSHFS_CACHE_SECONDS=0 mc_opts)" in *negative_timeout*|*au
 mc_unsupported="$(MC_NO_MAX=1 RH_SSHFS_MAX_CONNS=4 mc_opts)"
 [ -n "$mc_unsupported" ] || fail 'fake sshfs was not invoked'
 case "$mc_unsupported" in *max_conns*) fail 'max_conns passed to an sshfs that does not support it';; esac
+# Without mountpoint(1) answering yes (as on macOS), a mount listed early in a long table is reused.
+MC_MOUNTED="$fixture/mount" mc_opts >/dev/null
+grep -qx STATUS=already-mounted "$fixture/mount.out" || fail 'a mount listed before a long mount table was not found'
+[ ! -s "$MC_LOG" ] || fail 'a listed mount was mounted again'
 
 # Reject invalid settings before mount or local launcher SSH activity; cleanup ignores this knob.
 for value in 2 true '1,follow_symlinks' '$(touch bad)' '1;exit 0'; do

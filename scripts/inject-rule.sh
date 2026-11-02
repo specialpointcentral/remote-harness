@@ -627,7 +627,9 @@ case "${1:-}" in
           /*)
             codex_real=$("$PYTHON3" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$codex_bin")
             codex_rg="$(dirname "$(dirname "$codex_real")")/codex-path/rg"
-            if [ -x "$codex_rg" ] && "$codex_rg" --version </dev/null 2>/dev/null | grep -q '^ripgrep '; then
+            # Probes read the whole output before grep: under pipefail, `cmd | grep -q` fails when
+            # grep's early exit stops cmd with SIGPIPE, although the line was there.
+            if [ -x "$codex_rg" ] && grep -q '^ripgrep ' <<<"$("$codex_rg" --version </dev/null 2>/dev/null)"; then
               real_rg="$codex_rg"
             fi
             ;;
@@ -637,7 +639,7 @@ case "${1:-}" in
         claude_bin=$(command -v claude 2>/dev/null || true)
         case "$claude_bin" in
           /*)
-            if (exec -a rg "$claude_bin" --version </dev/null 2>/dev/null) | grep -q '^ripgrep '; then
+            if grep -q '^ripgrep ' <<<"$(exec -a rg "$claude_bin" --version </dev/null 2>/dev/null)"; then
               real_rg="$claude_bin"; rg_argv0=rg
             fi
             ;;
@@ -676,7 +678,7 @@ case "${1:-}" in
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
         if [ "$approval" = auto ]; then
-          if claude --help 2>/dev/null | grep -q '"auto"'; then
+          if grep -q '"auto"' <<<"$(claude --help 2>/dev/null)"; then
             flags_out="$flags_out --permission-mode auto"
           else
             approval=normal
@@ -724,7 +726,7 @@ case "${1:-}" in
         fi
         if [ "$approval" = auto ]; then
           # Automatic review keeps the workspace-write sandbox selected above.
-          if codex --help 2>/dev/null | grep -q -- '--approve-for-me'; then
+          if grep -q -- '--approve-for-me' <<<"$(codex --help 2>/dev/null)"; then
             flags_out="$flags_out --approve-for-me"
           else
             approval=normal
