@@ -126,5 +126,8 @@ bash tests/regression.sh
 git diff --check
 ```
 
+With sshfs and FUSE installed (FUSE-T on macOS), run the regression with `RH_TEST_REAL_SSHFS=1`, as
+CI does: the real local-SFTP mount tests then fail instead of skipping when they cannot run.
+
 The full remote-server-to-local-project SSHFS flow remains a manual integration test. Never commit
 or push unless the user asks; push only the authorized fork.

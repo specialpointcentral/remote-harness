@@ -33,10 +33,12 @@ jobs:
           # The install command mount-project.sh suggests on macOS.
           brew install macos-fuse-t/cask/fuse-t
           brew install macos-fuse-t/cask/sshfs-fuse-t
+      # The same checks as the Verification section of AGENTS.md. `bash -n` reads one script; any
+      # further names are only that script's arguments.
       - name: Check shell syntax
-        run: bash -n manage.sh tests/regression.sh scripts/*.sh
+        run: for script in manage.sh tests/*.sh scripts/*.sh; do bash -n "$script" || exit 1; done
       - name: Check Python syntax
-        run: python3 -m py_compile scripts/route-command.py tests/codex_tui_e2e.py
+        run: python3 -m py_compile scripts/*.py tests/*.py tests/fixtures/*.py
       - name: Run regression tests
         env:
           # SSHFS is installed above: a real mount test that cannot run fails instead of skipping.

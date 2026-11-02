@@ -75,6 +75,8 @@
   `config --get`、`branch --show-current`、`symbolic-ref` 等）路由到项目主机，并把发现命令输出中
   项目主机的绝对路径映射回挂载点；会写入的 git 调用留在远端执行。
 - 挂载点之外、或指定了其它仓库/index 的调用，原样执行真实工具。
+- Claude 会话默认把 `CLAUDE_CODE_BASH_EDIT_DIFF` 设为 `0`（远端登录 shell 导出的值优先）：它按目录
+  建立的 inotify 监听看不到路由命令造成的修改，还会在 SSHFS 上卡住。
 - 无法连到项目主机的路由调用必须以非零退出；绝不报告 clean 或无匹配，也不回退为扫描 SSHFS。
   只有可达的项目主机明确答复"未安装该工具"时，本会话此后才改用远端的该工具。
 - 路由调用共享每会话并发上限，以及只通过命令行传入的短期 OpenSSH 复用 master；生成的
@@ -109,6 +111,9 @@ python3 -m py_compile scripts/*.py tests/*.py tests/fixtures/*.py
 bash tests/regression.sh
 git diff --check
 ```
+
+装有 sshfs 和 FUSE（macOS 上为 FUSE-T）时，像 CI 一样用 `RH_TEST_REAL_SSHFS=1` 运行回归测试：
+真实的本机 SFTP 挂载测试无法运行时会失败，而不是跳过。
 
 完整远端服务器到本机项目的 SSHFS 流程仍需人工集成测试。未经用户要求不得 commit/push；只推送
 授权 fork。
