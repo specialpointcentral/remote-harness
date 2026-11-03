@@ -354,6 +354,16 @@ remote-harness/
   监听挂载点内的每个目录，而路由命令在项目主机上修改文件，SSHFS 不会产生对应事件，所以差异始终为空，
   建立监听却会拖慢界面。需要时在远端 shell 启动文件中 `export CLAUDE_CODE_BASH_EDIT_DIFF=1`；
   查看改动请用路由后的 `git diff`。
+- 隐私：Bash 在笔记本上执行，输出（`pwd`、报错、堆栈等）里会出现笔记本上的项目路径和用户名，并进入模型
+  上下文。git/rg 垫片会把报错里的项目路径映射回挂载点，项目命令自己的输出不做改写。
+- 远端 `/proc` 没有 `hidepid` 挂载选项时，服务器上的其他用户能看到所有进程的参数，包括 Agent 执行的 Bash
+  命令（在共享主机上直接运行 Claude 也一样）；检测到其他用户时启动器会提示。Linux 上挂载表只显示
+  `remote-harness`，不显示项目来源；默认挂载目录 `~/.remote-harness/mounts` 仅本人可访问。
+- Claude 会话的 settings 禁止 Read/Edit/Grep/Glob 访问会话目录（网关密钥、SSH 配置、runner、私有日志）和
+  `/proc`，Agent 也看不到 `SSH_CONNECTION` 里笔记本的地址和端口。
+- 不想让 Claude Code 发送遥测和错误报告时，在远端 shell 启动文件中
+  `export DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1`；`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 还会
+  关掉更新检查、`/feedback` 等非必要流量。
 
 ### 故障排查
 
@@ -751,6 +761,19 @@ remote-harness/
   files on the project host, and SSHFS reports no events for those changes, so the diff stays empty
   while setting up the watches slows the UI. To turn it back on, `export CLAUDE_CODE_BASH_EDIT_DIFF=1`
   in a remote shell startup file; routed `git diff` shows changes.
+- Privacy: Bash runs on the laptop, so its output (`pwd`, errors, stack traces) shows the laptop's
+  project path and user name and reaches the model. The git/rg shims map the project path in their
+  errors back to the mount; a project command's own output is not rewritten.
+- Unless `/proc` on the remote server is mounted with `hidepid`, other users there can read every
+  process's arguments, the agent's Bash commands included (as when running Claude directly on a shared
+  host); the launcher warns when it finds other users. On Linux the mount table shows only
+  `remote-harness`, not the project source, and the default `~/.remote-harness/mounts` is owner-only.
+- Claude session settings deny Read/Edit/Grep/Glob on the session directories (gateway key, SSH
+  config, runner, private logs) and `/proc`, and the agent never sees the laptop's address and port in
+  `SSH_CONNECTION`.
+- To keep Claude Code from sending telemetry and error reports, `export DISABLE_TELEMETRY=1
+  DISABLE_ERROR_REPORTING=1` in a remote shell startup file; `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+  also turns off update checks, `/feedback` and other nonessential traffic.
 
 ### Troubleshooting
 

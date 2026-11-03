@@ -40,6 +40,10 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
 - The main agent starts only through `ssh -tt <remote> ... <claude|codex|opencode>`.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
+- Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc`. `rh-session` blanks the
+  laptop's address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Linux sshfs mounts use
+  `fsname=remote-harness` and keep their source in the mount record; `mounts` is owner-only. Shim
+  stderr maps the project root back to the mount.
 
 ## Gateway Security
 

@@ -1356,6 +1356,10 @@ if [ "$rh_status" = INJECTED ]; then
     fi
   fi
   rh_ready=$(printf '%s\n' "$rh_out" | kv_value RH_READY_FILE)
+  if [ "$(printf '%s\n' "$rh_out" | kv_value RH_PROCESS_LIST_SHARED)" = 1 ]; then
+    warn "$(tr2 "Other users on the remote server can read every process's arguments, including the agent's Bash commands; an administrator can mount /proc with hidepid=2 to stop that." \
+                "远端服务器上的其他用户能读取所有进程的参数，包括 Agent 执行的 Bash 命令；管理员可以给 /proc 加上 hidepid=2 挂载选项来阻止。")"
+  fi
   # The session launcher records the agent pid for the box-side watcher that cleans up after a
   # dropped connection; it wraps only this final launch, never the opencode readiness probe below.
   rh_prefix=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_PREFIX)

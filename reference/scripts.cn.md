@@ -46,6 +46,7 @@
   `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc` 的系统上不会结束任何进程。
 - `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
   opencode 还会返回启动前必须出现的 readiness marker 路径。
+  `RH_PROCESS_LIST_SHARED=1` 告诉启动器 Agent 主机上的其他用户能读取进程参数（`/proc` 没有 `hidepid`）。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
   不会删除其它仍在运行的会话的 hook 或 runner。
   规则要求 Agent 按用户最近一条消息的语言回复，而不是按指令、工具输出或项目文件的语言回复，
@@ -109,9 +110,10 @@
   rg 文本始终映射行首的项目根路径前缀，包括单个绝对路径文件的 `--vimgrep` 输出。仅含内容的匹配若以相同
   前缀开头，就无法与文件名区分，也会接受同样的映射。JSON 映射在内存中逐条解码完整记录，只修改
   `data.path.text` 或 base64 编码的 `bytes` 变体；内容和匹配偏移的值不变，但 JSON 格式可能变化。
-  Git 发现输出按换行/NUL 分隔的记录逐条映射路径。rg 文本改写使用有界内存。项目 stderr 逐字节保留，
-  最多缓存 64 KiB 以识别工具缺失协议，超出后流式输出。即使命令返回 255，只要有项目 stderr 就不再
-  重试；传输错误和容量信息由独立的私有 SSH 诊断提供，stdout 的既有路径映射不变。
+  Git 发现输出按换行/NUL 分隔的记录逐条映射路径。rg 文本改写使用有界内存。项目 stderr 按行把项目根路径
+  映射回挂载点（包括带引号的路径，每行最多 64 KiB），最多缓存 64 KiB 以识别工具缺失协议，超出后流式输出。
+  含 `..` 的绝对路径参数先规范化再映射。即使命令返回 255，只要有项目 stderr 就不再重试；传输错误和
+  容量信息由独立的私有 SSH 诊断提供，stdout 的既有路径映射不变。
 - `session-reaper.sh`：远端每会话 watcher 加启动时 GC。Agent 进程消失（或其终端已挂断）时，
   停止复用 master 和残留的路由进程，在没有其它存活会话使用时卸载该会话挂载，并删除会话目录
   以及会话 SSH config 和 private key。经隧道的心跳检查连续失败满 `RH_HEARTBEAT_TIMEOUT` 秒后结束 Agent；

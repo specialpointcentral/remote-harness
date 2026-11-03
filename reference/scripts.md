@@ -55,6 +55,8 @@
   (default 120) passes. Without `/proc` nothing is stopped.
 - `inject-rule.sh`: installs session instructions, Claude/Codex hooks or the opencode plugin, and the
   remote runner. opencode emits a readiness marker path that must be observed before launch.
+  `RH_PROCESS_LIST_SHARED=1` tells the launcher that other users on the agent host can read process
+  arguments (no `hidepid` on `/proc`).
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
   project or cleaning up a dead launch never removes another live session's hook or runner.
   The rule tells the agent to reply in the language of the user's latest message, not that of the
@@ -137,10 +139,11 @@
   decodes one whole record in memory and changes only `data.path.text` or its base64 `bytes` variant;
   content and match offsets retain their values, while JSON formatting may change. Git discovery
   paths are mapped one newline/NUL record at a time. rg text rewriting uses bounded memory. Project
-  stderr is preserved byte for byte, with at most 64 KiB held for the missing-tool protocol before
-  streaming overflow. Project stderr also prevents retries when a command returns 255; private SSH
-  diagnostics supply transport and capacity information separately. Existing stdout path mapping is
-  unchanged.
+  stderr has the project root mapped back to the mount line by line (quoted paths included, at most
+  64 KiB per line), with at most 64 KiB held for the missing-tool protocol before streaming overflow.
+  An absolute argument with `..` is normalized before it is mapped. Project stderr also prevents
+  retries when a command returns 255; private SSH diagnostics supply transport and capacity
+  information separately. Existing stdout path mapping is unchanged.
 - `session-reaper.sh`: remote per-session watcher plus launch-time GC. When the agent process is
   gone (or its terminal was hung up), it stops the multiplexing master and leftover routed processes,
   unmounts the session mount unless another live session uses it, and removes the session dir and the

@@ -299,14 +299,14 @@ class ToolTests(unittest.TestCase):
             self.assertEqual([json.loads(record) for record in output.splitlines()], expected)
             self.assertFalse(output.endswith(b'\n'))
 
-    def test_small_project_stderr_keeps_exact_bytes_without_becoming_visible(self):
+    def test_small_project_stderr_maps_the_root_without_becoming_visible(self):
         self.ctx.root, self.ctx.used_mount = self.old, self.new
         stream = Stream()
         with mock.patch.object(tool.sys, 'stderr', stream):
             errors = tool.DiagnosticCapture(self.ctx)
             errors.feed(b'rg: /project/ro')
             errors.feed(b'ot/missing: not found\n')
-            self.assertEqual(errors.finish(), b'rg: /project/root/missing: not found\n')
+            self.assertEqual(errors.finish(), 'rg: /remote/挂载/missing: not found\n'.encode())
         self.assertFalse(errors.emitted)
         self.assertEqual(stream.buffer.getvalue(), b'')
 
@@ -322,7 +322,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(stream.count, 8 * 1024 * 1024)
         self.assertLessEqual(stream.largest, 65536 + len(self.old) + 1)
 
-    def test_large_diagnostic_overflow_streams_without_path_mapping(self):
+    def test_large_diagnostic_overflow_streams_with_path_mapping(self):
         self.ctx.root, self.ctx.used_mount = self.old, self.new
         prefix = b'rg: /project/root/missing '
         prefix += b'x' * (tool.DiagnosticCapture.LIMIT - len(prefix))
@@ -335,8 +335,34 @@ class ToolTests(unittest.TestCase):
             errors.feed(overflow)
             self.assertEqual(errors.finish(), b'')
         self.assertTrue(errors.emitted)
-        self.assertEqual(stream.buffer.getvalue(), prefix + overflow)
+        mapped = lambda data: data.replace(self.old.encode(), self.new.encode())
+        self.assertEqual(stream.buffer.getvalue(), mapped(prefix) + mapped(overflow))
         self.assertEqual(errors.pending, b'')
+
+    def test_error_text_maps_quoted_roots_but_not_longer_names(self):
+        rewriter = tool.ErrorRewriter(self.old, self.new)
+        data = (b"fatal: '/project/root/x' is outside repository at '/project/root'\n"
+                b'keep /project/rootX and a/project/root\0("/project/root")')
+        out = b''.join([piece for offset in range(len(data))
+                        for piece in rewriter.feed(data[offset:offset + 1])] + list(rewriter.flush()))
+        self.assertEqual(out.decode(), "fatal: '/remote/挂载/x' is outside repository at '/remote/挂载'\n"
+                                       'keep /project/rootX and a/project/root\0("/remote/挂载")')
+
+    def test_parent_references_are_resolved_before_mapping(self):
+        outside = Path(self.tmp.name) / 'outside'
+        outside.mkdir()
+        with self.assertRaises(tool.StayLocal):
+            self.ctx.translate_path(f'{self.mount}/../outside', str(self.mount))
+        self.assertEqual(self.ctx.translate_path(f'{self.mount}/a/../b/', str(self.mount)), '/project/root/b/')
+        self.assertEqual(self.ctx.translate_path(f'{self.mount}/../missing', str(self.mount)),
+                         f'{self.tmp.name}/missing')
+
+    def test_unusable_agent_host_tool_reports_a_summary_line(self):
+        self.args.real, self.args.real_argv0 = str(Path(self.tmp.name) / 'no-such-rg'), ''
+        stream = Stream()
+        with mock.patch.object(tool.sys, 'stderr', stream):
+            self.assertEqual(tool.run_local(self.ctx, ['pattern']), 127)
+        self.assertEqual(stream.buffer.getvalue(), b'remote-harness: category=tool exit=127 session=unknown\n')
 
     def test_cold_attempt_streams_both_outputs_and_keeps_error_status(self):
         stdout, stderr = CountingStream(), CountingStream()

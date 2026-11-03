@@ -89,6 +89,16 @@ case "$(MC_OS=Linux RH_SSHFS_CACHE_SECONDS=0 mc_opts)" in *negative_timeout*|*au
 mc_unsupported="$(MC_NO_MAX=1 RH_SSHFS_MAX_CONNS=4 mc_opts)"
 [ -n "$mc_unsupported" ] || fail 'fake sshfs was not invoked'
 case "$mc_unsupported" in *max_conns*) fail 'max_conns passed to an sshfs that does not support it';; esac
+# The world-readable mount table names no project source; FUSE-T's sshfs keeps its own options.
+case ",$mc_default," in *,fsname=remote-harness,*) ;; *) fail 'Linux sshfs mount table shows the project source';; esac
+case ",$(MC_OS=Darwin mc_opts)," in *,fsname=*) fail 'FUSE-T sshfs got the libfuse fsname option';; esac
+# The parent of default mountpoints, named after their projects, is private to this account.
+mkdir -p "$fixture/rh/mounts/proj"
+chmod 755 "$fixture/rh/mounts"
+PATH="$mc_bin:$PATH" RH_HOME="$fixture/rh" "$ROOT/scripts/mount-project.sh" --alias box --remote-path /p \
+  --ssh-config "$fixture/ssh_config" --mountpoint "$fixture/rh/mounts/proj" >/dev/null 2>&1 || true
+[ "$(stat -c %a "$fixture/rh/mounts" 2>/dev/null || stat -f %Lp "$fixture/rh/mounts")" = 700 ] \
+  || fail 'the default mountpoint parent is not private'
 # Without mountpoint(1) answering yes (as on macOS), a mount listed early in a long table is reused.
 MC_MOUNTED="$fixture/mount" mc_opts >/dev/null
 grep -qx STATUS=already-mounted "$fixture/mount.out" || fail 'a mount listed before a long mount table was not found'
@@ -218,6 +228,12 @@ else:
 assert os.readlink(source / "absolute") == str(source / "target")
 PY
 # Another session reusing the mount learns the mode it actually has, not the one it asked for.
+# The mount table shows the fixed fsname, never alias:path; sessions match the source by record.
+if [ "$(uname -s)" = Linux ]; then
+  real_table=$(cat /proc/mounts)
+  grep -qF "remote-harness $real_mp " <<<"$real_table" || fail 'the real mount does not show the fixed fsname'
+  ! grep -qF "x:$real_src" <<<"$real_table" || fail 'the mount table names the project source'
+fi
 real_mount rev.b
 grep -qx STATUS=already-mounted "$fixture/real.out" || fail 'second session did not reuse the mount'
 grep -qx FOLLOW_SYMLINKS=0 "$fixture/real.out" || fail 'shared mount did not report its preserved-symlink mode'

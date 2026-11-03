@@ -322,7 +322,16 @@ if is_mounted "$MP"; then
   if [ "$OS" != Darwin ]; then
     case "$want" in
       *[[:space:]]*) ;;                       # spaced source: unparseable from the mount table
-      *) have="$(mounted_source "$MP")";;
+      *) have="$(mounted_source "$MP")"
+         # Our Linux mounts show a fixed fsname: a session reads their source from the mount
+         # record; without one only liveness counts, as on macOS.
+         if [ "$have" = remote-harness ]; then
+           have=""
+           if [ -n "$SESSION_ID" ]; then
+             have=$(kv_b64 "$(mount_record "$MP")" REMOTE 2>/dev/null) || have=""
+             [ -n "$have" ] || have=remote-harness
+           fi
+         fi;;
     esac
   fi
   # Reuse only a LIVE mount that points at the requested project; otherwise drop the stale/wrong
@@ -370,6 +379,8 @@ if [ "$FORCE" != 1 ] && [ -n "$(ls -A "$MP" 2>/dev/null)" ]; then
 fi
 
 RH_HOME="${RH_HOME:-$HOME/.remote-harness}"
+# Default mountpoints are named after their projects: keep their parent private to this account.
+case "$MP" in "$RH_HOME/mounts/"*) chmod 700 "$RH_HOME/mounts" 2>/dev/null || true;; esac
 mkdir -p "$RH_HOME/.sessions" 2>/dev/null || true
 err="$(mktemp "$RH_HOME/.sessions/rh-mount.XXXXXX" 2>/dev/null)" || err="${RH_HOME}/.sessions/rh-mount.$$"
 # reconnect + keepalives so brief tunnel hiccups self-heal. idmap=user (libfuse sshfs) maps the
@@ -378,9 +389,11 @@ err="$(mktemp "$RH_HOME/.sessions/rh-mount.XXXXXX" 2>/dev/null)" || err="${RH_HO
 # slows stat-heavy operations — git status, editor file-watchers, tree-scanning builds — noticeably
 # over the tunnel. The trade-off is a brief window where a file changed on the project host (for
 # example by a routed build) may still look stale through the mount.
+# The mount table is world-readable even where /proc hides other users' processes (hidepid), and its
+# source column would show alias:/project/path, so libfuse sshfs mounts show a fixed fsname instead.
 case "$OS" in
   Darwin) SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3";;
-  *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user";;
+  *)      SSHFS_OPTS="reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user,fsname=remote-harness";;
 esac
 # By default the project host resolves symlinks, so every link reads exactly as it does there; linked
 # directories then look like ordinary ones and recursive scans descend into them. RH_SSHFS_FOLLOW_SYMLINKS=0
@@ -436,6 +449,9 @@ if "$SSHFS_BIN" "$ALIAS:$RPATH" "$MP" -o "$SSHFS_OPTS" 2>"$err"; then
     record=$(mount_record "$MP")
     if [ -f "$record" ] && [ ! -L "$record" ] && [ -z "$(kv "$record" FOLLOW_SYMLINKS)" ]; then
       printf 'FOLLOW_SYMLINKS=%s\n' "$FOLLOW_SYMLINKS" >> "$record"
+    fi
+    if [ -f "$record" ] && [ ! -L "$record" ] && [ -z "$(kv "$record" REMOTE)" ]; then
+      printf 'REMOTE=%s\n' "$(printf '%s' "$ALIAS:$RPATH" | base64 | tr -d '\n')" >> "$record"
     fi
   fi
   emit STATUS mounted

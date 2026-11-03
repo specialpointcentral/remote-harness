@@ -32,7 +32,9 @@
 #               RH_RESUME_AVAILABLE=<reason>,<epoch> when the last session of this mountpoint and
 #               agent ended on a lost connection (offered once; the marker is consumed), and
 #               RH_RESUME_ARGS=<agent arguments that continue the last conversation>
-#               RH_READY_FILE=<opencode marker>  RH_LAUNCH_PREFIX=<session launcher for the final launch>
+#               RH_READY_FILE=<opencode marker>
+#               RH_PROCESS_LIST_SHARED=<1 when other users here can read process arguments>
+#               RH_LAUNCH_PREFIX=<session launcher for the final launch>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
 # Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
 # from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
@@ -285,6 +287,20 @@ write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm 
     printf 'warm_pool=%s\n' "$(sq "$SCRIPT_DIR/warm_pool.py")"
     cat <<'EOS'
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+# The agent was started by the laptop's `ssh -tt`, whose first two SSH_CONNECTION fields (and the
+# first two of SSH_CLIENT) are the laptop's address and port. Hooks, MCP servers and status lines
+# would all see them, so blank them; the variables stay set, since agents use them to detect SSH.
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  read -r _ _ server_addr server_port <<EOF
+$SSH_CONNECTION
+EOF
+  SSH_CONNECTION="0.0.0.0 0 ${server_addr:-0.0.0.0} ${server_port:-0}"
+  export SSH_CONNECTION
+fi
+if [ -n "${SSH_CLIENT:-}" ]; then
+  SSH_CLIENT="0.0.0.0 0 ${SSH_CLIENT##* }"
+  export SSH_CLIENT
+fi
 start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
 term=$(tty 2>/dev/null) || term=""
 if [ -d "$sd" ] && [ ! -L "$sd" ]; then
@@ -437,10 +453,21 @@ write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker
   _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
   _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
   _wcs_prompt=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4") || return 1
+  # Session directories hold the gateway key, SSH config, runner and private logs, all naming the
+  # project host; editing them could also undo the routing. Read rules cover Grep and Glob too, and
+  # deny rules hold in every approval mode. /proc of this host has nothing for the project.
+  _wcs_deny=$("$PYTHON3" -c '
+import json, os, sys
+rules, roots = ["EnterWorktree", "ExitWorktree"], []
+for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
+    if root not in roots:
+        roots.append(root)
+        rules += [f"{tool}(/{root}/**)" for tool in ("Read", "Edit")]
+print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
   cat > "$1" <<EOF
 {
   "permissions": {
-    "deny": ["EnterWorktree", "ExitWorktree"]
+    "deny": $_wcs_deny
   },
   "hooks": {
     "UserPromptSubmit": [
@@ -500,7 +527,11 @@ write_rule() {  # $1=outfile $2=mountpoint $3=agent
     printf 'report the connection problem; do not retry against the mount. If a Bash call is denied, never work\n'
     printf 'around it by running the project command on this machine.\n'
     printf '\nHarness failures show only a category, exit code and opaque session ID. Detailed connection logs are private.\n'
-    printf 'Read those logs only when the user explicitly asks for detailed diagnostics; do not inspect them automatically.\n'
+    if [ "${3:-}" = claude ]; then
+      printf 'This session cannot read them; a user who wants details finds them on this server by that session ID.\n'
+    else
+      printf 'Read those logs only when the user explicitly asks for detailed diagnostics; do not inspect them automatically.\n'
+    fi
     printf 'This is a disclosure policy for the agent, not isolation from other processes running as the same user.\n'
     if [ "${3:-}" = claude ]; then
       printf '\nOrdinary and nested subagents work. Do not use Agent Teams or Agent `isolation: worktree`; use a\n'
@@ -735,6 +766,16 @@ case "${1:-}" in
         ;;
     esac
     resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
+    # Every process's arguments, the agent's own Bash commands among them, are readable by all users
+    # unless /proc is mounted with hidepid. Tell the laptop when other users have accounts or
+    # processes here; only an administrator can change it.
+    shared_ps=0
+    me=$(id -u 2>/dev/null) || me=""
+    if [ -n "$me" ] && [ -r /proc/mounts ] && ! awk '$2 == "/proc" && $3 == "proc" && $4 ~ /(^|,)hidepid=(1|2|noaccess|invisible)(,|$)/ { f = 1 }
+                                     END { exit !f }' /proc/mounts 2>/dev/null; then
+      { ps -e -o uid= 2>/dev/null; awk -F: '$7 !~ /(nologin|false)$/ { print $3 }' /etc/passwd 2>/dev/null; } \
+        | awk -v me="$me" '$1 >= 1000 && $1 < 65534 && $1 != me { f = 1 } END { exit !f }' && shared_ps=1
+    fi
     case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
     printf 'RH_STATUS=INJECTED\n'
     printf 'RH_RESUME_AVAILABLE=%s\n' "$resume_out"
@@ -743,6 +784,7 @@ case "${1:-}" in
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
     printf 'RH_APPROVAL=%s\n' "$approval"
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
+    printf 'RH_PROCESS_LIST_SHARED=%s\n' "$shared_ps"
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"
     ;;

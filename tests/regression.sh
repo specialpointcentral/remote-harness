@@ -956,7 +956,7 @@ claude_launch_env=$(sed -n 's/^RH_LAUNCH_ENV=//p' "$tmp/inject-claude.out")
   || fail "inject claude overrode an explicit bash edit diff setting"
 claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
-python3 - "$claude_settings" <<'PY'
+python3 - "$claude_settings" "$rh_home/.sessions" <<'PY'
 import json
 import sys
 
@@ -964,8 +964,9 @@ settings = json.load(open(sys.argv[1], encoding="utf-8"))
 hook = settings["hooks"]["PreToolUse"][0]
 assert hook["matcher"] == "Bash|Agent"
 assert "route-command.py" in hook["hooks"][0]["command"]
-assert "EnterWorktree" in settings["permissions"]["deny"]
-assert "ExitWorktree" in settings["permissions"]["deny"]
+# Session files (gateway key, SSH config, runner, private logs) stay out of Claude's file tools.
+assert settings["permissions"]["deny"] == ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
+                                           f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)"], settings
 worktree_hook = settings["hooks"]["WorktreeCreate"][0]["hooks"][0]
 assert worktree_hook["type"] == "command"
 assert "deny-worktree" in worktree_hook["command"]
@@ -976,8 +977,14 @@ if "$claude_worktree_blocker" >/dev/null 2>"$tmp/claude-worktree.err"; then
   fail "claude worktree blocker exited successfully"
 fi
 assert_grep "$tmp/claude-worktree.err" "separate remote-harness session" "claude worktree blocker guidance"
+assert_grep_e "$tmp/inject-claude.out" "^RH_PROCESS_LIST_SHARED=[01]$" "inject reports whether other users see process arguments"
+cp "$rh_home/.sessions/$claude_session_key/bin/rh-session" "$tmp/claude-rh-session"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
+# Without its session directory the launcher starts no watcher; it only prepares the agent's environment.
+assert_eq "the agent sees no laptop address in SSH_CONNECTION/SSH_CLIENT" \
+  "$(SSH_CONNECTION='192.0.2.7 51234 10.0.0.5 22' SSH_CLIENT='192.0.2.7 51234 22' \
+     "$tmp/claude-rh-session" sh -c 'printf "%s|%s" "$SSH_CONNECTION" "$SSH_CLIENT"')" "0.0.0.0 0 10.0.0.5 22|0.0.0.0 0 22"
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount-no-config" 0 || true)
 assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex inject requires ssh config"

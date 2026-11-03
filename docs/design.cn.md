@@ -58,6 +58,14 @@ stdin，并请求 `remote-harness-exec ... watch`。项目主机随后让命令�
 进程（`nohup ... &`、`setsid`、守护进程）不会被追踪。没有 python3，或旧客户端不带 `watch` 时，执行
 方式不变。`git`/`rg` 工具动词始终使用同样的看门狗。
 
+Agent 主机上的隐私：除非 `/proc` 以 `hidepid` 挂载，该主机上的所有用户都能读取所有进程的参数，包括 Agent
+自己执行的 `bash -c '<命令>'`，这与在共享主机上运行任何 Agent 相同；`inject-rule.sh` 会在该主机上有其他
+用户的账号或进程时报告，启动器提示一次。Linux 上的 sshfs 挂载在所有人可读的挂载表中显示固定的 fsname
+`remote-harness`，会话改从私有的挂载记录读取挂载来源。默认挂载点位于仅本人可访问的 `mounts` 目录。Claude
+会话禁止 Read/Edit（同时覆盖 Grep 和 Glob）访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`；`rh-session`
+清除 `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Bash 输出本身会出现项目主机的路径和用户名，并像
+其它工具输出一样进入模型上下文。
+
 这会阻止直接和常见间接本机 Agent 路径。任意项目 shell 仍是图灵完备的，而且 gateway SFTP 没有
 chroot 到登记项目。绝对安全边界需要独立本机 OS 账号；该账号只能访问目标项目，不保存 AI 凭据，
 也不安装 Agent。

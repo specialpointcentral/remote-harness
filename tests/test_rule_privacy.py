@@ -85,9 +85,12 @@ sys.exit(23)
                                      'Commands get no stdin', 'no PTY', 'kills its process tree',
                                      'project host is unreachable', 'do not retry against the mount',
                                      'never work around it by running the project command on this machine',
-                                     'Read those logs only when the user explicitly asks for detailed diagnostics',
                                      'npm test'):
                         self.assertIn(required, guidance)
+                    # Claude's session settings deny reading the session directories, logs included.
+                    self.assertIn('This session cannot read them' if agent == 'claude' else
+                                  'Read those logs only when the user explicitly asks for detailed diagnostics',
+                                  guidance)
                     if agent == 'claude':
                         for required in ('Ordinary and nested subagents work',
                                          'Do not use Agent Teams or Agent `isolation: worktree`',

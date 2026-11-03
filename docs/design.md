@@ -68,6 +68,16 @@ that deliberately detach (`nohup ... &`, `setsid`, daemons) are not followed. Wi
 with an older client that omits `watch`, execution is unchanged. The `git`/`rg` tool verb always uses
 the same watchdog.
 
+Privacy on the agent host: unless `/proc` is mounted with `hidepid`, every user there can read every
+process's arguments, the agent's own `bash -c '<command>'` included, as with any agent on a shared
+host; `inject-rule.sh` reports when other users have accounts or processes there and the launcher
+warns once. Linux sshfs mounts show the fixed fsname `remote-harness` in the world-readable mount
+table, and sessions read the mount's source from its private record instead. Default mountpoints sit
+in an owner-only `mounts` directory. Claude sessions deny Read/Edit (which covers Grep and Glob) on
+`$RH_HOME/.sessions` and Read on `/proc`, and `rh-session` blanks the laptop's address and port in
+`SSH_CONNECTION`/`SSH_CLIENT`. Bash output itself names the project-host path and user, and reaches
+the model like any tool output.
+
 This prevents the direct and common indirect local-agent paths. Arbitrary project shell is still
 Turing-complete, and gateway SFTP is not chrooted to the registered project. An absolute security
 boundary requires a dedicated local OS account with project-only access, no AI credentials, and no

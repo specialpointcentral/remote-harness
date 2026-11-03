@@ -172,6 +172,10 @@ class Context:
     def translate_path(self, value: str, cwd: str) -> str:
         """Map an agent-host path argument to the project host, or raise StayLocal."""
         if value.startswith("/"):
+            if ".." in value.split("/"):
+                # `<mount>/../x` is not in the mount; mapped verbatim it would name `<root>/../x`.
+                normalized = os.path.normpath(value)
+                value = normalized + "/" if value.endswith("/") and normalized != "/" else normalized
             mount = self.mount_prefix(value)
             if mount is not None:
                 self.used_mount = mount
@@ -572,11 +576,36 @@ def stop_master(args: Args) -> None:
         pass
 
 
-class DiagnosticCapture:
-    """Hold small project stderr for missing-tool detection; stream overflow without changing bytes.
+class ErrorRewriter(OutputRewriter):
+    """Map the project root back to the mount in error text, where paths often sit in quotes.
 
-    Any project stderr inhibits transport retries, including a small pending buffer. SSH's own
-    diagnostics go to a separate file and never enter this stream.
+    Lines are rewritten whole; one longer than LIMIT is rewritten in LIMIT-sized pieces.
+    """
+
+    LIMIT = 65536
+
+    def __init__(self, old: str, new: str) -> None:
+        super().__init__(old, new, False, anywhere=True)
+        self.anywhere = re.compile(
+            rb"(?<![^\s\x00:='\"`(\[<])" + re.escape(self.old) + rb"(?=$|[/\s\x00:'\"`)\]>,])"
+        )
+
+    def feed(self, chunk: bytes):
+        while chunk:  # never hold more than LIMIT bytes of one line
+            room = max(1, self.LIMIT - len(self.record))
+            piece, chunk = chunk[:room], chunk[room:]
+            yield from super().feed(piece)
+            if len(self.record) >= self.LIMIT:
+                yield self._record(bytes(self.record))
+                self.record.clear()
+
+
+class DiagnosticCapture:
+    """Hold small project stderr for missing-tool detection; stream overflow as it arrives.
+
+    Error text has the project root mapped back to the mount. Any project stderr inhibits transport
+    retries, including a small pending buffer. SSH's own diagnostics go to a separate file and never
+    enter this stream.
     """
 
     LIMIT = 65536
@@ -584,6 +613,8 @@ class DiagnosticCapture:
     def __init__(self, ctx: Context) -> None:
         self.pending = bytearray()
         self.emitted = False
+        self.ctx = ctx
+        self.paths: ErrorRewriter | None = None  # most calls write no stderr: build it on demand
 
     def _write(self, chunk: bytes) -> None:
         if chunk:
@@ -592,6 +623,12 @@ class DiagnosticCapture:
             self.emitted = True
 
     def feed(self, chunk: bytes) -> None:
+        if self.paths is None:
+            self.paths = ErrorRewriter(self.ctx.root, self.ctx.used_mount)
+        for data in self.paths.feed(chunk):
+            self._hold(data)
+
+    def _hold(self, chunk: bytes) -> None:
         if not self.emitted and len(self.pending) + len(chunk) <= self.LIMIT:
             self.pending.extend(chunk)
             return
@@ -601,6 +638,8 @@ class DiagnosticCapture:
         self._write(chunk)
 
     def finish(self) -> bytes:
+        for data in self.paths.flush() if self.paths is not None else ():
+            self._hold(data)
         if self.emitted:
             return b""
         output = bytes(self.pending)
@@ -800,7 +839,12 @@ def run_local(ctx: Context, argv: list[str]) -> int:
             in_mount = ctx.touches_mount
         if in_mount:
             extra = GIT_SSHFS_CONFIG
-    os.execv(real, [ctx.args.real_argv0 or real] + extra + argv)
+    try:
+        os.execv(real, [ctx.args.real_argv0 or real] + extra + argv)
+    except OSError as error:
+        status = 127 if isinstance(error, FileNotFoundError) else 126
+        sys.stderr.write(f"remote-harness: category=tool exit={status} session=unknown\n")
+        return status
     return 127
 
 

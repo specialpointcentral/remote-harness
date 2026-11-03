@@ -38,6 +38,9 @@
 - `laptop-setup.sh` 必须可与下载到同目录的 sibling helper 独立运行。
 - 主 Agent 只能通过 `ssh -tt <远端> ... <claude|codex|opencode>` 在远端启动。
 - Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。
+- Claude 会话禁止 Read/Edit 访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`。`rh-session` 清除
+  `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Linux 上的 sshfs 挂载使用 `fsname=remote-harness`，
+  挂载来源保存在挂载记录里；`mounts` 目录仅本人可访问。垫片的 stderr 把项目根路径映射回挂载点。
 
 ## Gateway 安全
 
