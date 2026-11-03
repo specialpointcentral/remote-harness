@@ -145,8 +145,8 @@ class RoutingTests(unittest.TestCase):
                                     text=True, capture_output=True, env=self.env)
             updated = json.loads(result.stdout)['hookSpecificOutput']['updatedInput']
             # The hook names the runner by its physical path (macOS: /var -> /private/var).
-            self.assertEqual(shlex.split(updated['command']),
-                             [os.path.realpath(runner), *extra, 'Lg==', 'cHJpbnRmIGhlbGxv'])
+            self.assertEqual(shlex.split(updated['command'].split('; exit\n', 1)[0]),
+                             [os.path.realpath(runner), *extra, '--cwd', '.', '--', 'printf hello'])
             self.assertEqual(updated['timeout'], 1234)
             self.assertEqual(updated['run_in_background'], background)
 

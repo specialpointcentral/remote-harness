@@ -68,6 +68,47 @@ that deliberately detach (`nohup ... &`, `setsid`, daemons) are not followed. Wi
 with an older client that omits `watch`, execution is unchanged. The `git`/`rg` tool verb always uses
 the same watchdog.
 
+The Claude and Codex hooks and the opencode plugin rewrite a routed call to
+`rh-run --cwd <dir> -- '<command>'`, so approval prompts and automatic reviews read the original
+command. `channel-guard.py` base64-encodes the readable request in-process (its plain values arrive
+in the environment), so the readable form costs no extra process; the encoded positional form
+remains for the launcher's prewarm call.
+
+Claude's hook returns no permission decision: a hook `allow` would skip Claude's approval prompt and
+its auto-mode classifier; without one, Claude judges the rewritten call under the session's approval
+mode.
+
+Claude's own permission rules see only that rh-run text, so the hook applies the user's `Bash(...)`
+rules (managed, user and project settings) to the original command. A deny rule that matches any
+simple command in it, as the shared lexer finds them (substitutions included; `sudo`, `env` and
+similar wrappers skipped), denies; an ask rule asks. An allow rule approves only a plain single
+command (no operator, redirection, expansion or glob) in default, acceptEdits and dontAsk modes;
+auto mode first drops broad allow rules, which only Claude can judge, so its classifier decides
+there. Anything else gets no decision, so Claude's normal mode asks. Claude's built-in checks
+that read the command text (read-only commands, dangerous `rm`, paths outside the project) see only
+rh-run; the hook does not imitate them, so normal mode asks for read-only commands and YOLO loses
+those checks. The parsed rules are cached in the session directory by each settings file's
+identity: stat answers from the mount's attribute cache, but every open is a round trip to the
+laptop.
+
+Codex accepts `updatedInput` only with `allow`, which keeps its own approval and review. Its
+normal and auto modes do not ask before ordinary commands; they rely on Codex's sandbox, which a
+routed command leaves, since it runs on the project host. Codex's hook input carries only the
+command, so the hook cannot see an escalated call; Codex checks the original itself instead. The
+rewritten command repeats it on a new line after `exit`: the shell stops before parsing that line,
+while Codex's exec policy splits the whole script into simple commands and so applies the user's
+`.rules`, its forced-`rm` check and its approval to the original. Routed commands thus get Codex's
+full-access behavior, where only those checks ask (or, under approval `never`, reject). Were Codex
+to stop reading past `exit`, routed commands would go unchecked again; the form never widens an
+approval.
+
+opencode also checks permissions on the rewritten text, after its plugins have run, so its plugin
+repeats the original after `exit` in the same way and sets the working directory to the original's
+own. opencode parses the whole text, so the user's bash rules and its external-directory check,
+which resolves relative paths from the working directory, judge the original. The rh-run and `exit`
+commands are checked as well, so an allowlist-style config whose catch-all rule asks or denies does
+so for every routed call.
+
 Privacy on the agent host: unless `/proc` is mounted with `hidepid`, every user there can read every
 process's arguments, the agent's own `bash -c '<command>'` included, as with any agent on a shared
 host; `inject-rule.sh` reports when other users have accounts or processes there and the launcher

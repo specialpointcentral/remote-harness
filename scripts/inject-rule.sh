@@ -194,8 +194,8 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
     [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
     _wsr_slots="$(dirname "$4")/runtime/bash-slots/${1##*/}"
     _wsr_diag="--diagnostics-dir $(sq "$(dirname "$4")/runtime/diagnostics")"
-    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --background --slots-dir $(sq "$_wsr_slots") $_wsr_diag -- "
-    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") --slots-dir $(sq "$_wsr_slots") $_wsr_diag $_wsr_warm-- "
+    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --background --slots-dir $(sq "$_wsr_slots") $_wsr_diag -- "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --slots-dir $(sq "$_wsr_slots") $_wsr_diag $_wsr_warm-- "
     _wsr_mux="$_wsr_mux --watch"
   fi
   mkdir -p "$1/bin" 2>/dev/null || return 1
@@ -204,6 +204,20 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
     _wsr_env="$(transport_settings_env)" || return 1
     printf 'export %s\n' "${_wsr_env#env }"
     printf 'background=0\ncase "${1:-}" in --background) background=1; shift;; esac\n'
+    # `--cwd DIR -- COMMAND` is the readable form the hooks and the opencode plugin write, so approval
+    # prompts and automatic reviews see the command; the positional form (both values base64, as the
+    # launcher's prewarm call uses) is kept. The guard encodes in-process, with no extra process per
+    # call: it gets the plain values in its environment, which other users cannot read, and replaces
+    # the @cwd/@command placeholders.
+    printf 'from_env=""\nif [ "${1:-}" = --cwd ]; then\n'
+    printf '  [ "$#" = 4 ] && [ "$3" = -- ] || { echo "remote-harness: category=input exit=2 session=unknown" >&2; exit 2; }\n'
+    if [ -n "$_wsr_guard" ]; then
+      printf '  RH_REQUEST_CWD=$2 RH_REQUEST_COMMAND=$4\n  export RH_REQUEST_CWD RH_REQUEST_COMMAND\n'
+      printf '  from_env=--request-from-env\n  set -- @cwd @command\n'
+    else
+      printf '  set -- "$(printf "%%s" "$2" | base64 | tr -d "\\n")" "$(printf "%%s" "$4" | base64 | tr -d "\\n")"\n'
+    fi
+    printf 'fi\n'
     printf '[ "$#" = 2 ] || { echo "remote-harness: category=input exit=2 session=unknown" >&2; exit 2; }\n'
     printf 'if [ "$background" = 1 ]; then\n'
     if [ -z "$_wsr_background_guard" ]; then
@@ -372,13 +386,15 @@ const readyFile = Buffer.from("$_wop_ready_b64", "base64").toString("utf8")
 const replyNote = Buffer.from("$_wop_note_b64", "base64").toString("utf8")
 const mountRoot = fs.realpathSync(configuredMount)
 
-const encode = (value) => Buffer.from(value, "utf8").toString("base64")
 const apostrophe = String.fromCharCode(39)
 const doubleQuote = String.fromCharCode(34)
+// POSIX quoting as Python's shlex.quote: plain words stay bare, so the approval prompt reads naturally.
 const shellQuote = (value) =>
-  apostrophe +
-  value.split(apostrophe).join(apostrophe + doubleQuote + apostrophe + doubleQuote + apostrophe) +
-  apostrophe
+  value !== "" && !/[^A-Za-z0-9_@%+=:,./-]/.test(value)
+    ? value
+    : apostrophe +
+      value.split(apostrophe).join(apostrophe + doubleQuote + apostrophe + doubleQuote + apostrophe) +
+      apostrophe
 
 export const RemoteHarness = async ({ directory }) => {
   fs.writeFileSync(readyFile, String(process.pid) + "\\n", { mode: 0o600 })
@@ -403,10 +419,15 @@ export const RemoteHarness = async ({ directory }) => {
         throw new Error("remote-harness: category=policy exit=2 session=unknown")
       }
 
-      output.args.command = [runner, encode(relative || "."), encode(command)]
+      // The readable form, so the approval prompt shows the original command. opencode checks
+      // permissions on the rewritten text, so the original follows on a new line after exit, as for
+      // Codex: the shell never parses that line, while opencode's own parser reads the whole text,
+      // and its bash rules and external directory check judge the original, whose relative paths
+      // start from its own directory.
+      output.args.command = [runner, "--cwd", relative || ".", "--", command]
         .map(shellQuote)
-        .join(" ")
-      output.args.workdir = mountRoot
+        .join(" ") + "; exit\n" + command
+      output.args.workdir = cwd
     },
     // opencode reloads the history before every model step and adds its own reminders the same way:
     // an in-memory synthetic part on the latest user message that is never saved or displayed.
@@ -687,7 +708,7 @@ case "${1:-}" in
         || abort_session
       [ -x "$SCRIPT_DIR/route-command.py" ] \
         || abort_session
-      hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp")"
+      hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp") --agent $agent"
       reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
         || abort_session
     fi

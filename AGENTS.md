@@ -40,6 +40,16 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
 - The main agent starts only through `ssh -tt <remote> ... <claude|codex|opencode>`.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
+- The Claude hook never returns a permission decision for a routed call: `allow` skips Claude's
+  prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so
+  the user's approval mode judges the original command. The Codex hook and the opencode plugin write
+  the same form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
+- Since Claude sees only rh-run, its hook applies the user's own rules to the original command:
+  `Bash(...)` deny/ask on any simple command the shared lexer finds, allow only for a plain single
+  command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their
+  identity changes. Codex and opencode check the original themselves: their rewrite repeats it on a
+  new line after `exit`, which the shell never parses, and Codex's exec policy (`.rules`, forced `rm`)
+  and opencode's bash rules read it; the opencode plugin also sets the original's own workdir.
 - Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc`. `rh-session` blanks the
   laptop's address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Linux sshfs mounts use
   `fsname=remote-harness` and keep their source in the mount record; `mounts` is owner-only. Shim

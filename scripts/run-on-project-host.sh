@@ -53,8 +53,27 @@ sq() {
 # and here-document text out of command positions. This best-effort check complements the existing
 # PATH and credential defenses; arbitrary shell still requires the documented account isolation.
 # Used by both dispatch and the remote hook's check-only call.
-check_command_policy() {
-  LC_ALL=C awk '
+check_command_policy() {  # [$1=1: also print each simple command's words, from its command word on]
+  # The words of one command go on one line, tab-separated, with backslash, tab, CR and newline
+  # escaped. Wrappers (command/env/exec/nohup/sudo/time), their options and assignments are left
+  # out; a word holding a substitution ends in `$()`. The remote hook matches permission rules on it.
+  LC_ALL=C awk -v emit="${1:-0}" '
+    function escaped(text,  out, k, ch) {
+      out = ""
+      for (k = 1; k <= length(text); k++) {
+        ch = substr(text, k, 1)
+        if (ch == "\\") out = out "\\\\"
+        else if (ch == "\n") out = out "\\n"
+        else if (ch == "\t") out = out "\\t"
+        else if (ch == "\r") out = out "\\r"
+        else out = out ch
+      }
+      return out
+    }
+    function flush() {
+      if (emit && in_record) print record
+      record = ""; in_record = 0
+    }
     function finish_word( executable) {
       if (!present) return
       if (redirection) {
@@ -80,8 +99,9 @@ check_command_policy() {
         else {
           if (executable ~ /^(claude|codex|opencode)$/) denied = 1
           expect_command = 0; wrapper = ""
+          if (emit) { record = escaped(word); in_record = 1 }
         }
-      }
+      } else if (emit && in_record) record = record "\t" escaped(word)
       word = ""; present = quoted = opaque = 0
     }
     function begin_substitution(kind) {
@@ -91,12 +111,14 @@ check_command_policy() {
       saved_expect[level] = expect_command; saved_redirection[level] = redirection
       saved_wrapper[level] = wrapper; saved_argument[level] = wrapper_argument
       saved_depth[level] = depth; saved_arithmetic[level] = arithmetic; substitution[level] = kind
+      saved_record[level] = record; saved_in_record[level] = in_record; record = ""; in_record = 0
       word = quote = redirection = wrapper = ""
       present = quoted = opaque = wrapper_argument = depth = arithmetic = 0
       expect_command = 1
     }
     function end_substitution() {
-      finish_word()
+      finish_word(); flush()
+      record = saved_record[level]; in_record = saved_in_record[level]
       word = saved_word[level] "$()"; present = 1
       quote = saved_quote[level]; quoted = saved_quoted[level]
       opaque = saved_opaque[level]
@@ -197,7 +219,7 @@ check_command_policy() {
           end_substitution(); continue
         }
         if (c ~ /[;&|()]/) {
-          finish_word(); expect_command = 1; wrapper = ""; wrapper_argument = 0
+          finish_word(); flush(); expect_command = 1; wrapper = ""; wrapper_argument = 0
           if (level && c == "(") depth++
           if (level && c == ")") depth--
           continue
@@ -205,11 +227,12 @@ check_command_policy() {
         present = 1; word = word c
       }
       if (!continued && quote == "") {
-        finish_word(); expect_command = 1; wrapper = ""; wrapper_argument = 0
+        finish_word(); flush(); expect_command = 1; wrapper = ""; wrapper_argument = 0
         if (documents && !body) body = 1
       } else if (!continued) word = word "\n"
     }
     END {
+      flush()
       if (denied) exit 1
       if (invalid || quote != "" || level || arithmetic || continued || body || redirection == "here") exit 2
       exit 0
@@ -870,9 +893,11 @@ dispatch_tool() {
 
 # Check-only entry for the remote hook: read shell text without executing or dispatching it.
 if [ "${1:-}" = "--check-command" ]; then
-  [ "$#" -eq 1 ] || fail "--check-command takes no arguments"
+  _policy_words=0
+  [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$2" = --words ] && _policy_words=1; } \
+    || fail "--check-command takes only --words"
   _policy_status=0
-  check_command_policy || _policy_status=$?
+  check_command_policy "$_policy_words" || _policy_status=$?
   exit "$_policy_status"
 fi
 

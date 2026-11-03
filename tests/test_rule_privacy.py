@@ -15,10 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 INJECT = ROOT / 'scripts' / 'inject-rule.sh'
 
 
-def encoded(value):
-    return base64.b64encode(value.encode()).decode()
-
-
 class RulePrivacyTests(unittest.TestCase):
     def test_agent_instruction_channels_omit_host_details_and_keep_runtime_routing(self):
         with tempfile.TemporaryDirectory(prefix='rh-rule-privacy-') as temporary:
@@ -99,11 +95,12 @@ sys.exit(23)
 
                     # Execute the generated runner, including its SSH wrapper, without a network.
                     # Private host values must still reach the encoded gateway request unchanged.
+                    # The hooks and the opencode plugin write the readable form.
                     routed_env = dict(env, PATH=str(session / 'bin') + ':' + env['PATH'])
-                    routed = subprocess.run(
-                        [str(session / 'bin' / 'rh-run'), encoded('packages/api'),
-                         encoded('printf routing-preserved')], env=routed_env, text=True,
-                        capture_output=True, timeout=8)
+                    command = "printf 'routing preserved'"
+                    routed = subprocess.run([str(session / 'bin' / 'rh-run'), '--cwd', 'packages/api', '--',
+                                             command],
+                                            env=routed_env, text=True, capture_output=True, timeout=8)
                     self.assertEqual(routed.returncode, 23, routed.stderr)
                     self.assertEqual(routed.stdout, 'project-host-routed\n')
                     ssh_arguments = json.loads(ssh_log.read_text().splitlines()[-1])
@@ -112,7 +109,7 @@ sys.exit(23)
                     request = ssh_arguments[-1].split()
                     self.assertEqual(request[0], 'remote-harness-exec')
                     self.assertEqual([base64.b64decode(value).decode() for value in request[1:4]],
-                                     [project_root, 'packages/api', 'printf routing-preserved'])
+                                     [project_root, 'packages/api', command])
                     self.assertEqual(request[4:], ['watch'])
 
 

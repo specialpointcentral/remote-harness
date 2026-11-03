@@ -57,7 +57,9 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertEqual(hook['permissionDecision'], 'allow', hook)
         updated = hook['updatedInput']
         self.assertEqual(updated['timeout_ms'], 123)
-        self.assertEqual(base64.b64decode(shlex.split(updated['command'])[-1]).decode(), command)
+        runner, tail = updated['command'].split('; exit\n', 1)
+        self.assertEqual(shlex.split(runner), [os.path.realpath(self.runner), '--cwd', '.', '--', command])
+        self.assertEqual(tail, command)
         result = self.dispatch(command)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, output)

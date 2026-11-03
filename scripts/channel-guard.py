@@ -15,6 +15,9 @@ With `--slots-dir` the ordinary path holds a per-session slot: foreground fallba
 RH_CHANNEL_QUEUE_SECONDS (600) and keep trying the warm pool while they wait, so a saturated quota
 waits for capacity instead of failing; explicit background commands (`--background`, standalone
 connections) queue only RH_BACKGROUND_QUEUE_SECONDS (10), since their slots free up rarely.
+
+With `--request-from-env` the cwd and command come in plain text from RH_REQUEST_CWD and
+RH_REQUEST_COMMAND (rh-run's readable form) and are encoded here into the @cwd/@command placeholders.
 """
 
 from __future__ import annotations
@@ -55,6 +58,22 @@ def valid_request(line: str) -> bool:
     parts = line.split(" ")
     return (len(parts) == 5 and parts[0] == "remote-harness-exec" and parts[4] == "watch"
             and all(part and set(part) <= B64 for part in parts[1:4]))
+
+
+def request_from_env(argv: list[str], options: dict[str, str]) -> list[str] | None:
+    """Encode rh-run's readable request (RH_REQUEST_CWD/RH_REQUEST_COMMAND) into the @cwd/@command
+    placeholders of the command and the warm request, or None when either value is missing."""
+    import binascii
+
+    values = {}
+    for name, placeholder in (("RH_REQUEST_CWD", "@cwd"), ("RH_REQUEST_COMMAND", "@command")):
+        value = os.environ.pop(name, None)  # the command's own environment never carries them
+        if value is None:
+            return None
+        values[placeholder] = binascii.b2a_base64(os.fsencode(value), newline=False).decode("ascii")
+    if "--warm-request" in options:
+        options["--warm-request"] = " ".join(values.get(part, part) for part in options["--warm-request"].split(" "))
+    return [values.get(arg, arg) for arg in argv]
 
 
 def write_all(fd: int, data: bytes) -> None:
@@ -142,9 +161,13 @@ def main() -> int:
     argv = sys.argv[1:]
     options = {}
     background = False
+    from_env = False
     while argv:
         if argv[0] == "--background":
             background = True
+            argv = argv[1:]
+        elif argv[0] == "--request-from-env":
+            from_env = True
             argv = argv[1:]
         elif argv[0] in ("--warm", "--warm-request", "--slots-dir", "--diagnostics-dir") and len(argv) >= 2:
             options[argv[0]] = argv[1]
@@ -153,6 +176,8 @@ def main() -> int:
             break
     if argv[:1] == ["--"]:
         argv = argv[1:]
+    if from_env:
+        argv = request_from_env(argv, options) or []
     if not argv:
         sys.stderr.write("remote-harness: category=input exit=2 session=unknown\n")
         return 2

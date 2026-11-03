@@ -47,13 +47,22 @@
 - `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
   opencode 还会返回启动前必须出现的 readiness marker 路径。
   `RH_PROCESS_LIST_SHARED=1` 告诉启动器 Agent 主机上的其他用户能读取进程参数（`/proc` 没有 `hidepid`）。
+  opencode 插件写与 hook 相同的可读格式，像 Codex 的 hook 一样在 `exit` 之后附上原命令，并为 opencode
+  自己的检查把工作目录设为原命令自己的目录。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
   不会删除其它仍在运行的会话的 hook 或 runner。
   规则要求 Agent 按用户最近一条消息的语言回复，而不是按指令、工具输出或项目文件的语言回复，
   并在每一轮用户消息上重复一行提醒：Claude 和 Codex 用 `UserPromptSubmit` hook，opencode 用
   `experimental.chat.messages.transform` 插件钩子，只在内存中附加到最新一条用户消息上。只靠规则时，
   它位于上下文开头，大量英文工具输出会让回复逐渐变成英文。
-- `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。
+- `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。带 `--agent claude` 时改写成
+  可读的 `rh-run --cwd <目录> -- <命令>` 且不返回审批决定，由 Claude 自己的审批模式判断；Codex 得到
+  同样的可读格式和 `allow`（Codex 只接受与 `updatedInput` 一起返回的 `allow`，它不跳过 Codex 的审批）。
+  对 Claude，它用原始命令对照用户的规则，原命令中的各条简单命令由 `run-on-project-host.sh --check-command
+  --words` 的词法器列出：`Bash(...)` deny/ask 规则对其中任意一条生效，allow 规则只在 default/acceptEdits/
+  dontAsk 模式下对单条普通命令生效。解析后的规则按每个源文件的标识缓存在会话目录（`claude-rules.json`）。
+  对 Codex，它在末尾追加 `; exit`，再另起一行附上原命令；shell 永远执行不到这一行，Codex 自己的执行策略和
+  对带 `-f` 的 `rm` 的检查则按它判断。
 - `diagnostics.py`：Agent 主机上的路由诊断 helper。OpenSSH 自身的错误写入 SSH config 旁
   `runtime/diagnostics` 下仅属主可读写的文件；框架摘要只包含失败类别、退出码和不含主机信息的通道会话
   编号（尚不可用时为 `unknown`），共享通道的会话共用该编号。日志保留到通道的正常清理，因为持久 SSH
@@ -65,6 +74,8 @@
   固定 PATH），SSH 通道关闭时终止该工具。客户端一侧设置每连接 keepalive 和可选的复用 master。
   `--find-tool <git|rg>` 报告工具动词会在哪里找到该工具；`laptop-setup.sh` 在启动前用它打印 ✓，
   或打印 ⚠ 和安装命令，因为缺少工具时 Agent 会通过 SSHFS 扫描项目。
+  `--check-command [--words]` 只从 stdin 读取 shell 文本：直接启动 Agent 时退出码 1，无法安全解析时为 2；
+  `--words` 还为 hook 打印每条简单命令的各个词。
   `$SHELL` 是 bash 或 zsh 时，项目命令加载登录 shell 快照，不再每次新开登录 shell（profile 较重的主机上
   每次 200ms 以上）。第一条命令把 profile 执行后的结果（导出变量、函数、shell 选项、umask、软资源限制；
   从不包含 AI 凭据和 `SSH_CONNECTION` 这类单次连接相关的值）抓取到 gateway 会话目录的 `shell-snapshot.sh`，
@@ -81,7 +92,9 @@
   完整的 exec 或 tool 请求，以 `RH_WAIT_GOT` 确认，然后按同样的 SSH 命令处理。它把自己的会话目录传给
   exec dispatcher，覆盖客户端可能带来的同名值。
 - `channel-guard.py`：远端有 python3 时包装会话 Bash runner，命令运行期间一直持有 SSH 通道，
-  使项目主机在取消或断线时终止命令树。带 `--warm SOCKET --warm-request LINE`（由 `rh-run` 写入）时，
+  使项目主机在取消或断线时终止命令树。带 `--request-from-env` 时，从 `RH_REQUEST_CWD` 和
+  `RH_REQUEST_COMMAND` 读取明文 cwd 和命令（rh-run 的可读格式），编码后填入命令和预热请求中的
+  `@cwd`/`@command` 占位符。带 `--warm SOCKET --warm-request LINE`（由 `rh-run` 写入）时，
   先在预热通道上发送请求并转发输出；完整的一行没写进去的请求改走普通路径，已写出却没有收到确认的请求以
   255 失败（送达不确定，绝不重试）。带 `--slots-dir` 时普通路径占用一个每会话名额：
   `RH_FOREGROUND_CONCURRENCY`（6），最多排队 `RH_CHANNEL_QUEUE_SECONDS`（600）秒，排队期间持续向预热池

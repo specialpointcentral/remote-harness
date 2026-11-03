@@ -35,6 +35,11 @@ router_tmp="$tmp/router"
 mkdir -p "$router_tmp/mount/packages/api" "$router_tmp/outside" "$router_tmp/project/packages/api"
 printf '#!/bin/sh\nexit 0\n' > "$router_tmp/rh-run"
 chmod +x "$router_tmp/rh-run"
+# The hook reads the user's Claude settings; keep this machine's out of the test.
+route_hook() {
+  env -u CLAUDE_PROJECT_DIR -u CLAUDE_CONFIG_DIR HOME="$router_tmp/home" \
+    python3 "$ROOT/scripts/route-command.py" "$@"
+}
 router_input="$router_tmp/input.json"
 cat > "$router_input" <<EOF
 {
@@ -51,11 +56,11 @@ cat > "$router_input" <<EOF
 }
 EOF
 router_output="$router_tmp/output.json"
-python3 "$ROOT/scripts/route-command.py" \
+route_hook \
   --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
   < "$router_input" > "$router_output"
+# Codex takes updatedInput only with "allow", which keeps its own approval and review in place.
 python3 - "$router_output" "$router_tmp/rh-run" <<'PY'
-import base64
 import json
 import shlex
 import sys
@@ -66,11 +71,32 @@ assert specific["hookEventName"] == "PreToolUse"
 assert specific["permissionDecision"] == "allow"
 updated = specific["updatedInput"]
 assert updated["timeout_ms"] == 12345
-argv = shlex.split(updated["command"])
-assert argv[0] == sys.argv[2]
-assert base64.b64decode(argv[1]).decode() == "packages/api"
-assert base64.b64decode(argv[2]).decode() == "printf routed"
+# The readable form, so the approval prompt shows the original command; Codex's own checks read
+# the copy after `exit`, which the shell never reaches.
+assert updated["command"] == (
+    shlex.quote(sys.argv[2]) + " --cwd packages/api -- 'printf routed'; exit\nprintf routed"), updated
 PY
+
+# Claude judges routed calls under the user's approval mode: no hook decision, and a rewritten
+# command its prompt and classifier can read. A hook "allow" would skip both.
+route_hook \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" --agent claude \
+  < "$router_input" > "$router_tmp/claude-output.json"
+python3 - "$router_tmp/claude-output.json" "$router_tmp/rh-run" <<'PY'
+import json
+import shlex
+import sys
+
+specific = json.load(open(sys.argv[1], encoding="utf-8"))["hookSpecificOutput"]
+assert "permissionDecision" not in specific, specific
+updated = specific["updatedInput"]
+assert updated["timeout_ms"] == 12345
+assert shlex.split(updated["command"]) == [sys.argv[2], "--cwd", "packages/api", "--", "printf routed"], updated
+PY
+route_hook \
+  --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" --agent other \
+  < "$router_input" > "$router_tmp/bad-agent.json"
+assert_grep "$router_tmp/bad-agent.json" '"permissionDecision": "deny"' "hook accepted an unknown agent"
 
 python3 - "$router_tmp/root-input.json" "$router_tmp/mount" <<'PY'
 import json
@@ -83,18 +109,18 @@ json.dump({
     "tool_input": {"command": "printf root-cwd"},
 }, open(sys.argv[1], "w", encoding="utf-8"))
 PY
-python3 "$ROOT/scripts/route-command.py" \
+route_hook \
   --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
   < "$router_tmp/root-input.json" > "$router_tmp/root-output.json"
 python3 - "$router_tmp/root-output.json" <<'PY'
-import base64
 import json
 import shlex
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
-argv = shlex.split(payload["hookSpecificOutput"]["updatedInput"]["command"])
-assert base64.b64decode(argv[1]).decode() == "."
+runner, tail = payload["hookSpecificOutput"]["updatedInput"]["command"].split("; exit\n")
+assert shlex.split(runner)[1:] == ["--cwd", ".", "--", "printf root-cwd"], runner
+assert tail == "printf root-cwd", tail
 PY
 
 cat > "$router_tmp/agent.json" <<EOF
@@ -105,7 +131,7 @@ cat > "$router_tmp/agent.json" <<EOF
   "tool_input": {"subagent_type": "general-purpose", "name": "reviewer"}
 }
 EOF
-python3 "$ROOT/scripts/route-command.py" \
+route_hook \
   --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
   < "$router_tmp/agent.json" > "$router_tmp/agent-output.json"
 python3 - "$router_tmp/agent-output.json" <<'PY'
@@ -123,7 +149,7 @@ cat > "$router_tmp/agent-worktree.json" <<EOF
   "tool_input": {"subagent_type": "general-purpose", "isolation": "worktree"}
 }
 EOF
-python3 "$ROOT/scripts/route-command.py" \
+route_hook \
   --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
   < "$router_tmp/agent-worktree.json" > "$router_tmp/agent-worktree-output.json"
 python3 - "$router_tmp/agent-worktree-output.json" <<'PY'
@@ -147,7 +173,7 @@ json.dump({
     "tool_input": {"command": "uname -a"},
 }, open(sys.argv[1], "w", encoding="utf-8"))
 PY
-python3 "$ROOT/scripts/route-command.py" \
+route_hook \
   --runner "$router_tmp/rh-run" --mount-root "$router_tmp/mount" \
   < "$router_tmp/outside.json" > "$router_tmp/outside-output.json"
 python3 - "$router_tmp/outside-output.json" <<'PY'
@@ -964,6 +990,7 @@ settings = json.load(open(sys.argv[1], encoding="utf-8"))
 hook = settings["hooks"]["PreToolUse"][0]
 assert hook["matcher"] == "Bash|Agent"
 assert "route-command.py" in hook["hooks"][0]["command"]
+assert hook["hooks"][0]["command"].endswith(" --agent claude")
 # Session files (gateway key, SSH config, runner, private logs) stay out of Claude's file tools.
 assert settings["permissions"]["deny"] == ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
                                            f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)"], settings
@@ -1033,18 +1060,18 @@ fs.writeFileSync(outputPath, JSON.stringify({ output, outsideDenied }))
 JS
 [ -s "$opencode_ready" ] || fail "opencode routing plugin did not write its readiness marker"
 python3 - "$tmp/opencode-plugin.json" "$opencode_session_dir/bin/rh-run" "$tmp/mount-opencode" <<'PY'
-import base64
 import json
 import shlex
 import sys
 
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 args = payload["output"]["args"]
-argv = shlex.split(args["command"])
-assert argv[0] == sys.argv[2]
-assert base64.b64decode(argv[1]).decode() == "packages/api"
-assert base64.b64decode(argv[2]).decode() == "printf opencode-routed"
-assert args["workdir"] == sys.argv[3]
+# The readable form quotes as shlex.quote does: plain words stay bare in the approval prompt. The
+# original follows after an exit the shell never passes, for opencode's own permission check, and
+# relative paths in it start from its own directory.
+assert args["command"] == (shlex.quote(sys.argv[2])
+    + " --cwd packages/api -- 'printf opencode-routed'; exit\nprintf opencode-routed"), args
+assert args["workdir"] == sys.argv[3] + "/packages/api", args
 assert args["timeout"] == 3210
 assert payload["outsideDenied"] is True
 PY
@@ -1937,6 +1964,8 @@ assert_grep "$tmp/wr-nopy.out" "RH_STATUS=INJECTED" "opencode inject works witho
 wr_nopy_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-nopy" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 PATH="$nopy_bin" "$wr_nopy_sd/bin/rh-run" "$(b64 .)" "$(b64 true)"
 assert_grep "$tmp/nopy-ssh.args" "remote-harness-exec " "runner executes without python3"
+PATH="$nopy_bin" "$wr_nopy_sd/bin/rh-run" --cwd . -- "printf 'it''s'"
+assert_grep "$tmp/nopy-ssh.args" " $(b64 .) $(b64 "printf 'it''s'")" "runner encodes the readable form without python3"
 refute_grep "$tmp/nopy-ssh.args" " watch" "runner asks for watch mode without python3"
 [ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
 # With a session id and python3 the runner, launcher and shims use the session's warm pool.
@@ -1963,6 +1992,7 @@ python3 "$ROOT/tests/test_rule_privacy.py" -v
 python3 "$ROOT/tests/test_session_files.py" -v
 python3 "$ROOT/tests/test_diagnostics.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
+python3 "$ROOT/tests/test_permission_rules.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 

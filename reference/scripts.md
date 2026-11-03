@@ -57,6 +57,8 @@
   remote runner. opencode emits a readiness marker path that must be observed before launch.
   `RH_PROCESS_LIST_SHARED=1` tells the launcher that other users on the agent host can read process
   arguments (no `hidepid` on `/proc`).
+  The opencode plugin writes the hooks' readable form, repeating the original after `exit` as the
+  Codex hook does, and gives opencode's own checks the original's working directory.
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
   project or cleaning up a dead launch never removes another live session's hook or runner.
   The rule tells the agent to reply in the language of the user's latest message, not that of the
@@ -65,6 +67,15 @@
   hook for opencode that adds it to the latest user message in memory only. The rule alone sits at
   the start of the context, so long English tool output used to pull replies into English.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
+  With `--agent claude` it rewrites to the readable `rh-run --cwd <dir> -- <command>` and returns no
+  permission decision, so Claude's own approval mode judges the call; Codex gets the same readable
+  form with `allow`, the only decision Codex takes with `updatedInput`, which keeps its approval.
+  For Claude it applies the user's rules to the original command, whose simple commands the lexer
+  of `run-on-project-host.sh --check-command --words` lists: `Bash(...)` deny/ask rules on any of
+  them, allow rules on a plain single command in default/acceptEdits/dontAsk mode. Parsed rules are
+  cached in the session directory (`claude-rules.json`) by each source file's identity. For Codex it
+  appends `; exit` and the original on a new line, which the shell never reaches, so Codex's own
+  exec policy and forced-`rm` check read the original.
 - `diagnostics.py`: agent-host helper for private routed-command diagnostics. OpenSSH's own errors
   go to owner-only files under the SSH config's `runtime/diagnostics` directory; framework summaries
   contain only a category, exit code and opaque transport-session identifier (`unknown` before one
@@ -79,6 +90,8 @@
   side sets per-connection keepalives and the optional multiplexing master. `--find-tool <git|rg>`
   reports where the tool verb finds a tool; `laptop-setup.sh` uses it before launch to print ✓ or a ⚠
   with an install hint, because a missing tool makes the agent scan the project over SSHFS.
+  `--check-command [--words]` only reads shell text from stdin: exit 1 for a direct agent launch, 2
+  for text it cannot parse safely; `--words` also prints each simple command's words for the hook.
   For a bash or zsh `$SHELL`, project commands load a login shell snapshot instead of starting a login
   shell each time (200+ ms on hosts with a heavy profile). The first command captures what the profile
   leaves behind (exported variables, functions, shell options, umask, soft limits; never the AI
@@ -102,6 +115,9 @@
   client-supplied value.
 - `channel-guard.py`: wraps the session Bash runner when python3 exists; it holds the SSH channel
   open while the command runs so the project host stops the command tree on cancel or disconnect.
+  With `--request-from-env` it takes the plain cwd and command from `RH_REQUEST_CWD` and
+  `RH_REQUEST_COMMAND` (rh-run's readable form) and encodes them into the `@cwd`/`@command`
+  placeholders of the command and the warm request.
   With `--warm SOCKET --warm-request LINE` (written by `rh-run`) it first sends the request on a warm
   channel and relays its output; a request whose complete line was not written runs on the ordinary
   path instead, and a written one without an acknowledgment fails with 255 (uncertain delivery,

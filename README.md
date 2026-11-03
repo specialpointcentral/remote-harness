@@ -342,6 +342,22 @@ remote-harness/
   Agent 自动审核审批请求；远端 CLI 不支持时（以及 opencode）退回普通审批并给出提示。`--approval normal`
   恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow`
   只写进**本次会话**的配置，退出即清。
+- Claude、Codex、opencode 的每个 Bash 调用都被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
+  自动审核看到的是原命令。Claude 仍按你选的审批模式处理：普通模式询问，auto 模式由自动审核判断，YOLO
+  不询问。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
+  deny 规则命中命令中任一段（含 `$(...)`、`sudo` 包装）即拒绝，ask 规则强制询问；allow 规则只在普通、
+  acceptEdits、dontAsk 模式下放行不含管道、重定向、变量、通配符的单条命令，其余仍询问。auto 模式交给
+  自动审核。Claude 自己按命令文本做的内置检查看不到原命令：只读命令（`ls`、`git status`）在普通模式下也会
+  询问，对危险 `rm`、项目外路径的额外检查不再生效。普通和 auto 模式下你或分类器仍会看到原命令，YOLO 下
+  则没有这些检查。
+- Codex 的普通和 auto 模式不会在普通命令前询问：它依赖 Codex 沙箱，而路由命令在笔记本上执行，不在沙箱内。
+  所以路由时 Codex 相当于它的"完全访问"模式：只有它的危险命令检查（带 `-f` 的 `rm`）和你 `.rules` 里的
+  `prompt`、`forbidden` 规则会询问或拒绝，auto 模式下询问交给自动审核；YOLO 下这两类命令直接拒绝，与本机
+  Codex 相同。这些检查由 Codex 自己完成：改写后的命令在 `exit` 之后另起一行附上原命令，shell 既不执行也不
+  解析这一行，Codex 按它检查。
+- opencode 在插件改写之后才检查权限，所以插件同样在 `exit` 之后另起一行附上原命令，并把工作目录设为原命令
+  自己的目录：opencode 解析整段文本，你的 bash 权限规则和项目外目录检查都按原命令判断。`rh-run` 和 `exit`
+  本身也算两条命令，`"*"` 设为 ask 或 deny 的白名单式配置会因此询问或拒绝。
 - Claude/Codex hook、opencode plugin、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
   退出删除会话目录。路由器加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
@@ -745,6 +761,28 @@ remote-harness/
   opencode) falls back to normal approvals with a notice. `--approval normal` restores per-action
   prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode's
   `permission:allow` goes into the **per-session** config only and is gone on exit.
+- Claude, Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
+  approval prompts and automatic review show the original command. Claude still applies your approval
+  mode: normal asks, auto lets the classifier decide, YOLO does not ask. Claude can match permission
+  rules only against the rewritten text, so the hook checks the original command against your
+  `Bash(...)` rules: a deny rule matching any part of it (`$(...)` and `sudo` wrappers included) denies,
+  an ask rule asks, and an allow rule approves a single command without pipes, redirections,
+  variables, or globs in normal, acceptEdits, and dontAsk modes; anything else still asks. Auto mode
+  leaves it to the classifier. Claude's own text-based checks cannot see the original command:
+  read-only commands (`ls`, `git status`) ask in normal mode too, and its extra checks for dangerous
+  `rm` and paths outside the project no longer apply. In normal and auto modes you or the classifier
+  still read the original; YOLO has none of these checks.
+- Codex's normal and auto modes do not ask before ordinary commands: they rely on Codex's sandbox,
+  and a routed command runs on the laptop, outside it. Routed, Codex therefore behaves as in its full
+  access mode: only its dangerous-command check (`rm` with `-f`) and the `prompt` and `forbidden`
+  rules in your `.rules` ask or deny, auto mode putting the question to its automatic review; YOLO
+  denies both, as a local Codex does. Codex runs these checks itself: the rewritten command repeats
+  the original on a new line after `exit`, which the shell neither runs nor parses, and Codex checks it.
+- opencode checks permissions after its plugins rewrite the call, so its plugin also repeats the
+  original on a new line after `exit` and sets the working directory to the original's own: opencode
+  parses the whole text, so your bash permission rules and its external-directory check judge the
+  original. `rh-run` and `exit` count as commands too, so an allowlist-style config (`"*"` set to ask
+  or deny) asks or denies because of them.
 - Claude/Codex hooks, the opencode plugin, runners, and instructions are **session-scoped**. Once
   routing is loaded, handler errors deny the call and SSH failures do not fall back to the original
   command.
