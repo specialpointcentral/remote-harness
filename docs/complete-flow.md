@@ -16,7 +16,8 @@
 8. The local bootstrap registers the physical project root for this gateway session.
 9. The remote server verifies `remote-harness-health`, then SSHFS-mounts the local project.
 10. `inject-rule.sh` installs Claude/Codex hooks or the opencode session plugin plus `rh-run`.
-11. opencode sessions preload the plugin and require its readiness marker; failure aborts launch.
+11. opencode sessions preload the plugin (2.x on a private `--standalone` server) and require its
+    readiness marker; failure aborts launch.
 12. The selected agent starts through `ssh -tt` on the remote server.
 13. File tools use SSHFS. Bash uses `remote-harness-exec` and runs in the mapped local project cwd
     with the login shell's environment (a per-session snapshot for bash/zsh). Agent-internal `git`/`rg`

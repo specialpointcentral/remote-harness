@@ -838,6 +838,8 @@ assert_grep "$tmp/approval-ap.c2.out" "RH_APPROVAL=normal" "a claude without aut
 refute_grep "$tmp/approval-ap.c2.out" "--permission-mode" "a claude without auto mode got --permission-mode"
 ap_inject codex auto ap.x3
 refute_grep "$tmp/approval-ap.x3.out" "--approve-for-me" "a codex without automatic review got --approve-for-me"
+printf '#!/bin/sh\necho 1.19.5\n' > "$ap_bin/opencode"
+chmod +x "$ap_bin/opencode"
 ap_inject opencode auto ap.o1
 assert_grep "$tmp/approval-ap.o1.out" "RH_APPROVAL=normal" "opencode auto approval falls back to normal"
 
@@ -1015,72 +1017,158 @@ assert_eq "the agent sees no laptop address in SSH_CONNECTION/SSH_CLIENT" \
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount-no-config" 0 || true)
 assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex inject requires ssh config"
-RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 1 "$basic_ssh_cfg" > "$tmp/inject-opencode.out"
-assert_grep "$tmp/inject-opencode.out" "OPENCODE_CONFIG='" "inject opencode env quoted"
-refute_grep "$tmp/inject-opencode.out" "CLAUDE_CODE_BASH_EDIT_DIFF" "only claude sessions get the bash edit diff default"
-assert_grep "$tmp/inject-opencode.out" "RH_READY_FILE=" "inject opencode exposes a plugin readiness marker"
-opencode_session_key="$(printf '%s' "$tmp/mount-opencode" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
-opencode_session_dir="$rh_home/.sessions/$opencode_session_key"
-opencode_plugin="$opencode_session_dir/plugins/remote-harness.js"
-opencode_ready="$opencode_session_dir/opencode-plugin.ready"
-[ -f "$opencode_plugin" ] || fail "inject opencode routing plugin missing"
-[ -x "$opencode_session_dir/bin/rh-run" ] || fail "inject opencode session runner missing"
-python3 - "$opencode_session_dir/opencode.json" "$opencode_plugin" <<'PY'
-import json
-import sys
-
-config = json.load(open(sys.argv[1], encoding="utf-8"))
-assert config["plugin"] == [sys.argv[2]]
-PY
+# opencode 1.x and 2.x get their own plugin format and config keys, and 2.x a private server; the
+# fake CLIs only answer --version. Session oc<major> is yolo; oc<major>.n has normal approvals and
+# leaves snapshots to the user's configuration.
+for oc_major in 1 2 3; do
+  mkdir -p "$tmp/oc-bin$oc_major"
+  case "$oc_major" in 1) oc_version=1.19.5;; 2) oc_version="opencode v2.2.5";; *) oc_version=3.0.0;; esac
+  printf '#!/bin/sh\necho %s\n' "$(sq "$oc_version")" > "$tmp/oc-bin$oc_major/opencode"
+  chmod +x "$tmp/oc-bin$oc_major/opencode"
+done
+oc_err=$(PATH="$tmp/oc-bin3:$PATH" RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" 0 "$basic_ssh_cfg" oc3 2>&1 || true)
+assert_grep <(printf '%s\n' "$oc_err") "RH_STATUS=ERROR" "inject accepted an unknown opencode major version"
+assert_grep <(printf '%s\n' "$oc_err") "opencode 3.0.0 is not supported" "inject names the unsupported opencode version"
 mkdir -p "$tmp/mount-opencode/packages/api"
-node --input-type=module - "$opencode_plugin" "$tmp/mount-opencode" "$tmp/opencode-plugin.json" <<'JS'
+for oc_sid in oc1 oc2 oc1.n oc2.n; do
+  oc_major=${oc_sid#oc}; oc_major=${oc_major%.n}
+  oc_approval=1; oc_snapshot=""
+  case "$oc_sid" in *.n) oc_approval=0; oc_snapshot=on;; esac
+  PATH="$tmp/oc-bin$oc_major:$PATH" RH_OPENCODE_SNAPSHOT="$oc_snapshot" RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode" "$oc_approval" "$basic_ssh_cfg" "$oc_sid" > "$tmp/inject-$oc_sid.out"
+  assert_grep "$tmp/inject-$oc_sid.out" "OPENCODE_CONFIG='" "inject opencode env quoted"
+  refute_grep "$tmp/inject-$oc_sid.out" "CLAUDE_CODE_BASH_EDIT_DIFF" "only claude sessions get the bash edit diff default"
+  oc_sd=$(sed -n 's/^RH_SESSION_DIR=//p' "$tmp/inject-$oc_sid.out")
+  oc_ready=$(sed -n 's/^RH_READY_FILE=//p' "$tmp/inject-$oc_sid.out")
+  [ -x "$oc_sd/bin/rh-run" ] || fail "inject opencode session runner missing"
+  [ "$oc_major" = 1 ] && oc_plugin="$oc_sd/plugins/remote-harness.js" || oc_plugin="$oc_sd/plugins/remote-harness"
+  node --input-type=module - "$oc_plugin" "$tmp/mount-opencode" "$tmp/opencode-$oc_sid.json" "$oc_major" <<'JS'
 import fs from "node:fs"
 import { pathToFileURL } from "node:url"
 
-const pluginPath = process.argv[2]
-const mountRoot = process.argv[3]
-const outputPath = process.argv[4]
-const module = await import(pathToFileURL(pluginPath).href)
-const factory = Object.values(module).find((value) => typeof value === "function")
-if (!factory) throw new Error("generated opencode plugin exports no function")
-const hooks = await factory({ directory: mountRoot })
-const output = { args: { command: "printf opencode-routed", workdir: "packages/api", timeout: 3210 } }
-await hooks["tool.execute.before"]({ tool: "bash", sessionID: "test", callID: "call" }, output)
-let outsideDenied = false
-try {
-  await hooks["tool.execute.before"](
-    { tool: "bash", sessionID: "test", callID: "outside" },
-    { args: { command: "uname -a", workdir: "../outside" } },
-  )
-} catch {
-  outsideDenied = true
+const [pluginPath, mountRoot, outputPath, major] = process.argv.slice(2)
+const hooks = {}
+if (major === "2") {
+  const plugin = (await import(pathToFileURL(pluginPath + "/server.js").href)).default
+  const domain = (prefix) => ({ hook: async (name, fn) => { hooks[prefix + name] = fn } })
+  await plugin.setup({ location: { directory: mountRoot }, tool: domain(""), session: domain("session.") })
+} else {
+  const module = await import(pathToFileURL(pluginPath).href)
+  Object.assign(hooks, await Object.values(module).find((value) => typeof value === "function")({ directory: mountRoot }))
 }
-fs.writeFileSync(outputPath, JSON.stringify({ output, outsideDenied }))
+// One tool call through this version's hook: the rewritten arguments, or "denied".
+const call = async (tool, args) => {
+  try {
+    if (major === "2") {
+      const event = { tool, input: args }
+      await hooks["execute.before"](event)
+      return event.input
+    }
+    const output = { args }
+    await hooks["tool.execute.before"]({ tool, sessionID: "test", callID: "call" }, output)
+    return output.args
+  } catch {
+    return "denied"
+  }
+}
+const shell = major === "2" ? "shell" : "bash"
+const results = {
+  routed: await call(shell, { command: "printf opencode-routed", workdir: "packages/api", timeout: 3210 }),
+  quoted: await call(shell, { command: "printf '%s\\n' \"it's $HOME\"" }),
+  outside: await call(shell, { command: "uname -a", workdir: "../outside" }),
+  empty: await call(shell, { command: " " }),
+  other: await call("read", { command: "left alone" }),
+}
+let parts
+if (major === "2") {
+  // opencode's input repair hook normally resolves the bash alias and decodes text input first.
+  results.alias = await call("bash", { command: "true" })
+  results.text = await call("shell", JSON.stringify({ command: "true", workdir: "packages" }))
+  results.background = await call("shell", { command: "sleep 1", background: true })
+  const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+  for (const _ of [1, 2]) await hooks["session.context"]({ messages })
+  parts = messages[0].content
+} else {
+  const messages = [{ info: { role: "user", id: "m", sessionID: "s" }, parts: [{ type: "text", text: "hi" }] }]
+  for (const _ of [1, 2]) await hooks["experimental.chat.messages.transform"]({}, { messages })
+  parts = messages[0].parts
+}
+results.note = parts.map((part) => part.text)
+fs.writeFileSync(outputPath, JSON.stringify(results))
 JS
-[ -s "$opencode_ready" ] || fail "opencode routing plugin did not write its readiness marker"
-python3 - "$tmp/opencode-plugin.json" "$opencode_session_dir/bin/rh-run" "$tmp/mount-opencode" <<'PY'
+  [ -s "$oc_ready" ] || fail "opencode $oc_sid routing plugin did not write its readiness marker"
+  python3 - "$tmp/opencode-$oc_sid.json" "$tmp/inject-$oc_sid.out" "$oc_sd" "$tmp/mount-opencode" "$oc_sid" <<'PY'
 import json
+import os
 import shlex
+import subprocess
 import sys
+import tempfile
 
-payload = json.load(open(sys.argv[1], encoding="utf-8"))
-args = payload["output"]["args"]
-# The readable form quotes as shlex.quote does: plain words stay bare in the approval prompt. The
-# original follows after an exit the shell never passes, for opencode's own permission check, and
-# relative paths in it start from its own directory.
-assert args["command"] == (shlex.quote(sys.argv[2])
-    + " --cwd packages/api -- 'printf opencode-routed'; exit\nprintf opencode-routed"), args
-assert args["workdir"] == sys.argv[3] + "/packages/api", args
-assert args["timeout"] == 3210
-assert payload["outsideDenied"] is True
+results = json.load(open(sys.argv[1], encoding="utf-8"))
+out = dict(line.split("=", 1) for line in open(sys.argv[2], encoding="utf-8").read().splitlines() if "=" in line)
+sd, mount, sid = sys.argv[3:]
+major, yolo = sid[2], not sid.endswith(".n")
+config = json.load(open(sd + "/opencode.json", encoding="utf-8"))
+note = "remote-harness: reply in the language of the user's latest message, not of tool output."
+assert out["RH_OPENCODE_MAJOR"] == major, out
+
+
+def routed(args, cwd, command, background=False):
+    # The runner, then the original after an exit the shell never passes, for opencode's own
+    # permission check; relative paths in it start from its own directory.
+    runner, tail = args["command"].split("; exit\n", 1)
+    argv = shlex.split(runner)
+    assert argv == [sd + "/bin/rh-run"] + ["--background"] * background + ["--cwd", cwd, "--", command], argv
+    assert tail == command, tail
+    assert args["workdir"] == os.path.normpath(os.path.join(mount, cwd)), args
+
+
+routed(results["routed"], "packages/api", "printf opencode-routed")
+# The readable form quotes as shlex.quote does: plain words stay bare in the approval prompt.
+assert results["routed"]["command"] == (shlex.quote(sd + "/bin/rh-run")
+    + " --cwd packages/api -- 'printf opencode-routed'; exit\nprintf opencode-routed"), results
+quoted = "printf '%s\\n' \"it's $HOME\""
+routed(results["quoted"], ".", quoted)
+# The shell runs only the runner line: a stand-in runner sees the original intact, and the copy
+# after exit never runs.
+with tempfile.TemporaryDirectory() as scratch:
+    fake = os.path.join(scratch, "rh-run")
+    with open(fake, "w", encoding="utf-8") as handle:
+        handle.write('#!/bin/sh\nprintf "%s|" "$@"\n')
+    os.chmod(fake, 0o700)
+    script = results["quoted"]["command"].replace(shlex.quote(sd + "/bin/rh-run"), shlex.quote(fake), 1)
+    ran = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    assert (ran.returncode, ran.stdout, ran.stderr) == (0, "--cwd|.|--|" + quoted + "|", ""), ran
+assert results["routed"]["timeout"] == 3210
+assert results["outside"] == results["empty"] == "denied", results
+assert results["other"] == {"command": "left alone"}, results
+# Snapshots are off by default; the .n sessions set RH_OPENCODE_SNAPSHOT=on.
+snapshot = False if yolo else None
+if major == "1":
+    assert config["plugin"] == [sd + "/plugins/remote-harness.js"], config
+    assert config.get("permission") == ("allow" if yolo else None), config
+    assert config.get("snapshot") == snapshot, config
+    assert out["RH_LAUNCH_FLAGS"] == "", out
+    assert results["note"] == ["hi", note], results
+else:
+    assert config["plugins"] == [sd + "/plugins/remote-harness"] and "plugin" not in config, config
+    assert "permission" not in config and config.get("snapshots") == snapshot, config
+    assert out["RH_LAUNCH_FLAGS"] == "--standalone" + " --auto" * yolo, out
+    routed(results["alias"], ".", "true")
+    routed(results["text"], "packages", "true")
+    routed(results["background"], ".", "sleep 1", background=True)
+    assert results["note"] == ["hi", "\n\n" + note], results
 PY
-RH_HOME="$rh_home" HOME="$home_dir" \
-  "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/mount-opencode" >/dev/null
+  RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" off opencode "$tmp/mount-opencode" "$oc_sid" >/dev/null
+done
 missing_opencode_cfg=$(RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on opencode "$tmp/code" laptop "$tmp/mount-opencode-no-config" 0 || true)
 assert_grep <(printf '%s\n' "$missing_opencode_cfg") "RH_STATUS=ERROR" "strict opencode inject requires ssh config"
 assert_grep "$ROOT/scripts/laptop-setup.sh" "opencode routing plugin failed to load" "laptop setup fails closed when the opencode plugin is unavailable"
+assert_grep "$ROOT/scripts/laptop-setup.sh" 'rh_probe="debug agents --standalone"' "laptop setup probes opencode 2.x on a private server"
 
 cat > "$tmp/bin/sudo" <<'EOS'
 #!/usr/bin/env bash
@@ -1956,6 +2044,7 @@ mkdir -p "$nopy_bin"
 for nopy_dep in bash sh dirname mkdir chmod sed tr awk cat rm cp ln git grep cksum base64; do
   ln -s "$(command -v "$nopy_dep")" "$nopy_bin/$nopy_dep"
 done
+cp "$ap_bin/opencode" "$nopy_bin/opencode"
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > %s\n' "$(sq "$tmp/nopy-ssh.args")" > "$nopy_bin/ssh"
 chmod +x "$nopy_bin/ssh"
 PATH="$nopy_bin" RH_HOME="$wr_rh" HOME="$rp_home" \

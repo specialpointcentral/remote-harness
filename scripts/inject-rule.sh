@@ -8,7 +8,8 @@
 #   claude   → --append-system-prompt-file <rule>   (session-only flag; nothing on disk to clean up
 #              beyond the box-side rule file; never touches the mounted repo)
 #   opencode → OPENCODE_CONFIG=<session config with instructions and tool hook plugin>
-#              (env; never touches the mounted repo)
+#              (env; never touches the mounted repo). 1.x and 2.x get their own plugin and config
+#              keys; 2.x also starts with --standalone, a private server instead of the shared one.
 #   codex    → -c developer_instructions=<rule>  (session-only CLI config; avoids changing
 #              CODEX_HOME, because modern Codex can store ChatGPT credentials in an encrypted
 #              keyring keyed by the real home and would prompt for login under a synthetic home).
@@ -32,7 +33,7 @@
 #               RH_RESUME_AVAILABLE=<reason>,<epoch> when the last session of this mountpoint and
 #               agent ended on a lost connection (offered once; the marker is consumed), and
 #               RH_RESUME_ARGS=<agent arguments that continue the last conversation>
-#               RH_READY_FILE=<opencode marker>
+#               RH_READY_FILE=<opencode marker>  RH_OPENCODE_MAJOR=<1|2, empty for other agents>
 #               RH_PROCESS_LIST_SHARED=<1 when other users here can read process arguments>
 #               RH_LAUNCH_PREFIX=<session launcher for the final launch>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
@@ -368,15 +369,26 @@ write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project r
   chmod +x "$_wts_shim" 2>/dev/null || return 1
 }
 
-write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker $5=reply language note
-  _wop_dir="$1/plugins"
-  _wop_file="$_wop_dir/remote-harness.js"
+# opencode 1.x imports a module and calls its exported functions for hooks; 2.x loads a directory whose
+# default export is { id, setup } and registers hooks on the context it gets. Both share the routing.
+write_opencode_plugin() {  # $1=session dir $2=runner $3=mountpoint $4=ready marker $5=reply language note $6=major
   _wop_runner_b64="$(printf '%s' "$2" | base64 | tr -d '\n')" || return 1
   _wop_mount_b64="$(printf '%s' "$3" | base64 | tr -d '\n')" || return 1
   _wop_ready_b64="$(printf '%s' "$4" | base64 | tr -d '\n')" || return 1
   _wop_note_b64="$(printf '%s' "$5" | base64 | tr -d '\n')" || return 1
-  mkdir -p "$_wop_dir" 2>/dev/null || return 1
-  cat > "$_wop_file" <<EOF
+  if [ "$6" = 2 ]; then
+    # 2.x skips a configured plugin path that is a file; the directory's server.js is its entry.
+    _wop_target="$1/plugins/remote-harness"
+    _wop_file="$_wop_target/server.js"
+    mkdir -p "$_wop_target" 2>/dev/null || return 1
+    printf '{ "type": "module" }\n' > "$_wop_target/package.json" || return 1
+  else
+    _wop_target="$1/plugins/remote-harness.js"
+    _wop_file="$_wop_target"
+    mkdir -p "$1/plugins" 2>/dev/null || return 1
+  fi
+  {
+    cat <<EOF
 import fs from "node:fs"
 import path from "node:path"
 
@@ -395,39 +407,77 @@ const shellQuote = (value) =>
     : apostrophe +
       value.split(apostrophe).join(apostrophe + doubleQuote + apostrophe + doubleQuote + apostrophe) +
       apostrophe
+const policyError = () => new Error("remote-harness: category=policy exit=2 session=unknown")
 
+// Rewrites shell tool arguments in place to run the command through the session runner, in the
+// project-host directory matching its working directory below the mount. Anything else is refused.
+const route = (args, directory) => {
+  const command = args?.command
+  if (typeof command !== "string" || command.trim() === "") throw policyError()
+  const base = directory || mountRoot
+  let cwd
+  try {
+    cwd = fs.realpathSync(path.resolve(base, args.workdir || base))
+  } catch {
+    throw policyError()
+  }
+  const relative = path.relative(mountRoot, cwd)
+  if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) throw policyError()
+  // A background command (2.x \`background: true\`) takes a background slot, not a warm channel.
+  const background = args.background === true ? ["--background"] : []
+  // The readable form, so the approval prompt shows the original command. opencode checks permissions
+  // on the rewritten text, so the original follows on a new line after exit, as for Codex: the shell
+  // never parses that line, while opencode's own parser reads the whole text, and its bash rules and
+  // external directory check judge the original, whose relative paths start from its own directory.
+  args.command = [runner, ...background, "--cwd", relative || ".", "--", command].map(shellQuote).join(" ") +
+    "; exit\n" + command
+  args.workdir = cwd
+}
+
+EOF
+    if [ "$6" = 2 ]; then
+      cat <<'EOF'
+export default {
+  id: "remote-harness",
+  setup: async (ctx) => {
+    const directory = ctx.location?.directory
+    // The built-in input repair hook runs first: it resolves the `bash` alias to `shell` and decodes
+    // stringified input. Both forms are handled here too, so another hook order cannot skip routing.
+    await ctx.tool.hook("execute.before", (event) => {
+      const tool = String(event.tool).toLowerCase()
+      if (tool !== "shell" && tool !== "bash") return
+      if (typeof event.input === "string") {
+        try {
+          event.input = JSON.parse(event.input)
+        } catch {
+          throw policyError()
+        }
+      }
+      route(event.input, directory)
+    })
+    // The context of each model request, after the history is loaded: the note reaches the model on
+    // the latest user message and is never saved or displayed. A failing session hook would fail the
+    // request, so a message that cannot take it goes without.
+    const replyPart = "\n\n" + replyNote
+    await ctx.session.hook("context", (event) => {
+      const user = event.messages.findLast((message) => message.role === "user")
+      if (!user || user.content.some((part) => part.text === replyPart)) return
+      try {
+        user.content.push({ type: "text", text: replyPart })
+      } catch {}
+    })
+    fs.writeFileSync(readyFile, String(process.pid) + "\n", { mode: 0o600 })
+  },
+}
+EOF
+    else
+      cat <<'EOF'
 export const RemoteHarness = async ({ directory }) => {
-  fs.writeFileSync(readyFile, String(process.pid) + "\\n", { mode: 0o600 })
+  fs.writeFileSync(readyFile, String(process.pid) + "\n", { mode: 0o600 })
   return {
     "tool.execute.before": async (input, output) => {
       if (String(input.tool).toLowerCase() !== "bash") return
-      const command = output.args?.command
-      if (typeof command !== "string" || command.trim() === "") {
-        throw new Error("remote-harness: category=policy exit=2 session=unknown")
-      }
-
-      const requested = output.args.workdir || directory || mountRoot
-      const candidate = path.resolve(directory || mountRoot, requested)
-      let cwd
-      try {
-        cwd = fs.realpathSync(candidate)
-      } catch {
-        throw new Error("remote-harness: category=policy exit=2 session=unknown")
-      }
-      const relative = path.relative(mountRoot, cwd)
-      if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
-        throw new Error("remote-harness: category=policy exit=2 session=unknown")
-      }
-
-      // The readable form, so the approval prompt shows the original command. opencode checks
-      // permissions on the rewritten text, so the original follows on a new line after exit, as for
-      // Codex: the shell never parses that line, while opencode's own parser reads the whole text,
-      // and its bash rules and external directory check judge the original, whose relative paths
-      // start from its own directory.
-      output.args.command = [runner, "--cwd", relative || ".", "--", command]
-        .map(shellQuote)
-        .join(" ") + "; exit\n" + command
-      output.args.workdir = cwd
+      route(output.args, directory)
     },
     // opencode reloads the history before every model step and adds its own reminders the same way:
     // an in-memory synthetic part on the latest user message that is never saved or displayed.
@@ -446,8 +496,10 @@ export const RemoteHarness = async ({ directory }) => {
   }
 }
 EOF
+    fi
+  } > "$_wop_file" || return 1
   chmod 600 "$_wop_file" 2>/dev/null || true
-  printf '%s' "$_wop_file"
+  printf '%s' "$_wop_target"
 }
 
 write_claude_worktree_blocker() {  # $1=session dir
@@ -617,7 +669,7 @@ case "${1:-}" in
     fi
     RULE="$SD/rule.md"
 
-    env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""
+    env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""; opencode_major=""
     if [ -n "$ssh_config" ]; then
       control_path="$(session_control_path "$ssh_config")" || abort_session
       diagnostic_dir="$(dirname "$ssh_config")/runtime/diagnostics"
@@ -738,22 +790,51 @@ case "${1:-}" in
         fi
         ;;
       opencode)
-        # OPENCODE_CONFIG is merged ADDITIVELY on top of the user's global + project configs, so we
-        # only write a minimal session layer (instructions + permission on yolo). No jq, no copying
-        # the user's config — that avoided a crash on a non-array `instructions` and a stale config
-        # snapshot overriding a project-local opencode.json.
+        # 1.x and 2.x differ in plugin format, config keys and process model. Any other version is
+        # refused: its loader could skip the plugin and leave Bash calls running on this host.
+        opencode_version=$(opencode --version </dev/null 2>/dev/null) || opencode_version=""
+        opencode_major=$(sed -n '1s/^[^0-9]*\([0-9][0-9]*\)\..*$/\1/p' <<<"$opencode_version")
+        case "$opencode_major" in
+          1|2) ;;
+          *)
+            printf 'remote-harness: opencode %s is not supported; install opencode 1.x or 2.x\n' \
+              "$(sed -n '1p' <<<"${opencode_version:-(not found)}")" >&2
+            abort_session;;
+        esac
+        # OPENCODE_CONFIG is merged ADDITIVELY on top of the user's global config (a project config
+        # still wins), so we only write a minimal session layer. No jq, no copying the user's config
+        # — that avoided a crash on a non-array `instructions` and a stale config snapshot overriding
+        # a project-local opencode.json.
         CFG="$SD/opencode.json"
         ready_file="$SD/opencode-plugin.ready"
         rm -f "$ready_file" 2>/dev/null || true
-        opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file" "$REPLY_LANGUAGE_NOTE") \
+        opencode_plugin=$(write_opencode_plugin "$SD" "$runner" "$mp" "$ready_file" "$REPLY_LANGUAGE_NOTE" "$opencode_major") \
           || abort_session
-        [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
         [ "$approval" = yolo ] || approval=normal  # opencode has no automatic approval review
         # JSON-escape session paths: escape \ then " (both legal in Unix paths; rare but correct).
         rule_json="$(printf '%s' "$RULE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
         plugin_json="$(printf '%s' "$opencode_plugin" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-        printf '{ "$schema": "https://opencode.ai/config.json", %s"plugin": ["%s"], "instructions": ["%s"] }\n' \
-          "$perm" "$plugin_json" "$rule_json" > "$CFG"
+        # Snapshots back /undo and revert, but each model step lists the whole work tree with git
+        # under a private GIT_DIR, which no shim routes: over SSHFS every file costs a round trip. Off
+        # unless the remote login shell exports RH_OPENCODE_SNAPSHOT=on; a project config still wins.
+        snapshot_key=snapshot
+        [ "$opencode_major" = 2 ] && snapshot_key=snapshots
+        snapshot_json=", \"$snapshot_key\": false"
+        [ "${RH_OPENCODE_SNAPSHOT:-}" != on ] || snapshot_json=""
+        if [ "$opencode_major" = 2 ]; then
+          printf '{ "plugins": ["%s"], "instructions": ["%s"]%s }\n' \
+            "$plugin_json" "$rule_json" "$snapshot_json" > "$CFG"
+          # Without --standalone a 2.x client attaches to the user's shared background server, whose
+          # configuration and plugins come from whichever opencode started it: Bash would then run
+          # unrouted, or through another session's runner. The private server inherits this session's
+          # environment and exits with the client. --auto approves what no rule denies.
+          flags_out="--standalone"
+          [ "$yolo" != 1 ] || flags_out="$flags_out --auto"
+        else
+          [ "$yolo" = 1 ] && perm='"permission": "allow", ' || perm=''
+          printf '{ "$schema": "https://opencode.ai/config.json", %s"plugin": ["%s"], "instructions": ["%s"]%s }\n' \
+            "$perm" "$plugin_json" "$rule_json" "$snapshot_json" > "$CFG"
+        fi
         env_out="${env_out:+$env_out }OPENCODE_CONFIG=$(sq "$CFG")"
         ;;
       codex)
@@ -805,6 +886,7 @@ case "${1:-}" in
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
     printf 'RH_APPROVAL=%s\n' "$approval"
     printf 'RH_READY_FILE=%s\n'   "$ready_file"
+    printf 'RH_OPENCODE_MAJOR=%s\n' "$opencode_major"
     printf 'RH_PROCESS_LIST_SHARED=%s\n' "$shared_ps"
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"

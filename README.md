@@ -50,10 +50,11 @@
 只给你一条命令；具体 SSH、路径、命名空间和挂载点都在你的本地终端里输入，不进入 Agent 聊天。
 
 本 fork 对 Claude Code、Codex 和 opencode 都启用严格命令路由：Claude/Codex 使用会话级
-`PreToolUse` hook，opencode 使用会话级 `tool.execute.before` 插件。它们会把每个 Bash 调用自动改写到
+`PreToolUse` hook，opencode 使用会话级插件（1.x 和 2.x 各有一种格式）。它们会把每个 Bash 调用自动改写到
 代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook/plugin、runner 或 SSH
 config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。
-opencode 还必须在预加载时写出会话 plugin readiness marker，否则交互式 Agent 不会启动。
+opencode 还必须在预加载时写出会话 plugin readiness marker，否则交互式 Agent 不会启动。opencode 2.x
+总是以 `--standalone` 启动私有服务端：用户共用的后台服务不会加载本会话的插件，命令会在那里不经路由执行。
 
 记号：**A** = 运行 Agent 的机器；**P** = 存放代码的机器（用一个 ssh `<别名>` 指代）。
 
@@ -278,8 +279,8 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
     `brew install macos-fuse-t/cask/fuse-t && brew install macos-fuse-t/cask/sshfs-fuse-t`。
     **不要用 macFUSE**（它要求降低安全策略）。FUSE-T 保留 sshfs 的同步写，编辑会先落到代码所在机器
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
-- Claude/Codex 严格路由要求远端 Agent 主机有 `python3`；opencode 要求支持
-  `tool.execute.before` 的当前插件接口。项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
+- Claude/Codex 严格路由要求远端 Agent 主机有 `python3`；opencode 须为 1.x 或 2.x（按
+  `opencode --version` 判断，其它版本拒绝启动）。项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
 - 多用户共享远程开发服务器建议按
   [`docs/ssh-sshfs-long-lived-connections.cn.md`](docs/ssh-sshfs-long-lived-connections.cn.md)
   调整 sshd 容量、keepalive、`nofile` 和 TCP 队列。该优化不是 remote-harness 的硬性前置条件，
@@ -340,8 +341,8 @@ remote-harness/
   最后一个会话退出时清理。
 - 审批模式默认 **auto**：Claude Code 以 `--permission-mode auto`、Codex 以 `--approve-for-me` 启动，由
   Agent 自动审核审批请求；远端 CLI 不支持时（以及 opencode）退回普通审批并给出提示。`--approval normal`
-  恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 的 `permission:allow`
-  只写进**本次会话**的配置，退出即清。
+  恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 1.x 的 `permission:allow`
+  只写进**本次会话**的配置，2.x 改用本次启动的 `--auto` 参数，退出即失效。
 - Claude、Codex、opencode 的每个 Bash 调用都被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
   自动审核看到的是原命令。Claude 仍按你选的审批模式处理：普通模式询问，auto 模式由自动审核判断，YOLO
   不询问。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
@@ -357,7 +358,8 @@ remote-harness/
   解析这一行，Codex 按它检查。
 - opencode 在插件改写之后才检查权限，所以插件同样在 `exit` 之后另起一行附上原命令，并把工作目录设为原命令
   自己的目录：opencode 解析整段文本，你的 bash 权限规则和项目外目录检查都按原命令判断。`rh-run` 和 `exit`
-  本身也算两条命令，`"*"` 设为 ask 或 deny 的白名单式配置会因此询问或拒绝。
+  本身也算两条命令，`"*"` 设为 ask 或 deny 的白名单式配置会因此询问或拒绝。opencode 2.x 和本机一样，
+  会直接拒绝它的解析器分析不了的命令（heredoc、`for`/`while` 等复合命令）。
 - Claude/Codex hook、opencode plugin、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
   退出删除会话目录。路由器加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
@@ -370,6 +372,10 @@ remote-harness/
   监听挂载点内的每个目录，而路由命令在项目主机上修改文件，SSHFS 不会产生对应事件，所以差异始终为空，
   建立监听却会拖慢界面。需要时在远端 shell 启动文件中 `export CLAUDE_CODE_BASH_EDIT_DIFF=1`；
   查看改动请用路由后的 `git diff`。
+- opencode 会话默认关闭快照（`/undo` 和回滚依赖它）：每一步模型调用都要经 SSHFS 列出整个工作区，
+  大仓库会明显变慢。需要时在远端 shell 启动文件中 `export RH_OPENCODE_SNAPSHOT=on`，或在项目的
+  opencode 配置里打开。opencode 的格式化器和语言服务器不经过 Bash，和你自己输入的 `!` 命令及终端一样，
+  在远端主机上对挂载目录执行。
 - 隐私：Bash 在笔记本上执行，输出（`pwd`、报错、堆栈等）里会出现笔记本上的项目路径和用户名，并进入模型
   上下文。git/rg 垫片会把报错里的项目路径映射回挂载点，项目命令自己的输出不做改写。
 - 远端 `/proc` 没有 `hidepid` 挂载选项时，服务器上的其他用户能看到所有进程的参数，包括 Agent 执行的 Bash
@@ -427,11 +433,12 @@ not in chat. Generically: **A** = the machine the agent runs on; **P** = the
 machine the code lives on (an ssh `<alias>`).
 
 This fork adds strict routing for Claude Code, Codex, and opencode. Claude/Codex use a session
-`PreToolUse` hook; opencode uses a session `tool.execute.before` plugin. Each rewrites Bash calls to
+`PreToolUse` hook; opencode uses a session plugin (1.x or 2.x format). Each rewrites Bash calls to
 the project host and maps the SSHFS-relative cwd to the corresponding project-host directory.
 Hook/plugin, runner, or SSH-config failures abort launch instead of falling back to the agent host.
 opencode must also produce a session-plugin readiness marker during preloading before its interactive
-Agent is allowed to start.
+Agent is allowed to start. opencode 2.x always starts with `--standalone`, a private server: the
+user's shared background server does not load the session plugin and would run commands unrouted.
 
 ### Install the Skill
 
@@ -692,9 +699,9 @@ See the full template, verification commands, and rollback notes in
     Avoid macFUSE (it requires lowering security). FUSE-T keeps sshfs's synchronous writes, so edits
     land on the host before remote builds. (Kext-less fallback: `rclone nfsmount`, but its writes are
     async — prefer FUSE-T for this edit-here/build-on-host workflow.)
-- Strict Claude/Codex routing requires `python3` on the remote Agent host. opencode requires a
-  current plugin interface with `tool.execute.before`. The project host needs POSIX `sh`, a base64
-  decoder, and its normal login shell.
+- Strict Claude/Codex routing requires `python3` on the remote Agent host. opencode must be 1.x or
+  2.x (read from `opencode --version`; other versions are refused). The project host needs POSIX `sh`,
+  a base64 decoder, and its normal login shell.
 - Shared remote development servers should use
   [`docs/ssh-sshfs-long-lived-connections.md`](docs/ssh-sshfs-long-lived-connections.md) to tune sshd
   capacity, keepalive, `nofile`, and TCP queues. This is not a hard prerequisite for remote-harness,
@@ -759,8 +766,9 @@ remote-harness/
 - The approval mode defaults to **auto**: Claude Code starts with `--permission-mode auto` and Codex
   with `--approve-for-me`, so the agent reviews approval requests itself; a remote CLI without it (and
   opencode) falls back to normal approvals with a notice. `--approval normal` restores per-action
-  prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode's
-  `permission:allow` goes into the **per-session** config only and is gone on exit.
+  prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode 1.x's
+  `permission:allow` goes into the **per-session** config only, 2.x gets this launch's `--auto` flag,
+  and both are gone on exit.
 - Claude, Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
   approval prompts and automatic review show the original command. Claude still applies your approval
   mode: normal asks, auto lets the classifier decide, YOLO does not ask. Claude can match permission
@@ -782,7 +790,8 @@ remote-harness/
   original on a new line after `exit` and sets the working directory to the original's own: opencode
   parses the whole text, so your bash permission rules and its external-directory check judge the
   original. `rh-run` and `exit` count as commands too, so an allowlist-style config (`"*"` set to ask
-  or deny) asks or denies because of them.
+  or deny) asks or denies because of them. Like a local opencode 2.x, 2.x refuses commands its parser
+  cannot analyze (here-documents, compound commands such as `for` or `while`).
 - Claude/Codex hooks, the opencode plugin, runners, and instructions are **session-scoped**. Once
   routing is loaded, handler errors deny the call and SSH failures do not fall back to the original
   command.
@@ -799,6 +808,11 @@ remote-harness/
   files on the project host, and SSHFS reports no events for those changes, so the diff stays empty
   while setting up the watches slows the UI. To turn it back on, `export CLAUDE_CODE_BASH_EDIT_DIFF=1`
   in a remote shell startup file; routed `git diff` shows changes.
+- opencode sessions turn snapshots off (they back `/undo` and revert): every model step lists the whole
+  work tree over SSHFS, which slows large repositories noticeably. To turn them back on,
+  `export RH_OPENCODE_SNAPSHOT=on` in a remote shell startup file, or enable them in the project's
+  opencode config. opencode's formatters and language servers do not go through Bash: like your own
+  `!` commands and terminals, they run on the remote host against the mount.
 - Privacy: Bash runs on the laptop, so its output (`pwd`, errors, stack traces) shows the laptop's
   project path and user name and reaches the model. The git/rg shims map the project path in their
   errors back to the mount; a project command's own output is not rewritten.

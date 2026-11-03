@@ -61,10 +61,10 @@ not migrated while running. See [design.md](design.md) for lifecycle details.
    user-mode sshd's free loopback port instead of `22` when it is used).
 8. The remote server uses the session key and config to mount the selected local project with
    SSHFS.
-9. For opencode, the remote CLI preloads the session plugin and must create its readiness marker.
-   Failure aborts before the interactive Agent starts.
+9. For opencode, the remote CLI preloads the session plugin (2.x on a private `--standalone` server)
+   and must create its readiness marker. Failure aborts before the interactive Agent starts.
 10. The selected agent is launched only on the remote server, inside the SSHFS mount.
-11. Claude/Codex `PreToolUse` hooks or the opencode `tool.execute.before` plugin rewrite Bash to the
+11. Claude/Codex `PreToolUse` hooks or the opencode plugin's tool hook rewrite Bash to the
     session runner. The runner sends only `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`
     through the forced gateway.
 12. The local dispatcher verifies the project root and physical cwd, removes common AI credential
@@ -143,8 +143,8 @@ has no AI credentials.
   selected Agent CLI installed.
 - The local machine runs an SSH server.
 - The remote server has SSHFS and FUSE.
-- Strict Claude/Codex routing requires Python 3 on the remote Agent host. opencode requires its
-  current `tool.execute.before` plugin interface.
+- Strict Claude/Codex routing requires Python 3 on the remote Agent host. opencode must be 1.x or
+  2.x; other versions are refused.
 - The local project host needs POSIX `sh`, a base64 decoder, and its project toolchain.
 - The remote server's sshd permits reverse TCP forwarding.
 

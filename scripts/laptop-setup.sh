@@ -37,7 +37,8 @@
 #                         --permission-mode auto, codex --approve-for-me, normal where the CLI
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
 #   --yolo                bypass approvals on the launched agent — claude/codex get their
-#                         bypass flag; opencode gets a temporary permission=allow config (restored)
+#                         bypass flag; opencode allows every permission in this session only
+#                         (1.x: permission=allow in the session config, 2.x: --auto)
 #   --local-sshd <mode>   SSH server the tunnel reaches on this laptop: 'system' (default; the
 #                         sshd on :22 reading ~/.ssh/authorized_keys) or 'user' (a per-session sshd
 #                         run as you on a free loopback port, for sshds that ignore authorized_keys
@@ -727,7 +728,7 @@ if [ "$APPROVAL" = yolo ]; then
   case "$LAUNCH_BASE" in
     claude)   EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex)    EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
-    opencode) warn "YOLO: opencode permission=allow (set in this session's config only — nothing global)";;
+    opencode) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
   esac
 fi
 
@@ -1324,8 +1325,8 @@ LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%
 # Inject the run-on-laptop rule SCOPED TO THIS SESSION: inject-rule builds box-side, per-session
 # artifacts (nothing global, nothing in the mounted repo, so other projects on this box are
 # unaffected) and prints how to launch so ONLY this agent reads it — a session flag for claude, or
-# an env/config prefix (Codex developer_instructions / OPENCODE_CONFIG) for codex/opencode. For opencode, YOLO's
-# permission=allow is folded into that per-session config too.
+# an env/config prefix (Codex developer_instructions / OPENCODE_CONFIG) for codex/opencode. For opencode 1.x,
+# YOLO's permission=allow is folded into that per-session config too; 2.x gets --auto.
 # The box-side session dir is keyed by mountpoint AND this launch's RULE_SESSION_ID, so a
 # relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
@@ -1426,12 +1427,19 @@ if [ "$LAUNCH_BASE" = opencode ]; then
   esac
   case "$rh_ready" in *'
 '*) err "opencode routing plugin returned an invalid readiness marker; refusing to launch"; exit 1;; esac
+  # 1.x loads plugins while it reads the configuration. 2.x loads them only when its server opens the
+  # directory, which listing agents does; --standalone keeps the probe off the user's shared server,
+  # as the launch flags keep the agent.
+  case "$(printf '%s\n' "$rh_out" | kv_value RH_OPENCODE_MAJOR)" in
+    2) rh_probe="debug agents --standalone";;
+    *) rh_probe="debug config";;
+  esac
   if ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     ready=$(sq "$rh_ready")
     mount_root=$(sq "$REMOTE_MOUNTPOINT")
     rm -f \"\$ready\" 2>/dev/null || true
     cd \"\$mount_root\" || exit 1
-    (${rh_env:+$rh_env }opencode debug config </dev/null >/dev/null 2>&1) &
+    (${rh_env:+$rh_env }opencode $rh_probe </dev/null >/dev/null 2>&1) &
     pid=\$!
     i=0
     while [ \"\$i\" -lt 60 ]; do

@@ -174,8 +174,8 @@ Read `docs/claude-multi-agent.md` for the full boundary.
 
 - remote-harness and the selected agent CLI are installed on the remote server;
 - the local machine can SSH to the remote server;
-- the remote server has SSHFS; Claude/Codex also require Python 3, while opencode requires its
-  current `tool.execute.before` plugin interface;
+- the remote server has SSHFS; Claude/Codex also require Python 3, while opencode must be 1.x or
+  2.x (other versions are refused);
 - the local machine runs an SSH server and has POSIX `sh` plus base64;
 - the remote server is trusted with the mounted project content;
 - no unrestricted authorization for the generated session key already exists locally.

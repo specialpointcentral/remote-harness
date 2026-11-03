@@ -43,8 +43,12 @@ gateway 拒绝任意 SSH shell，并验证请求项目根与本地 bootstrap 登
 
 ## 命令策略
 
-`route-command.py` 处理 Claude/Codex。生成的 opencode `tool.execute.before` plugin 为 opencode 执行
-等价的 Bash 和 cwd 改写。`run-on-project-host.sh` 校验本机物理 cwd，拒绝直接启动 Agent CLI，清除
+`route-command.py` 处理 Claude/Codex。生成的 opencode plugin 为 opencode 执行等价的 Bash 和 cwd
+改写：1.x 用 `tool.execute.before`；2.x 用 shell 工具的 `execute.before` 钩子，并且也处理它的 `bash`
+别名和字符串化的参数（通常已由 opencode 自带的参数修复钩子先行处理）。`inject-rule.sh` 读取
+`opencode --version`，拒绝其它主版本。2.x 总是以 `--standalone` 启动：不加时客户端会连到用户共用的
+后台服务，其配置和插件来自最先启动它的那个 opencode，Bash 会在那里不经路由执行，或经由别的会话的
+runner 执行。`run-on-project-host.sh` 校验本机物理 cwd，拒绝直接启动 Agent CLI，清除
 常见 AI 凭据环境变量，在 `PATH` 中屏蔽 Agent 二进制，然后用项目主机登录 shell 的环境执行。对 bash
 和 zsh，这个环境来自会话级快照，而不是每条命令新开一个登录 shell：第一条命令抓取 profile 执行后的结果
 （除 AI 凭据和单次连接相关值以外的导出变量、函数、shell 选项、umask、软资源限制），确认能静默且完整加载
@@ -83,9 +87,10 @@ Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它�
 内容，路由命令只会回到不受检查的状态，这种写法不会放宽任何审批。
 
 opencode 同样在插件运行之后才按改写后的文本检查权限，所以它的插件也用同样的方式在 `exit` 之后附上
-原命令，并把工作目录设为原命令自己的目录。opencode 会解析整段文本，用户的 bash 规则和它的项目外目录
-检查（按工作目录解析相对路径）都作用于原命令。rh-run 和 `exit` 也会被检查，所以兜底规则为 ask 或 deny
-的白名单式配置会对每个路由调用询问或拒绝。
+原命令，并把工作目录设为原命令自己的目录。opencode 会解析整段文本（1.x 用 tree-sitter，2.x 用自己的
+扫描器），用户的 bash 规则和它的项目外目录检查（按工作目录解析相对路径）都作用于原命令。rh-run 和
+`exit` 也会被检查，所以兜底规则为 ask 或 deny 的白名单式配置会对每个路由调用询问或拒绝。2.x 会拒绝它的
+扫描器分析不了的命令（heredoc、复合命令、动态执行），无论是否经过路由。
 
 Agent 主机上的隐私：除非 `/proc` 以 `hidepid` 挂载，该主机上的所有用户都能读取所有进程的参数，包括 Agent
 自己执行的 `bash -c '<命令>'`，这与在共享主机上运行任何 Agent 相同；`inject-rule.sh` 会在该主机上有其他
@@ -137,6 +142,13 @@ Claude Code 的 Bash 自动差异（bash edit diff）属于垫片无法接管的
 它查询被忽略目录和建立快照时使用私有 `GIT_DIR`，因此留在远端执行，并会在 SSHFS 上超时，导致被忽略的
 构建缓存目录也被监听。因此 Claude 会话以 `CLAUDE_CODE_BASH_EDIT_DIFF=${CLAUDE_CODE_BASH_EDIT_DIFF:-0}`
 启动，该值在远端登录 shell 读取启动文件之后展开；用户在启动文件中 export 的值会重新开启该功能。
+
+opencode 的快照（`/undo` 和回滚依赖它）是同一类扫描：每一步模型调用都会用私有 `GIT_DIR` 执行
+`git diff-files` 和 `git ls-files --others` 列出工作区，因此留在远端执行，每个被跟踪的文件都要经过
+SSHFS 往返。与 Claude 的差异展示不同，它读取挂载的文件，能看到路由命令造成的修改。会话默认关闭快照
+（1.x 为 `snapshot: false`，2.x 为 `snapshots: false`），除非远端登录 shell 导出
+`RH_OPENCODE_SNAPSHOT=on`；项目自己的 opencode 配置仍然优先。opencode 的格式化器和语言服务器不是 Bash
+调用：和用户自己的 `!` 命令及终端一样，它们在远端主机上对挂载目录执行。
 
 ## 连接
 

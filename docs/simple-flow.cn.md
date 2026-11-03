@@ -49,9 +49,10 @@ SSH 传输从暂存目录打包的八个 helper、bootstrap 副本和 SHA-256 �
 7. 本机 SSH 连接向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`（使用用户态 sshd 时，`22`
    换成它的空闲回环端口）。
 8. 远端服务器使用会话 key/config，通过 SSHFS 挂载选定的本机项目。
-9. opencode 会先在远端预加载会话 plugin，并且必须写出 readiness marker；失败时在交互式 Agent 启动前中止。
+9. opencode 会先在远端预加载会话 plugin（2.x 在私有的 `--standalone` 服务端上），并且必须写出
+   readiness marker；失败时在交互式 Agent 启动前中止。
 10. 选定 Agent 只在远端服务器、SSHFS 挂载目录内启动。
-11. Claude/Codex `PreToolUse` hook 或 opencode `tool.execute.before` plugin 把 Bash 改写到会话
+11. Claude/Codex `PreToolUse` hook 或 opencode plugin 的工具钩子把 Bash 改写到会话
     runner。runner 只通过 forced gateway 发送
     `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`。
 12. 本机 dispatcher 验证项目根和物理 cwd，清除常见 AI 凭据环境变量，在 `PATH` 中屏蔽
@@ -116,8 +117,8 @@ chroot 到选定项目。若需要绝对的“本机不能运行 Agent”以及�
 - 本机可 SSH 登录远端服务器；远端已经安装 remote-harness 和选定 Agent CLI。
 - 本机运行 SSH server。
 - 远端服务器安装 SSHFS 和 FUSE。
-- Claude/Codex 严格路由要求远端 Agent 主机安装 Python 3；opencode 需要当前
-  `tool.execute.before` plugin 接口。
+- Claude/Codex 严格路由要求远端 Agent 主机安装 Python 3；opencode 须为 1.x 或 2.x，其它版本会被
+  拒绝。
 - 本机项目主机需要 POSIX `sh`、base64 解码器和项目工具链。
 - 远端服务器 sshd 允许 reverse TCP forwarding。
 

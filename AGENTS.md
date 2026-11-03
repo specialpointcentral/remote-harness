@@ -14,7 +14,7 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/project-host-gateway.sh`: forced SSH command accepting only SFTP, health, exec, and the
   allowlisted `git`/`rg` tool verb.
 - `scripts/route-command.py`: Claude/Codex hook policy and cwd mapping.
-- `scripts/inject-rule.sh`: also generates the session opencode `tool.execute.before` plugin.
+- `scripts/inject-rule.sh`: also generates the session opencode plugin (1.x or 2.x format).
 - `scripts/run-on-project-host.sh`: validated local project command and tool dispatcher.
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
@@ -54,6 +54,10 @@ it provides files over SSHFS and executes project commands through a forced gate
   laptop's address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Linux sshfs mounts use
   `fsname=remote-harness` and keep their source in the mount record; `mounts` is owner-only. Shim
   stderr maps the project root back to the mount.
+- opencode 1.x and 2.x each get their own plugin and config keys; other versions are refused. 2.x
+  always starts with `--standalone`, for the launch and the readiness probe alike: without it the
+  client attaches to the user's shared background server, where Bash runs unrouted. Like a local
+  2.x, it refuses a routed command its scanner cannot analyze (here-documents, loops).
 
 ## Gateway Security
 
@@ -101,6 +105,8 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Calls outside the mount, or naming another repository/index, run the real tool unchanged.
 - Claude sessions default `CLAUDE_CODE_BASH_EDIT_DIFF` to `0` (a value exported by the remote login
   shell wins): its per-directory inotify watcher cannot see routed changes and stalls on SSHFS.
+- opencode sessions turn snapshots off unless the remote login shell exports
+  `RH_OPENCODE_SNAPSHOT=on`: each model step lists the whole work tree under a private `GIT_DIR`.
 - A routed call that cannot reach the project host fails non-zero; it never reports clean or
   no-match and never falls back to scanning SSHFS. Only an explicit "tool not installed" answer
   from a reachable project host switches that tool to the remote host for the rest of the session.

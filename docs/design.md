@@ -47,8 +47,13 @@ configuration error rather than a reusable credential.
 
 ## Command Policy
 
-`route-command.py` handles Claude/Codex. A generated opencode `tool.execute.before` plugin performs
-the equivalent Bash and cwd rewrite for opencode. `run-on-project-host.sh` validates the physical
+`route-command.py` handles Claude/Codex. A generated opencode plugin performs the equivalent Bash and
+cwd rewrite for opencode: `tool.execute.before` on 1.x, and on 2.x an `execute.before` hook for the
+shell tool that also takes its `bash` alias and stringified input, which opencode's own input repair
+hook normally resolves first. `inject-rule.sh` reads `opencode --version` and refuses other majors.
+2.x always starts with `--standalone`: a client without it attaches to the user's shared background
+server, whose configuration and plugins come from whichever opencode started it, so Bash would run
+there unrouted or through another session's runner. `run-on-project-host.sh` validates the physical
 local cwd, rejects direct Agent CLI launches, removes common AI credential variables, shadows the
 agent binaries in `PATH`, and executes with the environment of the project host's login shell. For
 bash and zsh that environment comes from a per-session snapshot instead of a new login shell per
@@ -104,10 +109,11 @@ approval.
 
 opencode also checks permissions on the rewritten text, after its plugins have run, so its plugin
 repeats the original after `exit` in the same way and sets the working directory to the original's
-own. opencode parses the whole text, so the user's bash rules and its external-directory check,
-which resolves relative paths from the working directory, judge the original. The rh-run and `exit`
-commands are checked as well, so an allowlist-style config whose catch-all rule asks or denies does
-so for every routed call.
+own. opencode parses the whole text (tree-sitter on 1.x, its own scanner on 2.x), so the user's bash
+rules and its external-directory check, which resolves relative paths from the working directory,
+judge the original. The rh-run and `exit` commands are checked as well, so an allowlist-style config
+whose catch-all rule asks or denies does so for every routed call. 2.x refuses a command its scanner
+cannot analyze (here-documents, compound commands, dynamic execution), routed or not.
 
 Privacy on the agent host: unless `/proc` is mounted with `hidepid`, every user there can read every
 process's arguments, the agent's own `bash -c '<command>'` included, as with any agent on a shared
@@ -169,6 +175,14 @@ ignored-directory lookup and snapshot use a private `GIT_DIR`, which keeps them 
 out over SSHFS, so ignored build caches are watched as well. Claude sessions therefore start with
 `CLAUDE_CODE_BASH_EDIT_DIFF=${CLAUDE_CODE_BASH_EDIT_DIFF:-0}`, expanded after the remote login shell's
 startup files; a value exported there turns the feature back on.
+
+opencode snapshots, which back `/undo` and revert, are the same kind of scan: every model step lists
+the work tree with `git diff-files` and `git ls-files --others` under a private `GIT_DIR`, which keeps
+them remote, so every tracked file costs SSHFS round trips. Unlike Claude's diff they do see routed
+changes, since they read the mounted files. Sessions turn them off (`snapshot: false` on 1.x,
+`snapshots: false` on 2.x) unless the remote login shell exports `RH_OPENCODE_SNAPSHOT=on`; a project
+opencode config still wins. opencode's formatters and language servers are not Bash calls: like the
+user's own `!` commands and terminals, they run on the remote host against the mount.
 
 ## Connections
 

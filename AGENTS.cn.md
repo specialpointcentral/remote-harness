@@ -16,7 +16,7 @@
 - `scripts/project-host-gateway.sh`：只接受 SFTP、health、exec，以及白名单 `git`/`rg` 工具动词的
   forced SSH command。
 - `scripts/route-command.py`：Claude/Codex hook 策略和 cwd 映射。
-- `scripts/inject-rule.sh`：同时生成会话级 opencode `tool.execute.before` plugin。
+- `scripts/inject-rule.sh`：同时生成会话级 opencode plugin（1.x 或 2.x 格式）。
 - `scripts/run-on-project-host.sh`：校验后的本机项目命令和工具 dispatcher。
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
@@ -49,6 +49,9 @@
 - Claude 会话禁止 Read/Edit 访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`。`rh-session` 清除
   `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Linux 上的 sshfs 挂载使用 `fsname=remote-harness`，
   挂载来源保存在挂载记录里；`mounts` 目录仅本人可访问。垫片的 stderr 把项目根路径映射回挂载点。
+- opencode 1.x 和 2.x 各用自己的插件和配置键，其它版本一律拒绝。2.x 的启动和就绪检查都必须加
+  `--standalone`：不加时客户端会连到用户共用的后台服务，Bash 在那里不经路由执行。2.x 和本机一样，会拒绝
+  它的解析器分析不了的路由命令（heredoc、循环等）。
 
 ## Gateway 安全
 
@@ -88,6 +91,8 @@
 - 挂载点之外、或指定了其它仓库/index 的调用，原样执行真实工具。
 - Claude 会话默认把 `CLAUDE_CODE_BASH_EDIT_DIFF` 设为 `0`（远端登录 shell 导出的值优先）：它按目录
   建立的 inotify 监听看不到路由命令造成的修改，还会在 SSHFS 上卡住。
+- opencode 会话默认关闭快照，除非远端登录 shell 导出 `RH_OPENCODE_SNAPSHOT=on`：每一步模型调用都会
+  用私有 `GIT_DIR` 列出整个工作区。
 - 无法连到项目主机的路由调用必须以非零退出；绝不报告 clean 或无匹配，也不回退为扫描 SSHFS。
   只有可达的项目主机明确答复"未安装该工具"时，本会话此后才改用远端的该工具。
 - 路由调用共享每会话并发上限，以及只通过命令行传入的短期 OpenSSH 复用 master；生成的

@@ -156,8 +156,8 @@ shell 代码仍是图灵完备的，SFTP 也不是项目 chroot。若要绝对�
 
 - remote-harness 和所选 Agent CLI 安装在远端服务器；
 - 本机可以 SSH 到远端服务器；
-- 远端服务器有 SSHFS；Claude/Codex 还需要 Python 3，opencode 需要当前
-  `tool.execute.before` plugin 接口；
+- 远端服务器有 SSHFS；Claude/Codex 还需要 Python 3，opencode 须为 1.x 或 2.x（其它版本会被
+  拒绝）；
 - 本机运行 SSH server，并有 POSIX `sh` 和 base64；
 - 远端服务器被信任，可访问所挂载的项目内容；
 - 本机不存在对本次生成会话 key 的无限制授权。

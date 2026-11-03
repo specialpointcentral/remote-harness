@@ -45,7 +45,9 @@
   拿不到 fusectl 的结论时，lazy 卸载后的 sshfs 会保留。仍在刷写数据的 sshfs 不会被打断（等待上限由
   `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc` 的系统上不会结束任何进程。
 - `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
-  opencode 还会返回启动前必须出现的 readiness marker 路径。
+  opencode 还会返回启动前必须出现的 readiness marker 路径。它读取 `opencode --version`，按 1.x 或
+  2.x 生成插件和配置，其它版本一律拒绝；2.x 的启动参数以 `--standalone` 开头，`RH_OPENCODE_MAJOR`
+  决定启动器的就绪检查命令（`debug config`，2.x 为 `debug agents --standalone`）。
   `RH_PROCESS_LIST_SHARED=1` 告诉启动器 Agent 主机上的其他用户能读取进程参数（`/proc` 没有 `hidepid`）。
   opencode 插件写与 hook 相同的可读格式，像 Codex 的 hook 一样在 `exit` 之后附上原命令，并为 opencode
   自己的检查把工作目录设为原命令自己的目录。
