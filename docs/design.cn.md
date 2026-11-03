@@ -58,9 +58,9 @@ runner 执行。`run-on-project-host.sh` 校验本机物理 cwd，拒绝直接�
 远端有 python3 时，`rh-run` 经过 `channel-guard.py` 执行：它在调用存续期间一直持有 SSH 通道的
 stdin，并请求 `remote-harness-exec ... watch`。项目主机随后让命令的 stdin 来自 `/dev/null`，把命令放进
 独立进程组（Linux 用 `setsid`，macOS 用 `perl` 的 `setpgrp`），并把通道 EOF 视为取消：Bash 调用被停止
-或超时、Agent 被杀、连接断开时，先向命令的进程组和进程树发送 TERM，五秒后发送 KILL。主动脱离的
-进程（`nohup ... &`、`setsid`、守护进程）不会被追踪。没有 python3，或旧客户端不带 `watch` 时，执行
-方式不变。`git`/`rg` 工具动词始终使用同样的看门狗。
+或超时、Agent 被杀、连接断开时，先向命令的进程组和进程树发送 TERM，五秒后（测试可用 `RH_KILL_GRACE`
+设为 1 到 60 秒）发送 KILL。主动脱离的进程（`nohup ... &`、`setsid`、守护进程）不会被追踪。没有
+python3，或旧客户端不带 `watch` 时，执行方式不变。`git`/`rg` 工具动词始终使用同样的看门狗。
 
 Claude 和 Codex 的 hook 以及 opencode 插件把路由调用改写成 `rh-run --cwd <目录> -- '<命令>'`，审批提示
 和自动审核都能读到原始命令。`channel-guard.py` 在进程内对可读请求做 base64 编码（明文值经环境变量

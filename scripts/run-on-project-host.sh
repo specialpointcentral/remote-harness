@@ -397,13 +397,15 @@ EOF
 }
 
 # Stop a command and everything it started: TERM to its process group and process tree, then KILL
-# whatever is still there after five seconds.
+# whatever is still there after five seconds (RH_KILL_GRACE, 1 to 60, lets tests wait less).
 terminate_tree() {  # $1=root pid
+  _tt_grace=${RH_KILL_GRACE:-5}
+  case "$_tt_grace" in [1-9]|[1-5][0-9]|60) ;; *) _tt_grace=5;; esac
   _tt_targets=$(process_tree "$1")
   _tt_live=$(live_tree_targets "$_tt_targets")
   signal_tree_targets TERM "$1" "$_tt_live"
   _tt_i=0
-  while [ "$_tt_i" -lt 5 ]; do
+  while [ "$_tt_i" -lt "$_tt_grace" ]; do
     _tt_live=$(live_tree_targets "$_tt_targets")
     [ -n "$_tt_live" ] || return 0
     sleep 1

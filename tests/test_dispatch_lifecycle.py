@@ -60,7 +60,8 @@ class DispatchLifecycleTests(unittest.TestCase):
         self.addCleanup(self.stop_remaining)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith('RH_') and key not in ('BASH_ENV', 'ENV')}
-        self.env.update(SHELL='/bin/sh', HOME=str(self.path))
+        # Workers that ignore TERM get KILL after one second instead of the default five.
+        self.env.update(SHELL='/bin/sh', HOME=str(self.path), RH_KILL_GRACE='1')
         self.worker = self.path / 'worker.py'
         self.worker.write_text('''import os, signal, sys, time
 from pathlib import Path

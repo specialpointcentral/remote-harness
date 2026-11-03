@@ -125,8 +125,10 @@ proc_start() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:
 
 # Shell-quote a value for SAFE interpolation into a remote command string: wrap in single quotes,
 # escaping any embedded single quote as '\''. Prevents paths with apostrophes (legal on macOS) from
-# breaking — or injecting into — the ssh command strings the setup scripts build.
-sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# breaking — or injecting into — the ssh command strings the setup scripts build. Pattern and
+# replacement come from variables, so every bash from 3.2 on (macOS) reads them the same way, and no
+# process starts: setup scripts quote dozens of values.
+sq() { local _sq_q="'" _sq_r="'\\''"; printf "'%s'" "${1//$_sq_q/$_sq_r}"; }
 
 # First value of KEY in KEY=VALUE lines on stdin (values may contain '=').
 kv_value() { sed -n "s/^$1=//p" | head -1; }

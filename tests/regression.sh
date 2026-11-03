@@ -586,9 +586,10 @@ assert_eq "rg missing on the project host falls back to the agent-host rg" \
 assert_eq "later rg calls keep the agent-host rg" "$(run_missing_rg -n hello 2>&1)" "local-rg -n hello"
 assert_eq "a missing project-host tool is detected once per session" "$(grep -c . "$missing_log")" "1"
 
-# Concurrency cap: with one slot, routed calls never overlap.
+# Concurrency cap: with one slot, routed calls never overlap. Uncapped, the three calls start within
+# tens of milliseconds of each other, well inside one call's 0.3 s.
 cap_runner="$router_tmp/cap-runner"
-printf '#!/bin/sh\nprintf "start\\n" >> %s\nsleep 1\nprintf "end\\n" >> %s\n' \
+printf '#!/bin/sh\nprintf "start\\n" >> %s\nsleep 0.3\nprintf "end\\n" >> %s\n' \
   "'$router_tmp/cap.log'" "'$router_tmp/cap.log'" > "$cap_runner"
 chmod +x "$cap_runner"
 for cap_i in 1 2 3; do
@@ -787,13 +788,11 @@ hb_inject off hb.1
 hb_inject on hb.2 > "$tmp/inject-hb2.out"
 assert_grep_e "$tmp/inject-hb2.out" "^RH_RESUME_AVAILABLE=heartbeat,[0-9]+$" "next launch of the mountpoint offers resume"
 hb_inject off hb.2
-hb_inject on hb.3 > "$tmp/inject-hb3.out"
-refute_grep "$tmp/inject-hb3.out" "RH_RESUME_AVAILABLE=heartbeat" "a resume marker is offered only once"
-hb_inject off hb.3
 # An agent that exits by itself (as most do on the SIGHUP of a dropped connection) leaves a resume
 # marker only when the project host is unreachable at that moment.
 hb_exit() {  # session-id: the stand-in agent exits on its own, then the watcher finishes
-  hb_sd=$(hb_inject on "$1" | sed -n 's/^RH_SESSION_DIR=//p')
+  hb_inject on "$1" > "$tmp/inject-$1.out"
+  hb_sd=$(sed -n 's/^RH_SESSION_DIR=//p' "$tmp/inject-$1.out")
   hb_watch
   kill "$hb_owner" 2>/dev/null || true
   wait_gone "$hb_watcher" || { kill "$hb_watcher"; fail "the watcher did not finish after the agent exited"; }
@@ -801,6 +800,7 @@ hb_exit() {  # session-id: the stand-in agent exits on its own, then the watcher
   hb_inject off "$1"
 }
 HB_OK=1 hb_exit hb.4
+refute_grep "$tmp/inject-hb.4.out" "RH_RESUME_AVAILABLE=heartbeat" "a resume marker is offered only once"
 [ -z "$(find "$rh_home/.sessions/.resume" -type f 2>/dev/null)" ] \
   || fail "an agent exit with a reachable project host left a resume marker"
 hb_exit hb.5
@@ -1976,6 +1976,12 @@ ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.a >/dev/null
 ir on claude "$tmp/ir-code" laptop "$ir_mp" 0 "$basic_ssh_cfg" rev.b > "$tmp/ir-b.out"
 assert_grep "$tmp/ir-b.out" "$ir_sd.rev.b/claude-settings.json" "inject-rule keys the session dir by session id"
 [ -x "$ir_sd.rev.a/bin/rh-run" ] || fail "inject-rule: a second launch deleted the first session runner"
+# With a session id and python3 the runner, launcher and shims use the session's warm pool.
+assert_grep "$ir_sd.rev.b/bin/rh-run" "--warm '$tmp/runtime/warm.rev.b'" "runner tries the session's warm pool"
+assert_grep "$ir_sd.rev.b/bin/rh-run" "remote-harness-exec " "runner hands the guard the request line"
+assert_grep "$ir_sd.rev.b/bin/rh-session" "warm_pool.py" "launcher starts the warm pool"
+assert_grep "$ir_sd.rev.b/bin/git" "--warm-socket '$tmp/runtime/warm.rev.b'" "git shim uses the warm pool"
+[ -f "$ir_sd.rev.b/impl/warm_pool.py" ] || fail "session implementation lacks warm_pool.py"
 ir off claude "$ir_mp" rev.a >/dev/null
 [ ! -d "$ir_sd.rev.a" ] && [ -x "$ir_sd.rev.b/bin/rh-run" ] || fail "inject-rule: off did not remove exactly its own session"
 ir off claude "$ir_mp" rev.b >/dev/null
@@ -2057,16 +2063,8 @@ PATH="$nopy_bin" "$wr_nopy_sd/bin/rh-run" --cwd . -- "printf 'it''s'"
 assert_grep "$tmp/nopy-ssh.args" " $(b64 .) $(b64 "printf 'it''s'")" "runner encodes the readable form without python3"
 refute_grep "$tmp/nopy-ssh.args" " watch" "runner asks for watch mode without python3"
 [ ! -e "$wr_nopy_sd/bin/git" ] || fail "git shim installed without python3"
-# With a session id and python3 the runner, launcher and shims use the session's warm pool.
+# Without a warm pool (RH_WARM_MAX=0) neither the runner nor the shims name one.
 mkdir -p "$tmp/wr-mount-warm"
-RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount-warm" 0 "$basic_ssh_cfg" rev.warm > /dev/null
-wr_warm_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-warm" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').rev.warm"
-assert_grep "$wr_warm_sd/bin/rh-run" "--warm '$tmp/runtime/warm.rev.warm'" "runner tries the session's warm pool"
-assert_grep "$wr_warm_sd/bin/rh-run" "remote-harness-exec " "runner hands the guard the request line"
-assert_grep "$wr_warm_sd/bin/rh-session" "warm_pool.py" "launcher starts the warm pool"
-assert_grep "$wr_warm_sd/bin/git" "--warm-socket '$tmp/runtime/warm.rev.warm'" "git shim uses the warm pool"
-[ -f "$wr_warm_sd/impl/warm_pool.py" ] || fail "session implementation lacks warm_pool.py"
-RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" off codex "$tmp/wr-mount-warm" rev.warm >/dev/null
 RH_WARM_MAX=0 RH_HOME="$wr_rh" HOME="$rp_home" "$ROOT/scripts/inject-rule.sh" on codex "$tmp/rp-code" laptop "$tmp/wr-mount-warm" 0 "$basic_ssh_cfg" rev.cold > /dev/null
 wr_cold_sd="$wr_rh/.sessions/$(printf '%s' "$tmp/wr-mount-warm" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_').rev.cold"
 refute_grep "$wr_cold_sd/bin/rh-run" "--warm" "RH_WARM_MAX=0 leaves the warm pool out of the runner"

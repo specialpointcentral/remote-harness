@@ -43,7 +43,7 @@
 # a session that is still running. Without session_id the key is the mountpoint alone (legacy).
 set -uo pipefail
 
-sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+sq() { local _sq_q="'" _sq_r="'\\''"; printf "'%s'" "${1//$_sq_q/$_sq_r}"; }  # as in _common.sh
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
 
 # After `on` has created the session dir, every failure removes it so a relaunch never finds a
@@ -652,10 +652,12 @@ case "${1:-}" in
     # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
     source_scripts="$SCRIPT_DIR"
     mkdir "$SD/impl" || abort_session
+    impl_sources=() impl_copies=()
     for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
-      cp "$source_scripts/$impl_file" "$SD/impl/$impl_file" || abort_session
-      chmod 500 "$SD/impl/$impl_file" || abort_session
+      impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
     done
+    # One cp and one chmod for all of them: each extra process costs more than the copy itself.
+    cp "${impl_sources[@]}" "$SD/impl/" && chmod 500 "${impl_copies[@]}" || abort_session
     SCRIPT_DIR="$SD/impl"
     if [ -n "$SESSION_LEASE" ]; then
       RH_REAPER_LIBRARY=1 . "$SCRIPT_DIR/session-reaper.sh" || abort_session

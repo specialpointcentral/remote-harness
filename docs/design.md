@@ -68,10 +68,10 @@ the SSH channel's stdin open for exactly as long as the call lives, and requests
 `remote-harness-exec ... watch`. The project host then gives the command stdin from `/dev/null`,
 starts it in its own process group (`setsid` on Linux, `perl` `setpgrp` on macOS), and treats EOF on
 the channel as cancellation: a stopped or timed-out Bash call, a killed agent, or a dropped connection
-sends TERM and, five seconds later, KILL to the command's process group and process tree. Processes
-that deliberately detach (`nohup ... &`, `setsid`, daemons) are not followed. Without python3, or
-with an older client that omits `watch`, execution is unchanged. The `git`/`rg` tool verb always uses
-the same watchdog.
+sends TERM and, five seconds later (`RH_KILL_GRACE`, 1 to 60, for tests), KILL to the command's
+process group and process tree. Processes that deliberately detach (`nohup ... &`, `setsid`,
+daemons) are not followed. Without python3, or with an older client that omits `watch`, execution is
+unchanged. The `git`/`rg` tool verb always uses the same watchdog.
 
 The Claude and Codex hooks and the opencode plugin rewrite a routed call to
 `rh-run --cwd <dir> -- '<command>'`, so approval prompts and automatic reviews read the original

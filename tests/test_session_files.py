@@ -194,6 +194,10 @@ pathlib.Path(str(key) + '.pub').write_text('public key')
                                  'fixture', str(self.project), 'normal', str(cfg), 'bad'],
                                 env=self.env, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
+        # Every launch also starts the session GC, detached; it may still hold its lock here.
+        lock, deadline = self.sessions / '.resources.lock', time.monotonic() + 10
+        while lock.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertEqual(list(self.sessions.iterdir()), [cfg.parent])
         self.assert_private(outside, 0o755)
 
@@ -323,6 +327,30 @@ sweep_local_resources
         self.assertFalse((self.sessions / 'rev.dead').exists())
         self.assertFalse((resume / 'old').exists())
         self.assertTrue((resume / 'fresh').exists())
+
+    def test_local_record_follows_every_change_of_a_reused_encoding(self):
+        # Each value's encoding is reused while it stays the same; every change must reach the record.
+        body = self.local_library() + r'''
+LOCAL_SESSION_DIR="$HOME/.remote-harness/.sessions/rev.changes"
+private_local_dirs "$HOME/.remote-harness/.sessions" "$LOCAL_SESSION_DIR"
+for field in $RESOURCE_FIELDS; do printf -v "$field" %s ""; done
+record="$LOCAL_SESSION_DIR/resources.env"
+show() {
+  local $RESOURCE_FIELDS
+  load_resource_record "$record"
+  [ "$LOCAL_SSHD_CFG" = "$expected" ] && same=yes || same=no
+  printf '%s|%s|%s|%s\n' "$TARGET" "$TUNNEL_PID" "$(resource_value "$record" TUNNEL_PID)" "$same"
+}
+expected=""
+TARGET=box TUNNEL_PID=100; write_local_resource_record; show
+TUNNEL_PID=200; write_local_resource_record; show
+expected=$'it\'s 50% "done"\nnext line'
+TUNNEL_PID="" LOCAL_SSHD_CFG=$expected; write_local_resource_record; show
+TUNNEL_PID=100; write_local_resource_record; show
+'''
+        self.assertEqual(self.run_shell(body).stdout.splitlines(),
+                         ['box|100|100|yes', 'box|200|200|yes', 'box|||yes', 'box|100|100|yes'])
+        self.assert_private(self.sessions / 'rev.changes' / 'resources.env', 0o600)
 
     def test_warm_broker_restricts_existing_files_and_refuses_symlink_targets(self):
         directory = self.home / 'warm'

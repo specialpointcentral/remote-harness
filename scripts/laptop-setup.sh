@@ -217,14 +217,56 @@ remote_config_usage() {
   return 2
 }
 
-resource_value() { # records are base64 values, never executable shell configuration
-  local _raw
-  _raw=$(sed -n "s/^$2=//p" "$1" | head -1)
-  if [ "$OS" = Darwin ]; then printf '%s' "$_raw" | base64 -D
-  else printf '%s' "$_raw" | base64 --decode; fi
+resource_decode() {  # base64 text
+  [ -n "$1" ] || return 0
+  if [ "$OS" = Darwin ]; then printf '%s' "$1" | base64 -D
+  else printf '%s' "$1" | base64 --decode; fi
+}
+
+# Records are base64 values, never executable shell configuration. They are read with the shell's
+# own `read`, so only a value's decoding starts a process.
+resource_value() {  # file name -> the value of the first NAME= line
+  local _line
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in "$2="*) resource_decode "${_line#"$2="}"; return;; esac
+  done 2>/dev/null < "$1"
+  return 0
 }
 
 RESOURCE_FIELDS="TARGET PORT BOX_SSH_CONFIG LOCAL_SSH_CONFIG TUNNEL_PID TUNNEL_START AUTHKEY_TYPE AUTHKEY_BLOB AUTHKEY_TAG AUTHKEY_BEGIN AUTHKEY_END AUTHKEY_REF_DIR AUTHKEY_TOKEN AUTHKEY_MANAGED GATEWAY_SESSION_DIR LOCAL_SSHD_PID LOCAL_SSHD_START LOCAL_SSHD_CFG"
+
+load_resource_record() {  # file: sets every RESOURCE_FIELDS name, local to the caller, in one read
+  local _line _name _raw _seen=" "
+  for _name in $RESOURCE_FIELDS; do printf -v "$_name" '%s' ""; done
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in *=*) ;; *) continue;; esac
+    _name=${_line%%=*} _raw=${_line#*=}
+    case "$_name" in ''|*[!A-Z_]*) continue;; esac
+    case " $RESOURCE_FIELDS " in *" $_name "*) ;; *) continue;; esac
+    case "$_seen" in *" $_name "*) continue;; esac  # the first line for a name counts
+    _seen="$_seen$_name "
+    [ -z "$_raw" ] || printf -v "$_name" '%s' "$(resource_decode "$_raw")"
+  done 2>/dev/null < "$1"
+  return 0
+}
+
+# The record is rewritten after each setup step while most fields keep their value, so each value is
+# encoded once and its encoding reused until it changes (RR_PLAIN_<name>, RR_ENC_<name>).
+for _rr_name in $RESOURCE_FIELDS; do printf -v "RR_PLAIN_$_rr_name" '%s' ""; printf -v "RR_ENC_$_rr_name" '%s' ""; done
+unset _rr_name
+RR_OWNER_START=""
+resource_record_line() {  # name: appends NAME=base64(value) to the caller's _record
+  local _value="${!1}" _plain="RR_PLAIN_$1" _encoded="RR_ENC_$1"
+  if [ -z "$_value" ]; then
+    _record="$_record$1="$'\n'
+    return 0
+  fi
+  if [ "${!_plain}" != "$_value" ]; then
+    printf -v "$_encoded" '%s' "$(printf '%s' "$_value" | base64 | tr -d '\n')"
+    printf -v "$_plain" '%s' "$_value"
+  fi
+  _record="$_record$1=${!_encoded}"$'\n'
+}
 
 private_local_dirs() (
   umask 077
@@ -233,21 +275,20 @@ private_local_dirs() (
   done
 )
 
-write_local_resource_record() (
-  umask 077
+write_local_resource_record() {
   [ -n "$LOCAL_SESSION_DIR" ] || return 0
   [ ! -L "$LOCAL_SESSION_DIR" ] && [ ! -L "$LOCAL_SESSION_DIR/resources.env.tmp" ] \
     && [ ! -L "$LOCAL_SESSION_DIR/resources.env" ] || return 1
-  local _name _value
-  {
-    for _name in $RESOURCE_FIELDS; do
-      _value="${!_name}"
-      printf '%s=%s\n' "$_name" "$(printf '%s' "$_value" | base64 | tr -d '\n')"
-    done
-    printf 'OWNER_PID=%s\nOWNER_START=%s\n' "$$" "$(proc_start "$$" | base64 | tr -d '\n')"
-  } > "$LOCAL_SESSION_DIR/resources.env.tmp" && chmod 600 "$LOCAL_SESSION_DIR/resources.env.tmp" \
+  local _name _record=""
+  for _name in $RESOURCE_FIELDS; do resource_record_line "$_name"; done
+  # $$ is this script's pid in its subshells too, so its start time never changes.
+  [ -n "$RR_OWNER_START" ] || RR_OWNER_START=$(proc_start "$$" | base64 | tr -d '\n')
+  ( umask 077
+    printf '%sOWNER_PID=%s\nOWNER_START=%s\n' "$_record" "$$" "$RR_OWNER_START" \
+      > "$LOCAL_SESSION_DIR/resources.env.tmp" ) \
+    && chmod 600 "$LOCAL_SESSION_DIR/resources.env.tmp" \
     && mv "$LOCAL_SESSION_DIR/resources.env.tmp" "$LOCAL_SESSION_DIR/resources.env"
-)
+}
 
 # Stop a recorded process only while it is still the same one (start time and command line match);
 # one that is gone, or whose pid now has another start time, counts as stopped.
@@ -262,9 +303,7 @@ release_local_resources() { # only release records whose exact remote config is 
   # shellcheck disable=SC2086 # declares each record field as a local name.
   local $RESOURCE_FIELDS
   [ -f "$_file" ] && [ ! -L "$_dir" ] || return 1
-  for _name in $RESOURCE_FIELDS; do
-    printf -v "$_name" '%s' "$(resource_value "$_file" "$_name")"
-  done
+  load_resource_record "$_file"
   [ -n "$TARGET" ] && [ -n "$BOX_SSH_CONFIG" ] || return 1
   remote_config_usage
   _usage=$?
@@ -1104,12 +1143,16 @@ while :; do
   TUNNEL_START=$(proc_start "$TUNNEL_PID")
   write_local_resource_record
 
-  # Poll until the remote port is listening (up to 20s)
+  # Poll until the remote port is listening, for up to 20 s. A tunnel is usually up within a second,
+  # and each check is a short round trip over the setup connection; the deadline counts real time,
+  # so checks that open their own connection do not stretch the wait.
   READY=0
-  for _ in $(seq 1 10); do
-    sleep 2
+  _ready_deadline=$((SECONDS + 20))
+  while :; do
+    sleep 0.5
     if remote_port_listening "$PORT"; then READY=1; break; fi
     kill -0 "$TUNNEL_PID" 2>/dev/null || break
+    [ "$SECONDS" -lt "$_ready_deadline" ] || break
   done
   if [ "$READY" = 1 ]; then
     ok "Tunnel active — remote port $PORT is live"
