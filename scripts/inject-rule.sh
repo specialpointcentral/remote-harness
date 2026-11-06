@@ -13,8 +13,9 @@
 #   codex    → -c developer_instructions=<rule>  (session-only CLI config; avoids changing
 #              CODEX_HOME, because modern Codex can store ChatGPT credentials in an encrypted
 #              keyring keyed by the real home and would prompt for login under a synthetic home).
-#              Also passes `-s workspace-write -c sandbox_workspace_write.network_access=true` and
-#              a writable root for the session-owned ~/.remote-harness/.sessions dirs because codex's
+#              Selects workspace-write via `--approve-for-me` (auto) or `-s workspace-write` (normal),
+#              with `-c sandbox_workspace_write.network_access=true` and a writable root for the
+#              session-owned ~/.remote-harness/.sessions runtime dirs because codex's
 #              default sandbox blocks network and otherwise prevents ssh from writing its temp
 #              known_hosts there. It never makes ~/.ssh writable.
 #              The project's own AGENTS.md is still read additively; the mounted repo is never touched.
@@ -848,24 +849,28 @@ case "${1:-}" in
         # initialization could otherwise move a bundled rg or system git ahead of the shims.
         tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
         flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
-        # codex's default sandbox gates network, which blocks the session runner's ssh to the project
-        # host. The `[sandbox_workspace_write]` sub-table only merges when workspace-write is
-        # EXPLICITLY selected, so `-s workspace-write` is required — `network_access` alone at the
-        # implicit default is IGNORED. It also needs write access to the session-owned directories
-        # where the wrapper/config put temporary known_hosts; never ~/.ssh. Under --yolo,
-        # --dangerously-bypass-approvals-and-sandbox already drops the sandbox, so DON'T add -s there.
-        if [ "$yolo" != 1 ]; then
-          roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
-            || abort_session
-          flags_out="$flags_out -s workspace-write -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
-        fi
         if [ "$approval" = auto ]; then
-          # Automatic review keeps the workspace-write sandbox selected above.
+          # This preset selects workspace-write and on-request approvals with automatic review.
+          # Codex rejects combining it with --sandbox or --ask-for-approval.
           if grep -q -- '--approve-for-me' <<<"$(codex --help 2>/dev/null)"; then
             flags_out="$flags_out --approve-for-me"
           else
             approval=normal
           fi
+        fi
+        if [ "$approval" = normal ]; then
+          # An explicit normal choice (or unsupported-auto fallback) must ask the user even if their
+          # personal config selects never or an automatic reviewer.
+          flags_out="$flags_out -s workspace-write -a on-request -c $(sq 'approvals_reviewer="user"')"
+        fi
+        # Both sandboxed modes need network for the runner's SSH and write access to temporary SSH
+        # state, never ~/.ssh or the session's hooks. The preset above explicitly selects
+        # workspace-write too, so these settings apply to auto without a conflicting -s flag.
+        # YOLO's --dangerously-bypass-approvals-and-sandbox is supplied by laptop-setup.sh.
+        if [ "$yolo" != 1 ]; then
+          roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
+            || abort_session
+          flags_out="$flags_out -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
         fi
         ;;
     esac

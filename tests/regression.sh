@@ -827,7 +827,9 @@ assert_grep "$tmp/approval-ap.c1.out" "--permission-mode auto" "auto approval st
 assert_grep "$tmp/approval-ap.c1.out" "RH_APPROVAL=auto" "inject reports claude auto approval"
 ap_inject codex auto ap.x1
 assert_grep "$tmp/approval-ap.x1.out" "--approve-for-me" "auto approval routes codex approvals to automatic review"
-assert_grep "$tmp/approval-ap.x1.out" "-s workspace-write" "codex automatic review keeps the workspace-write sandbox"
+assert_grep "$tmp/approval-ap.x1.out" "RH_APPROVAL=auto" "supported codex auto approval stays auto"
+ap_inject codex normal ap.x4
+assert_grep "$tmp/approval-ap.x4.out" "RH_APPROVAL=normal" "explicit codex normal approval stays normal"
 ap_inject codex yolo ap.x2
 assert_grep "$tmp/approval-ap.x2.out" "RH_APPROVAL=yolo" "inject accepts the yolo approval name"
 refute_grep "$tmp/approval-ap.x2.out" "--approve-for-me" "yolo codex also requested automatic review"
@@ -838,6 +840,35 @@ assert_grep "$tmp/approval-ap.c2.out" "RH_APPROVAL=normal" "a claude without aut
 refute_grep "$tmp/approval-ap.c2.out" "--permission-mode" "a claude without auto mode got --permission-mode"
 ap_inject codex auto ap.x3
 refute_grep "$tmp/approval-ap.x3.out" "--approve-for-me" "a codex without automatic review got --approve-for-me"
+assert_grep "$tmp/approval-ap.x3.out" "RH_APPROVAL=normal" "a codex without auto review falls back to normal"
+# Validate the actual argument/config combinations, including the normal fallback. Auto is a
+# workspace-write preset: adding -s or -a makes the real CLI reject it before it can start.
+python3 - "$tmp" "$(dirname "$basic_ssh_cfg")/runtime" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+for sid, mode in [('ap.x1', 'auto'), ('ap.x4', 'normal'), ('ap.x2', 'yolo'), ('ap.x3', 'normal')]:
+    output = dict(line.split('=', 1) for line in
+                  (Path(sys.argv[1]) / f'approval-{sid}.out').read_text().splitlines())
+    args = shlex.split(output['RH_LAUNCH_FLAGS'])
+    config = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '-c')
+    assert output['RH_APPROVAL'] == mode, (sid, output['RH_APPROVAL'])
+    assert ('--approve-for-me' in args) == (mode == 'auto'), (sid, args)
+    if mode == 'normal':
+        assert args[args.index('-s') + 1] == 'workspace-write', (sid, args)
+        assert args[args.index('-a') + 1] == 'on-request', (sid, args)
+        assert config['approvals_reviewer'] == '"user"', (sid, config)
+    else:
+        assert not {'-s', '--sandbox', '-a', '--ask-for-approval'} & set(args), (sid, args)
+        assert 'approvals_reviewer' not in config, (sid, config)
+    if mode != 'yolo':
+        assert config['sandbox_workspace_write.network_access'] == 'true', (sid, config)
+        assert json.loads(config['sandbox_workspace_write.writable_roots']) == [sys.argv[2]], (sid, config)
+    else:
+        assert not any(key.startswith('sandbox_workspace_write.') for key in config), (sid, config)
+PY
 printf '#!/bin/sh\necho 1.19.5\n' > "$ap_bin/opencode"
 chmod +x "$ap_bin/opencode"
 ap_inject opencode auto ap.o1
@@ -1625,8 +1656,8 @@ launch_dir="$tmp/launch-project"
 mkdir -p "$launch_dir/.git/refs/heads"
 printf 'ref: refs/heads/main\n' > "$launch_dir/.git/HEAD"
 printf '[branch "main"]\n\tremote = origin\n\tmerge = refs/heads/main\n' > "$launch_dir/.git/config"
-project_launch() {  # output file; the caller's environment is passed through
-  LAUNCH_DIR="$launch_dir" reverse_session "$proj_home" 32023 "$valid_project" > "$1"
+project_launch() {  # output file, extra setup arguments; the caller's environment is passed through
+  LAUNCH_DIR="$launch_dir" reverse_session "$proj_home" 32023 "$valid_project" "${@:2}" > "$1"
 }
 SSH_LOG="$ssh_log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" MOUNT_FOLLOW_SYMLINKS=1 project_launch "$tmp/project-valid.out"
 assert_grep "$ssh_log" "env RH_SSHFS_FOLLOW_SYMLINKS='1'" "launcher mounts with symlinks followed by default"
@@ -1659,6 +1690,14 @@ assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops t
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
 assert_grep_e "$ssh_log" "inject-rule\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*auto[^ ]* " "setup passes the default auto approval to the injector"
 assert_grep "$tmp/project-valid.out" "Approvals: codex automatic review" "setup reports the auto approval mode"
+SSH_LOG="$tmp/approval-normal.ssh.log" project_launch "$tmp/approval-normal-launch.out" --approval normal
+assert_grep_e "$tmp/approval-normal.ssh.log" "inject-rule\\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*normal[^ ]* " \
+  "setup passes an explicit normal approval to the injector"
+refute_grep "$launch_dir.out" "--dangerously-bypass-approvals-and-sandbox" "normal launch must not bypass approvals"
+SSH_LOG="$tmp/approval-yolo.ssh.log" project_launch "$tmp/approval-yolo-launch.out" --approval yolo
+assert_grep_e "$tmp/approval-yolo.ssh.log" "inject-rule\\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*yolo[^ ]* " \
+  "setup passes an explicit yolo approval to the injector"
+assert_grep "$launch_dir.out" "-lic codex --dangerously-bypass-approvals-and-sandbox" "yolo launch retains its bypass flag"
 # An interactive ssh that lost its connection (exit 255) makes the next launch of the same remote,
 # mountpoint and agent offer to continue, once.
 refute_grep "$tmp/project-valid.out" "ended on a lost connection" "a first launch offered resume"

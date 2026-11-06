@@ -25,6 +25,11 @@ setup 脚本使用 `~/.remote-harness` 下的会话级 SSH config 和 wrapper。
 `--approve-for-me` 并保留 workspace-write 沙箱；该 Codex 不支持时退回普通审批）；需要逐项确认时传
 `--approval normal`。
 
+`--approve-for-me` 自带 workspace-write，并与 `--sandbox`、`--ask-for-approval` 互斥，注入器不会
+将它们组合使用。normal 模式显式指定 `-s workspace-write -a on-request -c 'approvals_reviewer="user"'`，
+防止个人默认配置悄悄启用自动审查或关闭审批。两种模式都保留会话所需的 SSH 网络和运行时目录访问权限。
+YOLO 使用 `--dangerously-bypass-approvals-and-sandbox`，不附加上述沙箱或审批参数。
+
 会话把 `git`/`rg` 垫片目录放在 Agent PATH 最前面，并通过 `shell_environment_policy.set.PATH`
 固定 Codex shell 子进程的 PATH。这些子进程禁用 login shell 和 shell profile 加载，避免垫片
 被重新排序。项目命令仍通过 gateway 使用本机项目主机的 shell。普通和 YOLO 会话均使用这些设置。

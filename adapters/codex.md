@@ -28,6 +28,13 @@ If the user asks for yolo / bypass approvals, append `--yolo`. Without it the wi
 workspace-write sandbox, or normal approvals when this Codex lacks it); pass `--approval normal`
 for per-action prompts.
 
+`--approve-for-me` selects workspace-write itself and conflicts with `--sandbox` and
+`--ask-for-approval`; the injector never combines them. Normal mode explicitly selects
+`-s workspace-write -a on-request -c 'approvals_reviewer="user"'` so personal defaults cannot
+silently enable automatic review or disable approvals. Both modes retain the session's SSH network
+and runtime-directory access. YOLO uses `--dangerously-bypass-approvals-and-sandbox` without those
+sandbox or approval flags.
+
 The session prepends its `git`/`rg` shims to the agent PATH and pins that PATH for Codex shell
 subprocesses with `shell_environment_policy.set.PATH`. Login shells and shell-profile loading are
 disabled for those subprocesses so they cannot reorder the shims. Project commands still use the
