@@ -721,6 +721,11 @@ mkdir -p "$tmp/code" "$tmp/mount" "$tmp/home with 'quote/.codex" "$tmp/rh with '
 printf 'personal guidance\n' > "$tmp/home with 'quote/.codex/AGENTS.md"
 rh_home="$tmp/rh with 'quote"
 home_dir="$tmp/home with 'quote"
+# Session setup must not depend on a real Claude installation in CI.
+mkdir -p "$tmp/agent-version-bin"
+printf '#!/bin/sh\necho "2.1.318 (Claude Code)"\n' > "$tmp/agent-version-bin/claude"
+chmod +x "$tmp/agent-version-bin/claude"
+export PATH="$tmp/agent-version-bin:$PATH"
 session_key="$(printf '%s' "$tmp/mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 session_dir="$rh_home/.sessions/$session_key"
 basic_ssh_cfg="$tmp/basic-ssh-config"
@@ -819,7 +824,7 @@ ap_inject() {  # agent approval session-id; output in $tmp/approval-<session-id>
 # The supported mode comes first, then more help than any pipe buffer holds: a probe whose grep -q
 # exits early under pipefail would see the CLI die of SIGPIPE and fall back to normal approvals.
 ap_more="exec awk 'BEGIN { for (i = 0; i < 8000; i++) print \"      --other-option-\" i }'"
-printf '#!/bin/sh\necho "  --permission-mode <mode>  (choices: \\"auto\\", \\"manual\\")"\n%s\n' "$ap_more" > "$ap_bin/claude"
+printf '#!/bin/sh\nif [ "$1" = -v ]; then echo "2.1.318 (Claude Code)"; exit; fi\necho "  --permission-mode <mode>  (choices: \\"auto\\", \\"manual\\")"\n%s\n' "$ap_more" > "$ap_bin/claude"
 printf '#!/bin/sh\necho "      --approve-for-me"\n%s\n' "$ap_more" > "$ap_bin/codex"
 chmod +x "$ap_bin/claude" "$ap_bin/codex"
 ap_inject claude auto ap.c1
@@ -833,7 +838,7 @@ assert_grep "$tmp/approval-ap.x4.out" "RH_APPROVAL=normal" "explicit codex norma
 ap_inject codex yolo ap.x2
 assert_grep "$tmp/approval-ap.x2.out" "RH_APPROVAL=yolo" "inject accepts the yolo approval name"
 refute_grep "$tmp/approval-ap.x2.out" "--approve-for-me" "yolo codex also requested automatic review"
-printf '#!/bin/sh\necho usage\n' > "$ap_bin/claude"
+printf '#!/bin/sh\nif [ "$1" = -v ]; then echo "2.1.295 (Claude Code)"; else echo usage; fi\n' > "$ap_bin/claude"
 cp "$ap_bin/claude" "$ap_bin/codex"
 ap_inject claude auto ap.c2
 assert_grep "$tmp/approval-ap.c2.out" "RH_APPROVAL=normal" "a claude without auto mode falls back to normal approvals"
@@ -954,17 +959,18 @@ cp "$codex_tool_bin/ssh" "$claude_tool_bin/ssh"
 for claude_variant in native verbose plain; do
   rm -f "$claude_tool_bin/claude"
   if [ "$claude_variant" = plain ]; then
-    printf '#!/bin/sh\nprintf "2.0.0 (Claude Code)\\n"\n' > "$claude_tool_bin/claude"
+    printf '#!/bin/sh\nprintf "2.1.295 (Claude Code)\\n"\n' > "$claude_tool_bin/claude"
     chmod +x "$claude_tool_bin/claude"
   elif [ "$claude_variant" = verbose ]; then
     # More output than a pipe buffer holds after the version line still identifies ripgrep.
-    printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\nexec awk %s\n' \
+    printf '#!/bin/sh\nif [ "$1" = -v ]; then echo "2.1.318 (Claude Code)"; exit; fi\nprintf "ripgrep fixture\\n"\nexec awk %s\n' \
       "'BEGIN { for (i = 0; i < 8000; i++) print \"feature-\" i }'" > "$claude_tool_bin/claude"
     chmod +x "$claude_tool_bin/claude"
   elif [ -n "$rg_real" ]; then
-    ln -s "$rg_real" "$claude_tool_bin/claude"
+    printf '#!/bin/sh\nif [ "$1" = -v ]; then echo "2.1.318 (Claude Code)"; exit; fi\nexec %s "$@"\n' "$(sq "$rg_real")" > "$claude_tool_bin/claude"
+    chmod +x "$claude_tool_bin/claude"
   else
-    printf '#!/bin/sh\nprintf "ripgrep fixture\\n"\n' > "$claude_tool_bin/claude"
+    printf '#!/bin/sh\nif [ "$1" = -v ]; then echo "2.1.318 (Claude Code)"; else printf "ripgrep fixture\\n"; fi\n' > "$claude_tool_bin/claude"
     chmod +x "$claude_tool_bin/claude"
   fi
   PATH="$claude_tool_bin" RH_HOME="$rh_home" HOME="$home_dir" \
@@ -1024,6 +1030,8 @@ hook = settings["hooks"]["PreToolUse"][0]
 assert hook["matcher"] == "Bash|Agent"
 assert "route-command.py" in hook["hooks"][0]["command"]
 assert hook["hooks"][0]["command"].endswith(" --agent claude")
+assert hook["hooks"][0]["onFailure"] == "block"
+assert hook["hooks"][0]["timeout"] > 10  # the shell policy subprocess has a 10-second limit
 # Session files (gateway key, SSH config, runner, private logs) stay out of Claude's file tools.
 assert settings["permissions"]["deny"] == ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
                                            f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)"], settings
@@ -2119,6 +2127,7 @@ python3 "$ROOT/tests/test_session_files.py" -v
 python3 "$ROOT/tests/test_diagnostics.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_permission_rules.py" -v
+python3 "$ROOT/tests/test_claude_hooks.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 

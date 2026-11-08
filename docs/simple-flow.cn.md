@@ -117,8 +117,9 @@ chroot 到选定项目。若需要绝对的“本机不能运行 Agent”以及�
 - 本机可 SSH 登录远端服务器；远端已经安装 remote-harness 和选定 Agent CLI。
 - 本机运行 SSH server。
 - 远端服务器安装 SSHFS 和 FUSE。
-- Claude/Codex 严格路由要求远端 Agent 主机安装 Python 3；opencode 须为 1.x 或 2.x，其它版本会被
-  拒绝。
+- Claude/Codex 严格路由要求远端 Agent 主机安装 Python 3；Claude 须为 2.1.295+，旧版或无法识别的
+  版本会在 Agent 启动前被拒绝，因为无法保证路由 hook 失败时阻止命令执行。
+  opencode 须为 1.x 或 2.x，其它版本会被拒绝。
 - 本机项目主机需要 POSIX `sh`、base64 解码器和项目工具链。
 - 远端服务器 sshd 允许 reverse TCP forwarding。
 

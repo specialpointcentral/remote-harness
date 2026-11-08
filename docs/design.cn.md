@@ -69,6 +69,14 @@ Claude 和 Codex 的 hook 以及 opencode 插件把路由调用改写成 `rh-run
 Claude 的 hook 不返回审批决定：hook 返回 `allow` 会跳过 Claude 的审批提示和 auto 模式的自动审核；
 不返回决定时，Claude 按会话的审批模式判断改写后的调用。
 
+Claude 要求 2.1.295 或更新版本。路由 `PreToolUse` hook 设置 `onFailure: "block"`：hook 无法启动、
+超时、崩溃或返回无效 JSON 时，Claude 会阻止调用，避免 Bash 在 Agent 主机上执行未经改写的原命令。
+默认的 hook 失败行为会在没有路由改写的情况下继续普通审批流程；Python 的异常捕获无法覆盖被 Claude
+终止的 hook。Claude/Codex 路由 hook 的外层预算为 15 秒，大于内部 shell 策略检查的 10 秒限制；
+SSHFS 路径和 settings 操作也使用这份预算。增大预算用于减少不必要的取消，Claude 的阻断保证来自
+`onFailure`。成功改写仍交给 auto 模式或普通审批判断。会话实现和配置是冻结的：更新 harness 后需要
+重新创建 harness 会话（可以恢复 Claude 对话）；已有会话不会自动获得此修复。
+
 Claude 自己的权限规则只能看到 rh-run 这段文本，所以 hook 用原始命令去对照用户的 `Bash(...)` 规则
 （managed、用户和项目 settings）。deny 规则只要命中其中任意一条简单命令就拒绝——简单命令由共享词法器拆出，
 包括命令替换，并跳过 `sudo`、`env` 等包装；ask 规则命中则询问。allow 规则只在 default、acceptEdits、

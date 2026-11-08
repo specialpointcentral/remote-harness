@@ -279,7 +279,9 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
     `brew install macos-fuse-t/cask/fuse-t && brew install macos-fuse-t/cask/sshfs-fuse-t`。
     **不要用 macFUSE**（它要求降低安全策略）。FUSE-T 保留 sshfs 的同步写，编辑会先落到代码所在机器
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
-- Claude/Codex 严格路由要求远端 Agent 主机有 `python3`；opencode 须为 1.x 或 2.x（按
+- Claude/Codex 严格路由要求远端 Agent 主机有 `python3`。Claude Code 须为 **2.1.295 或更新版本**，
+  以支持路由 hook 失败时阻止命令执行；更新 harness 后需重新创建会话，可恢复原 Claude 对话。
+  opencode 须为 1.x 或 2.x（按
   `opencode --version` 判断，其它版本拒绝启动）。项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
 - 多用户共享远程开发服务器建议按
   [`docs/ssh-sshfs-long-lived-connections.cn.md`](docs/ssh-sshfs-long-lived-connections.cn.md)

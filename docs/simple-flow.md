@@ -144,7 +144,8 @@ has no AI credentials.
 - The local machine runs an SSH server.
 - The remote server has SSHFS and FUSE.
 - Strict Claude/Codex routing requires Python 3 on the remote Agent host. opencode must be 1.x or
-  2.x; other versions are refused.
+  2.x; other versions are refused. Claude requires 2.1.295+; older or unrecognized versions are
+  refused before agent launch because they cannot guarantee blocking when the routing hook fails.
 - The local project host needs POSIX `sh`, a base64 decoder, and its project toolchain.
 - The remote server's sshd permits reverse TCP forwarding.
 

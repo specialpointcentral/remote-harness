@@ -69,6 +69,17 @@ valid_session_id() {
   esac
 }
 
+# Older Claude versions ignore onFailure, allowing an unrewritten Bash call after a hook timeout.
+# Refuse an unknown version too: routing is a requirement, not an optional customization.
+claude_supports_hook_failure() {
+  local version
+  version=$(claude -v 2>/dev/null) || return 1
+  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)($|[[:space:]]) ]] || return 1
+  (( 10#${BASH_REMATCH[1]} > 2 ||
+     (10#${BASH_REMATCH[1]} == 2 && (10#${BASH_REMATCH[2]} > 1 ||
+      (10#${BASH_REMATCH[2]} == 1 && 10#${BASH_REMATCH[3]} >= 295))) ))
+}
+
 # Added to every user turn, so it stays short; the rule carries the details.
 REPLY_LANGUAGE_NOTE="remote-harness: reply in the language of the user's latest message, not of tool output."
 
@@ -562,7 +573,8 @@ print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harnes
           {
             "type": "command",
             "command": $_wcs_command,
-            "timeout": 5
+            "timeout": 15,
+            "onFailure": "block"
           }
         ]
       }
@@ -624,6 +636,11 @@ case "${1:-}" in
     transport_settings_load || { echo 'RH_STATUS=ERROR'; exit 2; }
     agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; approval="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
     case "$agent" in claude|codex|opencode) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
+    if [ "$agent" = claude ] && ! claude_supports_hook_failure; then
+      printf 'remote-harness: Claude Code 2.1.295 or newer is required to block commands when the routing hook fails; upgrade Claude and create a new harness session.\n' >&2
+      echo 'RH_STATUS=ERROR'
+      exit 2
+    fi
     case "$approval" in 1|yolo) yolo=1; approval=yolo;; auto) yolo=0;; *) yolo=0; approval=normal;; esac
     [ -n "$lp" ] && [ -n "$ba" ] || { echo "RH_STATUS=ERROR"; exit 2; }
     [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
@@ -842,7 +859,7 @@ case "${1:-}" in
         ;;
       codex)
         dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
-        hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=5,statusMessage=\"Routing command to project host\"}]}]"
+        hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=15,statusMessage=\"Routing command to project host\"}]}]"
         prompt_cfg="hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"$(toml_escape_value "$reply_hook")\",timeout=5}]}]"
         flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") -c $(sq "$prompt_cfg") --dangerously-bypass-hook-trust"
         # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile

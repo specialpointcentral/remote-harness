@@ -70,6 +70,10 @@
   hook for opencode that adds it to the latest user message in memory only. The rule alone sits at
   the start of the context, so long English tool output used to pull replies into English.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
+  Routing hooks have a 15-second budget around the 10-second command-policy check. Claude sessions
+  require 2.1.295+ and set `onFailure: "block"` so an unavailable, timed-out or invalid hook cannot
+  leave an unrewritten command running on the agent host. Create a new harness session after an
+  update; existing sessions keep their implementation and settings snapshot.
   With `--agent claude` it rewrites to the readable `rh-run --cwd <dir> -- <command>` and returns no
   permission decision, so Claude's own approval mode judges the call; Codex gets the same readable
   form with `allow`, the only decision Codex takes with `updatedInput`, which keeps its approval.

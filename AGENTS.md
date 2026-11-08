@@ -40,6 +40,9 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
 - The main agent starts only through `ssh -tt <remote> ... <claude|codex|opencode>`.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
+- Claude requires 2.1.295+ and its routing hook must set `onFailure: "block"`; a cancelled or broken
+  hook must never let the original Bash command run on the agent host. Routing hook budgets exceed
+  the inner command-policy timeout. New settings require a new harness session.
 - The Claude hook never returns a permission decision for a routed call: `allow` skips Claude's
   prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so
   the user's approval mode judges the original command. The Codex hook and the opencode plugin write
@@ -151,3 +154,9 @@ CI does: the real local-SFTP mount tests then fail instead of skipping when they
 
 The full remote-server-to-local-project SSHFS flow remains a manual integration test. Never commit
 or push unless the user asks; push only the authorized fork.
+
+On the agent host with Claude installed, also run
+`RH_TEST_CLAUDE_CLI=/absolute/path/to/claude python3 tests/test_claude_hooks.py -v`.
+It uses a temporary HOME, dummy API key and loopback model fixture to test real CLI hook cancellation,
+invalid output and startup failure. The unprotected control must reproduce execution on the agent
+host; protected failures must leave both execution markers absent. No real model is called.

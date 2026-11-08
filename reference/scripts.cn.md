@@ -65,6 +65,9 @@
   dontAsk 模式下对单条普通命令生效。解析后的规则按每个源文件的标识缓存在会话目录（`claude-rules.json`）。
   对 Codex，它在末尾追加 `; exit`，再另起一行附上原命令；shell 永远执行不到这一行，Codex 自己的执行策略和
   对带 `-f` 的 `rm` 的检查则按它判断。
+  路由 hook 的预算为 15 秒，内部命令策略检查限时 10 秒。Claude 会话要求 2.1.295+，并设置
+  `onFailure: "block"`，防止 hook 不可用、超时或输出无效时在 Agent 主机执行未经改写的原命令。
+  更新后需重新创建 harness 会话；已有会话保留原实现和配置快照。
 - `diagnostics.py`：Agent 主机上的路由诊断 helper。OpenSSH 自身的错误写入 SSH config 旁
   `runtime/diagnostics` 下仅属主可读写的文件；框架摘要只包含失败类别、退出码和不含主机信息的通道会话
   编号（尚不可用时为 `unknown`），共享通道的会话共用该编号。日志保留到通道的正常清理，因为持久 SSH

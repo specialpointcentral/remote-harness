@@ -42,6 +42,8 @@ sys.exit(23)
             # inject-rule reads the opencode version to pick its plugin format.
             (fake_bin / 'opencode').write_text('#!/bin/sh\necho 1.19.5\n')
             (fake_bin / 'opencode').chmod(0o700)
+            (fake_bin / 'claude').write_text('#!/bin/sh\necho "2.1.295 (Claude Code)"\n')
+            (fake_bin / 'claude').chmod(0o700)
             env = {name: value for name, value in os.environ.items()
                    if not name.startswith('RH_') and name not in ('BASH_ENV', 'ENV')}
             env.update(HOME=str(home), RH_HOME=str(home / 'rh'), RH_WARM_MAX='0',

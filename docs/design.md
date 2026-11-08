@@ -83,6 +83,17 @@ Claude's hook returns no permission decision: a hook `allow` would skip Claude's
 its auto-mode classifier; without one, Claude judges the rewritten call under the session's approval
 mode.
 
+Claude requires version 2.1.295 or newer. Its routing `PreToolUse` hook sets `onFailure: "block"`:
+if the hook cannot start, times out, crashes or returns invalid JSON, Claude blocks the call before
+Bash can execute the original command on the agent host. The default hook failure behavior would
+continue through normal approvals with no routing rewrite. Python's exception handler cannot cover
+a hook killed by Claude. Claude/Codex routing hooks have a 15-second outer budget, longer than the
+shell policy subprocess's 10-second limit; SSHFS path and settings operations share that budget.
+The larger budget reduces avoidable cancellations, while `onFailure` is the Claude safety gate.
+Successful rewrites still leave auto mode and ordinary approvals in charge. Session implementations
+and settings are frozen: after upgrading the harness, create a new harness session (the Claude
+conversation can be resumed). Existing sessions do not pick up this change.
+
 Claude's own permission rules see only that rh-run text, so the hook applies the user's `Bash(...)`
 rules (managed, user and project settings) to the original command. A deny rule that matches any
 simple command in it, as the shared lexer finds them (substitutions included; `sudo`, `env` and
