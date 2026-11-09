@@ -223,8 +223,8 @@ transport_settings_env() {
 validate_launch_ui() {  # $1=UI $2=agent
   case "$1" in
     terminal) ;;
-    paseo) [ "$2" = claude ] || { printf '%s\n' '--ui paseo requires --launch claude' >&2; return 2; };;
-    *) printf 'unsupported --ui %s (expected terminal|paseo)\n' "$1" >&2; return 2;;
+    paseo|orca) [ "$2" = claude ] || { printf -- '--ui %s requires --launch claude\n' "$1" >&2; return 2; };;
+    *) printf 'unsupported --ui %s (expected terminal|paseo|orca)\n' "$1" >&2; return 2;;
   esac
 }
 

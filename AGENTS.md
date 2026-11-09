@@ -19,6 +19,8 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
 - `scripts/paseo-session.mjs` / `paseo-guard.py` create and guard a native Paseo Claude session.
+- `scripts/orca-session.py` creates a native Orca Claude chat. `orca-claude.py` and
+  `orca_native.py` bind the configured Claude command to a private session identity and lease.
 - `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
 - `scripts/warm_pool.py`: per-session pool of channels opened ahead of time on the gateway's wait
   verb (`serve`), and the client half channel-guard and the tool shim use.
@@ -43,9 +45,13 @@ it provides files over SSHFS and executes project commands through a forced gate
   With Claude and `--ui paseo`, the same SSH session owns the Harness bridge while the same-host
   Paseo daemon starts the main agent with the injected settings. The bridge revokes its lease
   before archive and exit. An all-tool hook blocks a stale Paseo agent after transport cleanup.
+- With `--ui orca`, the bridge owns one reserved mount and creates a native Claude chat on the
+  same-host Orca Server. The configured wrapper binds the provider UUID and mount to a lease.
+  Keep the identity and mount reservations across cleanup so old chats cannot acquire a new route.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
 - Claude requires 2.1.295+ and its routing hook must set `onFailure: "block"`; a cancelled or broken
-  hook must never let the original Bash command run on the agent host. Routing hook budgets exceed
+  hook must never let the original Bash command run on the agent host. Generated session settings
+  keep hooks enabled even when project settings set `disableAllHooks`. Routing hook budgets exceed
   the inner command-policy timeout. New settings require a new harness session.
 - The Claude hook never returns a permission decision for a routed call: `allow` skips Claude's
   prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so

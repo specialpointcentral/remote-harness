@@ -204,7 +204,7 @@ def claude_decision(event: dict[str, object], command: str, commands: list[list[
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": updated_input}}
 
 
-def route(runner_arg: str, mount_root_arg: str, agent: str) -> dict[str, object]:
+def route(runner_arg: str, mount_root_arg: str, agent: str, orca: bool = False) -> dict[str, object]:
     try:
         event = json.load(sys.stdin)
     except (OSError, json.JSONDecodeError):
@@ -229,6 +229,9 @@ def route(runner_arg: str, mount_root_arg: str, agent: str) -> dict[str, object]
     except ValueError:
         return deny("command_parse")
     if launches_agent:
+        return deny("local_agent")
+    if orca and any(words and os.path.basename(words[0]) in ("orca", "orca-ide", "orca-dev", "orcad")
+                    for words in commands):
         return deny("local_agent")
 
     runner = os.path.realpath(os.path.expanduser(runner_arg))
@@ -269,22 +272,26 @@ def route(runner_arg: str, mount_root_arg: str, agent: str) -> dict[str, object]
 
 
 def parse_args(argv: list[str]) -> dict[str, str]:
-    """The fixed `--runner PATH --mount-root PATH [--agent claude|codex]` that inject-rule.sh writes."""
+    """Fixed arguments from inject-rule.sh, with an extra manager restriction for Orca."""
     if len(argv) % 2:
         raise ValueError("options need values")
     values = dict(zip(argv[::2], argv[1::2]))
     if len(values) * 2 != len(argv):
         raise ValueError("an option repeats")
     values.setdefault("--agent", "codex")
-    if sorted(values) != ["--agent", "--mount-root", "--runner"] or values["--agent"] not in ("claude", "codex"):
-        raise ValueError("expected --runner PATH --mount-root PATH [--agent claude|codex]")
+    required = {"--agent", "--mount-root", "--runner"}
+    if (not required <= values.keys() or values.keys() - required - {"--ui"}
+            or values["--agent"] not in ("claude", "codex")
+            or ("--ui" in values and (values["--ui"] != "orca" or values["--agent"] != "claude"))):
+        raise ValueError("expected --runner PATH --mount-root PATH [--agent claude|codex] [--ui orca]")
     return values
 
 
 def main() -> int:
     try:
         args = parse_args(sys.argv[1:])
-        result = route(args["--runner"], args["--mount-root"], args["--agent"])
+        result = route(args["--runner"], args["--mount-root"], args["--agent"],
+                       orca=args.get("--ui") == "orca")
     except Exception:  # Keep hook execution fail-closed after Python starts.
         result = deny("framework")
     json.dump(result, sys.stdout)

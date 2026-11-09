@@ -6,7 +6,7 @@
 #   Phase 2 — Reconnect automatically (establishes the reverse tunnel)
 #   Phase 3 — Pick a project dir on THIS laptop (readline prompt, defaults to cwd)
 #   Phase 4 — Mount the chosen dir on the remote box via sshfs (over the tunnel)
-#   Phase 5 — Start the agent in the mounted dir through the terminal or the native Paseo bridge.
+#   Phase 5 — Start the agent in the mounted dir through the terminal or a native chat bridge.
 #
 # Usage (emitted by the skill — paste as-is). This script sources _common.sh from beside it, so the
 # command fetches BOTH files into one temp dir (the laptop usually has no install):
@@ -33,7 +33,7 @@
 #   --project-dir <d>     laptop project dir to mount (validated; prompts again if invalid)
 #   --launch <cmd>        coding-agent CLI to start on the remote (default: claude;
 #                         Codex passes 'codex', opencode passes 'opencode')
-#   --ui terminal|paseo   terminal (default), or native Paseo chat for Claude
+#   --ui terminal|paseo|orca  terminal (default), or a native chat for Claude
 #   --approval <mode>     approvals on the launched agent: 'auto' (default; claude
 #                         --permission-mode auto, codex --approve-for-me, normal where the CLI
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
@@ -108,10 +108,18 @@ if [ -f "$RH_COMMON" ]; then
   . "$RH_COMMON"
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
 validate_launch_ui "$UI" "$LAUNCH" || exit 2
-if [ "$UI" = paseo ] && [ "$SETUP_ONLY" = 1 ]; then
-  printf '%s\n' '--ui paseo needs a full session (not --setup-only)' >&2
+if [ "$UI" != terminal ] && [ "$SETUP_ONLY" = 1 ]; then
+  printf '%s\n' "--ui $UI needs a full session (not --setup-only)" >&2
   exit 2
 fi
+if [ "$UI" = orca ] && [ -n "$REMOTE_MP" ]; then
+  printf '%s\n' '--ui orca reserves a unique mount and cannot use --remote-mountpoint' >&2
+  exit 2
+fi
+case "$UI" in
+  paseo) ui_label=Paseo;;
+  orca) ui_label=Orca;;
+esac
 transport_settings_load "$LOCAL_SSHD_MODE" || exit 2
 
 # Its own RH_LAPTOP_STEPS steps, after any simple-laptop-setup.sh steps (RH_STEP_BASE).
@@ -772,7 +780,7 @@ EFF_LAUNCH="$LAUNCH"
 LAUNCH_BASE="$LAUNCH"
 if [ "$APPROVAL" = yolo ]; then
   case "$LAUNCH_BASE:$UI" in
-    claude:paseo) warn "YOLO: Paseo Claude bypassPermissions";;
+    claude:paseo|claude:orca) warn "YOLO: $ui_label Claude bypassPermissions";;
     claude:terminal) EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex:terminal) EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
     opencode:terminal) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
@@ -1274,6 +1282,15 @@ step_begin "$(tr2 "Mounting the project on the remote (sshfs)" "在远端挂载�
 #  - otherwise default to <remote $RH_HOME>/mounts/<project-name>.
 #    The mount call itself resolves that default, so it costs no extra round trip.
 REMOTE_MOUNTPOINT="$REMOTE_MP"
+if [ "$UI" = orca ]; then
+  if ! REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    exec python3 -I -S \"\$rh/scripts/orca_native.py\" reserve \"\$rh\" $(sq "$RULE_SESSION_ID")
+  ") || [ -z "$REMOTE_MOUNTPOINT" ]; then
+    err "Could not reserve the Orca mount. Update Remote Harness on the agent host."
+    exit 1
+  fi
+fi
 
 # Mount, with interactive retry: a recoverable failure (sshfs missing / target not empty) loops
 # back instead of exiting, so the tunnel we just established is NOT thrown away.
@@ -1309,6 +1326,10 @@ while :; do
       err "Aborted (sshfs missing)."; exit 1
       ;;
     not-empty)
+      if [ "$UI" = orca ]; then
+        err "The reserved Orca mount is not empty. Start a new Harness launch."
+        exit 1
+      fi
       warn "Remote mountpoint is not empty: ${REMOTE_MOUNTPOINT}"
       say "  sshfs needs an EMPTY box dir (mounting would hide its existing contents)."
       if [ "$ASSUME_YES" = 1 ] || [ ! -e /dev/tty ]; then
@@ -1422,13 +1443,17 @@ if [ "$rh_status" = INJECTED ]; then
     _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
     REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
   fi
-  if [ "$UI" = paseo ]; then
-    rh_paseo_launch=$(printf '%s\n' "$rh_out" | kv_value RH_PASEO_LAUNCH)
-    if [ -z "$rh_paseo_launch" ] || [ -z "$rh_prefix" ]; then
-      err "Remote Harness does not support --ui paseo on this host; update its scripts."
+  if [ "$UI" != terminal ]; then
+    case "$UI" in
+      paseo) native_key=RH_PASEO_LAUNCH;;
+      orca) native_key=RH_ORCA_LAUNCH;;
+    esac
+    rh_native_launch=$(printf '%s\n' "$rh_out" | kv_value "$native_key")
+    if [ -z "$rh_native_launch" ] || [ -z "$rh_prefix" ]; then
+      err "Remote Harness does not support --ui $UI on this host; update its scripts."
       exit 1
     fi
-    EFF_LAUNCH="export $rh_env; exec $rh_prefix $rh_paseo_launch"
+    EFF_LAUNCH="export $rh_env; exec $rh_prefix $rh_native_launch"
   else
     # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
     # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
@@ -1528,6 +1553,8 @@ step_begin "$(tr2 "Launching ${LAUNCH} on the remote" "在远端启动 ${LAUNCH}
 step_end ok "${REMOTE_MOUNTPOINT}"
 if [ "$UI" = paseo ]; then
   say "  $(tr2 "Open the conversation in Paseo when it appears. Keep this launcher running. Archive the conversation or press Ctrl-C here to end it." "会话出现后请在 Paseo 中打开。保持此启动器运行。归档会话或在此按 Ctrl-C 可结束。")"
+elif [ "$UI" = orca ]; then
+  say "  $(tr2 "Open the chat in Orca when it appears. Keep this launcher running. Close the chat, archive its workspace, or press Ctrl-C here to end it." "会话出现后请在 Orca 中打开。保持此启动器运行。关闭会话、归档工作区或在此按 Ctrl-C 可结束。")"
 else
   say "  $(tr2 "Your terminal becomes the remote ${LAUNCH} session. Exit ${LAUNCH} to return here." "终端将切换为远端 ${LAUNCH} 会话；退出 ${LAUNCH} 即返回这里。")"
 fi
@@ -1553,7 +1580,7 @@ remote_launch_prelude() {
   _warm=$(tr2 "Prewarmed project metadata (.git, settings files)" "预热项目元数据（.git、设置文件）")
   _start=$(tr2 "Starting ${LAUNCH_BASE} (a folder used for the first time asks whether you trust it)..." \
                "启动 ${LAUNCH_BASE}（第一次进入的目录会先询问是否信任）…")
-  [ "$UI" = terminal ] || _start=$(tr2 "Creating a native Claude conversation in Paseo..." "正在 Paseo 中创建原生 Claude 会话…")
+  [ "$UI" = terminal ] || _start=$(tr2 "Creating a native Claude conversation in $ui_label..." "正在 $ui_label 中创建原生 Claude 会话…")
   # The marks take this terminal's colors (empty when it has none), like ok() and the local steps.
   cat <<EOF
 printf '  %s\342\234\223%s %s\n' $(sq "$_G") $(sq "$_0") $(sq "$_conn")
@@ -1613,7 +1640,7 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
     exec 3<&-
     return "$_rc"
   fi
-  [ "$UI" = paseo ] || warn "no controlling tty found; remote ${LAUNCH} TUI may not start"
+  [ "$UI" != terminal ] || warn "no controlling tty found; remote ${LAUNCH} TUI may not start"
   ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd"
 }
 start_tunnel_supervisor

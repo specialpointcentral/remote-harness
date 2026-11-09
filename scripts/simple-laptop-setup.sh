@@ -201,6 +201,10 @@ case "$LAUNCH" in
   *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
 esac
 validate_launch_ui "$UI" "$LAUNCH" || exit 2
+if [ "$UI" = orca ] && [ -n "$REMOTE_MP" ]; then
+  printf '%s\n' '--ui orca reserves a unique mount and cannot use --remote-mountpoint' >&2
+  exit 2
+fi
 case "$APPROVAL" in
   ""|normal|auto|yolo) ;;
   *) printf 'unsupported --approval %s (expected normal|auto|yolo)\n' "$APPROVAL" >&2; exit 2;;
@@ -262,7 +266,7 @@ else
   PROJECT_DIR="$(choose_project_dir "$PWD" 1)"
 fi
 
-if [ -z "$REMOTE_MP" ]; then
+if [ "$UI" != orca ] && [ -z "$REMOTE_MP" ]; then
   # A remembered mountpoint belongs to the project it was chosen for; any other project (or a cache
   # written before that was recorded) defaults to auto, shown with the name it will actually use.
   cached_mp=""
@@ -329,13 +333,19 @@ else
   say "Remote alias:     ${BOX_ALIAS} (session-local config)"
   say "Local project:    ${PROJECT_DIR}"
 fi
-if [ -n "$REMOTE_MP" ]; then
+if [ "$UI" = orca ]; then
+  say "$(tr2 "Remote mountpoint: reserved for this Orca chat" "远端挂载点：     此 Orca 会话专用")"
+elif [ -n "$REMOTE_MP" ]; then
   if is_zh; then say "远端挂载点：     ${REMOTE_MP}"; else say "Remote mountpoint: ${REMOTE_MP}"; fi
 else
   if is_zh; then say "远端挂载点：     远端 ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; else say "Remote mountpoint: remote ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; fi
 fi
 if is_zh; then say "启动命令：       ${LAUNCH}（审批模式 ${APPROVAL}）"; else say "Launch:           ${LAUNCH} (approval: ${APPROVAL})"; fi
-[ "$UI" = terminal ] || say "$(tr2 "Interface:        Paseo (native chat)" "交互界面：       Paseo 原生聊天")"
+case "$UI" in
+  paseo) ui_label=Paseo;;
+  orca) ui_label=Orca;;
+esac
+[ "$UI" = terminal ] || say "$(tr2 "Interface:        $ui_label (native chat)" "交互界面：       $ui_label 原生聊天")"
 if [ "$LOCAL_SSHD" = user ]; then
   say "$(tr2 "Local SSH server: per-session user-mode sshd (RH_LOCAL_SSHD=system switches back)" "本机 SSH 服务：   会话级用户态 sshd（RH_LOCAL_SSHD=system 可改回）")"
 else

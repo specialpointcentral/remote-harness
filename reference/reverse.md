@@ -113,6 +113,12 @@ creates a native Claude conversation through the Paseo daemon using the same per
 Archiving or deleting it in Paseo ends the Harness session. The CLI resume offer in step 9 applies
 to terminal sessions. [Setup and session lifecycle](../docs/paseo.md)
 
+## Native Orca chat
+
+With `--launch claude --ui orca`, the launcher reserves a mount for this chat before step 6. The
+agent-host bridge requests a native Claude tab from Orca Server. Closing the chat or archiving
+its folder workspace ends the Harness session. [Setup and session lifecycle](../docs/orca.md)
+
 ## Preconditions
 
 - The laptop can SSH into the remote box with the user's existing SSH key.

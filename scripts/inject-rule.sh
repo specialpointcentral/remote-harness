@@ -24,7 +24,7 @@
 #   experimental.chat.messages.transform plugin hook), because the rule alone sits at the start of the
 #   context and loses to long tool output in another language.
 #
-#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id] [terminal|paseo]
+#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id] [terminal|paseo|orca]
 #              approval: 0|normal, 1|yolo, or auto = the agent's automatic approval review when this CLI
 #              supports it (claude --permission-mode auto, codex --approve-for-me), else normal.
 #   inject-rule.sh off <agent> <mountpoint> [session_id]
@@ -37,7 +37,7 @@
 #               RH_READY_FILE=<opencode marker>  RH_OPENCODE_MAJOR=<1|2, empty for other agents>
 #               RH_PROCESS_LIST_SHARED=<1 when other users here can read process arguments>
 #               RH_LAUNCH_PREFIX=<session launcher for the final launch>
-#               RH_PASEO_LAUNCH=<bridge command, only in Paseo mode>
+#               RH_PASEO_LAUNCH or RH_ORCA_LAUNCH=<native bridge command>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
 # Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
 # from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
@@ -551,6 +551,8 @@ for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
         roots.append(root)
         rules += [f"{tool}(/{root}/**)" for tool in ("Read", "Edit")]
 print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
+  # Flag settings have higher precedence than project settings. Explicit false keeps the
+  # route and lease hooks active if a project-level setting otherwise disables all hooks.
   cat > "$1" <<EOF
 {
   "disableAllHooks": false,
@@ -687,6 +689,11 @@ case "${1:-}" in
         impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
       done
     fi
+    if [ "$ui" = orca ]; then
+      for impl_file in orca-session.py orca_native.py native_workspace.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
     # One cp and one chmod for all of them: each extra process costs more than the copy itself.
     cp "${impl_sources[@]}" "$SD/impl/" && chmod 500 "${impl_copies[@]}" || abort_session
     SCRIPT_DIR="$SD/impl"
@@ -702,7 +709,7 @@ case "${1:-}" in
     fi
     RULE="$SD/rule.md"
 
-    env_out=""; flags_out=""; paseo_launch=""; ready_file=""; prefix_out=""; control_path=""; opencode_major=""
+    env_out=""; flags_out=""; paseo_launch=""; orca_launch=""; ready_file=""; prefix_out=""; control_path=""; opencode_major=""
     if [ -n "$ssh_config" ]; then
       control_path="$(session_control_path "$ssh_config")" || abort_session
       diagnostic_dir="$(dirname "$ssh_config")/runtime/diagnostics"
@@ -794,6 +801,7 @@ case "${1:-}" in
       [ -x "$SCRIPT_DIR/route-command.py" ] \
         || abort_session
       hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp") --agent $agent"
+      [ "$ui" != orca ] || hook_command="$hook_command --ui orca"
       reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
         || abort_session
     fi
@@ -821,6 +829,10 @@ case "${1:-}" in
             abort_session
           fi
           paseo_launch="$(sq "$node_bin") $(sq "$SCRIPT_DIR/paseo-session.mjs") $(sq "$approval") $(sq "$PYTHON3")"
+          flags_out=""
+        elif [ "$ui" = orca ]; then
+          printf '%s' "${lp##*/}" > "$SD/orca-project-title" || abort_session
+          orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3")"
           flags_out=""
         elif [ "$approval" = auto ]; then
           if grep -q '"auto"' <<<"$(claude --help 2>/dev/null)"; then
@@ -939,6 +951,7 @@ case "${1:-}" in
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"
     [ -z "$paseo_launch" ] || printf 'RH_PASEO_LAUNCH=%s\n' "$paseo_launch"
+    [ -z "$orca_launch" ] || printf 'RH_ORCA_LAUNCH=%s\n' "$orca_launch"
     ;;
   off)
     mp="${3:-}"; sid="${4:-}"
@@ -960,6 +973,6 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] [terminal|paseo] | off <agent> <box_mountpoint> [session_id]" >&2
+    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] [terminal|paseo|orca] | off <agent> <box_mountpoint> [session_id]" >&2
     echo "RH_STATUS=ERROR"; exit 2;;
 esac

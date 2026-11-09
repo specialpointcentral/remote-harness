@@ -28,7 +28,9 @@ description: >-
 
 默认使用终端界面。用户要求在 Paseo 原生聊天时，选择 `--launch claude`，在最终 bootstrap 命令
 追加 `--ui paseo`，并提供 [Paseo 设置指南](docs/paseo.cn.md)。使用手机 Paseo 时，本机项目主机
-需保持启动器运行。
+需保持启动器运行。用户要求使用 Orca 原生聊天时，选择 `--launch claude --ui orca`，并提供
+[Orca 设置指南](docs/orca.cn.md)。每次 Orca 启动会保留专用挂载点，用户在已配对设备上打开
+聊天期间，项目主机需保持启动器运行。
 
 按确定的审批模式追加 `--approval auto`、`--approval normal`，或 `--yolo`（仅当用户明确要求免审批模式时）。中文使用 `RH_LANG=zh`，其他情况使用 `RH_LANG=en`。
 

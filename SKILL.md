@@ -31,7 +31,9 @@ Select the remote agent CLI:
 Use the terminal interface by default. When the user asks for native Paseo chat, select
 `--launch claude`, append `--ui paseo` to the final bootstrap command, and point them to
 [the Paseo setup guide](docs/paseo.md). The project host keeps the launcher running while they use
-Paseo on their phone.
+Paseo on their phone. When the user requests native Orca chat, use `--launch claude --ui orca`
+and point them to [the Orca setup guide](docs/orca.md). Orca mode reserves a mount for each chat
+and keeps the project-host launcher running while the user connects from a paired Orca device.
 
 Append the settled approval mode: `--approval auto`, `--approval normal`, or `--yolo` (only when the
 user explicitly requests bypass/no-approval mode). Use `RH_LANG=zh` for Chinese and `RH_LANG=en`

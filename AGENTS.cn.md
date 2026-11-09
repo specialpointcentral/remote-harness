@@ -21,6 +21,8 @@
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
 - `scripts/paseo-session.mjs` / `paseo-guard.py`：创建并保护 Paseo 原生 Claude 会话。
+- `scripts/orca-session.py`：创建 Orca 原生 Claude 会话。
+  `orca-claude.py` 和 `orca_native.py` 将配置的 Claude 命令绑定到私有会话身份和 lease。
 - `scripts/channel-guard.py`：在路由 Bash 命令存续期间持有其 SSH 通道。
 - `scripts/warm_pool.py`：每会话一个、在 gateway 的 wait 动词上预先打开通道的通道池（`serve`），以及
   channel-guard 和工具垫片使用的客户端部分。
@@ -41,7 +43,11 @@
   `--ui paseo` 时，同一 SSH 会话监管 Harness 桥接进程，由同一主机的 Paseo 守护进程带注入设置
   启动主 Agent。桥接进程在归档和退出前撤销 lease；通道清理后，全工具 hook 拒绝旧 Paseo 会话的
   工具调用。
+- 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
+  创建原生 Claude 聊天。包装器将 Claude UUID 和挂载绑定到 lease。清理后需保留 UUID 和挂载的
+  预留记录，避免旧聊天获得新路由。
 - Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。
+- 生成的 Claude 会话设置会保持 hooks 启用，即使项目设置了 `disableAllHooks`。
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成
   可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 和 opencode
   插件写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。

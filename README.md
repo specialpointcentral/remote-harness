@@ -220,6 +220,12 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
 再由远端 Paseo 创建 Claude 会话。项目主机保持启动器运行，手机连接同一台远端 Paseo 后即可打开会话。
 [安装与会话生命周期](docs/paseo.cn.md)
 
+### Orca 原生聊天
+
+在项目主机运行 bootstrap 时选择 `--launch claude --ui orca`。同一台 Agent 主机上的 Orca Server
+和 Claude 使用该会话的专用挂载和命令路由。项目主机保持启动器运行，手机或桌面客户端打开原生会话。
+[安装与会话生命周期](docs/orca.cn.md)
+
 ### 断线与会话恢复
 
 - **sshfs 不是同步**：远端没有项目副本，每次读写都实时经 SFTP 落到本机磁盘；`close` 会等写入完成，
@@ -626,6 +632,13 @@ Select `--launch claude --ui paseo` in the bootstrap on the project host. Harnes
 mount and command routing, then the remote Paseo daemon creates a Claude conversation. Keep the
 launcher running on the project host and open the conversation from the phone paired to that daemon.
 [Setup and session lifecycle](docs/paseo.md)
+
+### Native Orca chat
+
+Select `--launch claude --ui orca` in the bootstrap on the project host. Orca Server and Claude
+run on the same agent host and use this chat's mount and command routing. Keep the project-host
+launcher running while using the native chat from a paired phone or desktop.
+[Setup and session lifecycle](docs/orca.md)
 
 ### Disconnects and resuming
 

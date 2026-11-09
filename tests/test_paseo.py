@@ -85,7 +85,7 @@ else
   touch "$HOME/agent-started"
 fi
 ''')
-        for name in ('paseo/claude.json',):
+        for name in ('paseo/claude.json', 'orca/claude.json'):
             path = self.rh / name
             path.parent.mkdir(exist_ok=True)
             path.parent.chmod(0o700)
@@ -96,7 +96,7 @@ fi
         self.reserve = [sys.executable, '-EsB', str(self.rh / 'scripts/native_workspace.py'),
                         'reserve', str(self.rh), str(self.mount)]
         subprocess.run(self.reserve, check=True, env=self.env)
-        self.wrappers = ('paseo-claude.py',)
+        self.wrappers = ('paseo-claude.py', 'orca-claude.py')
 
     def launch(self, wrapper, cwd, *args, env=None):
         return subprocess.run([sys.executable, '-EsB', str(self.rh / 'scripts' / wrapper), *args],
