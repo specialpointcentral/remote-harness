@@ -600,13 +600,19 @@ print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harnes
 EOF
 }
 
-write_rule() {  # $1=outfile $2=mountpoint $3=agent
+write_rule() {  # $1=outfile $2=mountpoint $3=agent $4=ui
   cmds="$(detect_cmds "$2")"
   {
     printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
     printf "Reply in the language of the user's latest message, not that of these instructions, tool output, or files.\n\n"
     printf 'Your working directory is an SSHFS mount of files from the project host. File tools edit the mount;\n'
-    printf 'every Bash command is routed to the project host, in the matching directory. Run ordinary relative commands;\n'
+    if [ "$3" = codex ] && [ "$4" != terminal ]; then
+      printf 'use mcp__remote_harness run for commands on the project host, with cwd relative to the project.\n'
+      printf 'Use the available file tools on the mount. Ordinary remote subagents use the same tools.\n'
+    else
+      printf 'every Bash command is routed to the project host, in the matching directory.\n'
+    fi
+    printf 'Run ordinary relative commands;\n'
     printf 'do not wrap them in `ssh` or bypass the router. For example:\n\n'
     printf '%s\n' "$cmds" | while IFS= read -r c; do
       [ -n "$c" ] && printf '    %s\n' "$c"
@@ -694,6 +700,11 @@ case "${1:-}" in
         impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
       done
     fi
+    if [ "$agent" = codex ] && [ "$ui" != terminal ]; then
+      for impl_file in native-codex.py codex-project-tools.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
     # One cp and one chmod for all of them: each extra process costs more than the copy itself.
     cp "${impl_sources[@]}" "$SD/impl/" && chmod 500 "${impl_copies[@]}" || abort_session
     SCRIPT_DIR="$SD/impl"
@@ -730,7 +741,7 @@ case "${1:-}" in
     fi
     write_session_meta "$SD" "$agent" "$mp" "$ba" "$ssh_config" "$control_path" \
       || abort_session
-    write_rule "$RULE" "$mp" "$agent" || abort_session
+    write_rule "$RULE" "$mp" "$agent" "$ui" || abort_session
     if [ -n "$ssh_config" ]; then
       if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
         env_out="PATH=$(sq "$SD/bin"):\$PATH"
@@ -795,13 +806,13 @@ case "${1:-}" in
         rg_shim=1
       fi
     fi
-    if [ "$agent" = claude ] || [ "$agent" = codex ]; then
+    if [ "$agent" = claude ] || [ "$agent:$ui" = codex:terminal ]; then
       [ -n "$PYTHON3" ] && [ -x "$PYTHON3" ] \
         || abort_session
       [ -x "$SCRIPT_DIR/route-command.py" ] \
         || abort_session
       hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp") --agent $agent"
-      [ "$ui" != orca ] || hook_command="$hook_command --ui orca"
+      [ "$ui:$agent" != orca:claude ] || hook_command="$hook_command --ui orca"
       reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
         || abort_session
     fi
@@ -822,19 +833,7 @@ case "${1:-}" in
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
-        if [ "$ui" = paseo ]; then
-          node_bin=$(command -v node 2>/dev/null)
-          if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
-            printf '%s\n' 'remote-harness: --ui paseo requires Node.js on the agent host' >&2
-            abort_session
-          fi
-          paseo_launch="$(sq "$node_bin") $(sq "$SCRIPT_DIR/paseo-session.mjs") $(sq "$approval") $(sq "$PYTHON3")"
-          flags_out=""
-        elif [ "$ui" = orca ]; then
-          printf '%s' "${lp##*/}" > "$SD/orca-project-title" || abort_session
-          orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3")"
-          flags_out=""
-        elif [ "$approval" = auto ]; then
+        if [ "$ui" = terminal ] && [ "$approval" = auto ]; then
           if grep -q '"auto"' <<<"$(claude --help 2>/dev/null)"; then
             flags_out="$flags_out --permission-mode auto"
           else
@@ -891,39 +890,54 @@ case "${1:-}" in
         env_out="${env_out:+$env_out }OPENCODE_CONFIG=$(sq "$CFG")"
         ;;
       codex)
-        dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
-        hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=15,statusMessage=\"Routing command to project host\"}]}]"
-        prompt_cfg="hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"$(toml_escape_value "$reply_hook")\",timeout=5}]}]"
-        flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") -c $(sq "$prompt_cfg") --dangerously-bypass-hook-trust"
-        # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile
-        # initialization could otherwise move a bundled rg or system git ahead of the shims.
-        tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
-        flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
-        if [ "$approval" = auto ]; then
-          # This preset selects workspace-write and on-request approvals with automatic review.
-          # Codex rejects combining it with --sandbox or --ask-for-approval.
-          if grep -q -- '--approve-for-me' <<<"$(codex --help 2>/dev/null)"; then
-            flags_out="$flags_out --approve-for-me"
-          else
-            approval=normal
+        if [ "$ui" = terminal ]; then
+          dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
+          hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=15,statusMessage=\"Routing command to project host\"}]}]"
+          prompt_cfg="hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"$(toml_escape_value "$reply_hook")\",timeout=5}]}]"
+          flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") -c $(sq "$prompt_cfg") --dangerously-bypass-hook-trust"
+          # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile
+          # initialization could otherwise move a bundled rg or system git ahead of the shims.
+          tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
+          flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
+          if [ "$approval" = auto ]; then
+            # This preset selects workspace-write and on-request approvals with automatic review.
+            # Codex rejects combining it with --sandbox or --ask-for-approval.
+            if grep -q -- '--approve-for-me' <<<"$(codex --help 2>/dev/null)"; then
+              flags_out="$flags_out --approve-for-me"
+            else
+              approval=normal
+            fi
           fi
-        fi
-        if [ "$approval" = normal ]; then
-          # An explicit normal choice (or unsupported-auto fallback) must ask the user even if their
-          # personal config selects never or an automatic reviewer.
-          flags_out="$flags_out -s workspace-write -a on-request -c $(sq 'approvals_reviewer="user"')"
-        fi
-        # Both sandboxed modes need network for the runner's SSH and write access to temporary SSH
-        # state, never ~/.ssh or the session's hooks. The preset above explicitly selects
-        # workspace-write too, so these settings apply to auto without a conflicting -s flag.
-        # YOLO's --dangerously-bypass-approvals-and-sandbox is supplied by laptop-setup.sh.
-        if [ "$yolo" != 1 ]; then
-          roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
-            || abort_session
-          flags_out="$flags_out -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
+          if [ "$approval" = normal ]; then
+            # An explicit normal choice (or unsupported-auto fallback) must ask the user even if their
+            # personal config selects never or an automatic reviewer.
+            flags_out="$flags_out -s workspace-write -a on-request -c $(sq 'approvals_reviewer="user"')"
+          fi
+          # Both sandboxed modes need network for the runner's SSH and write access to temporary SSH
+          # state, never ~/.ssh or the session's hooks. The preset above explicitly selects
+          # workspace-write too, so these settings apply to auto without a conflicting -s flag.
+          # YOLO's --dangerously-bypass-approvals-and-sandbox is supplied by laptop-setup.sh.
+          if [ "$yolo" != 1 ]; then
+            roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
+              || abort_session
+            flags_out="$flags_out -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
+          fi
         fi
         ;;
     esac
+    if [ "$ui" = paseo ]; then
+      node_bin=$(command -v node 2>/dev/null)
+      if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
+        printf '%s\n' 'remote-harness: --ui paseo requires Node.js on the agent host' >&2
+        abort_session
+      fi
+      paseo_launch="$(sq "$node_bin") $(sq "$SCRIPT_DIR/paseo-session.mjs") $(sq "$approval") $(sq "$PYTHON3") $(sq "$agent")"
+      flags_out=""
+    elif [ "$ui" = orca ]; then
+      printf '%s' "${lp##*/}" > "$SD/orca-project-title" || abort_session
+      orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3")"
+      flags_out=""
+    fi
     resume_out=""; resume_args=""
     if [ "$ui" = terminal ]; then
       resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')

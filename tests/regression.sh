@@ -2132,6 +2132,8 @@ python3 "$ROOT/tests/test_permission_rules.py" -v
 python3 "$ROOT/tests/test_claude_hooks.py" -v
 python3 "$ROOT/tests/test_paseo.py" -v
 python3 "$ROOT/tests/test_orca.py" -v
+python3 "$ROOT/tests/test_native_codex.py" -v
+python3 "$ROOT/tests/test_native_codex_managers.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 

@@ -11,6 +11,7 @@ import sys
 MOUNTS = ".orca-mounts"
 IDENTITIES = ".orca-identities"
 LEASE = "orca-lease.json"
+CODEX_CHATS = ".orca-codex-chats"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 SESSION_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
@@ -46,8 +47,8 @@ def write_once(path, data):
         json.dump(data, stream)
 
 
-def config(home):
-    path = private_dir(home / "orca") / "claude.json"
+def config(home, agent="claude"):
+    path = private_dir(home / "orca") / f"{agent}.json"
     try:
         return private_json(path)
     except FileNotFoundError as error:

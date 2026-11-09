@@ -67,10 +67,10 @@ class PaseoOptionTests(PaseoFixture):
             with self.subTest(name=name):
                 args = ['--port', '27678'] if name == 'laptop-setup.sh' else []
                 result = subprocess.run(
-                    ['bash', str(SCRIPTS / name), *args, '--launch', 'codex', '--ui', 'paseo'],
+                    ['bash', str(SCRIPTS / name), *args, '--launch', 'opencode', '--ui', 'paseo'],
                     env=self.env, text=True, input='', capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('--ui paseo requires --launch claude', result.stderr)
+                self.assertIn('--ui paseo requires --launch claude or codex', result.stderr)
                 self.assertFalse((self.home / 'ssh-ran').exists())
 
 
@@ -85,7 +85,7 @@ else
   touch "$HOME/agent-started"
 fi
 ''')
-        for name in ('paseo/claude.json', 'orca/claude.json'):
+        for name in ('paseo/claude.json', 'orca/claude.json', 'codex.json'):
             path = self.rh / name
             path.parent.mkdir(exist_ok=True)
             path.parent.chmod(0o700)
@@ -96,7 +96,7 @@ fi
         self.reserve = [sys.executable, '-EsB', str(self.rh / 'scripts/native_workspace.py'),
                         'reserve', str(self.rh), str(self.mount)]
         subprocess.run(self.reserve, check=True, env=self.env)
-        self.wrappers = ('paseo-claude.py', 'orca-claude.py')
+        self.wrappers = ('paseo-claude.py', 'orca-claude.py', 'native-codex.py')
 
     def launch(self, wrapper, cwd, *args, env=None):
         return subprocess.run([sys.executable, '-EsB', str(self.rh / 'scripts' / wrapper), *args],

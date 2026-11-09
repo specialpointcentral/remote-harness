@@ -1,5 +1,7 @@
 # 在 Paseo 原生聊天中使用 Claude
 
+Codex 请参阅[原生 Codex 设置](codex-native.cn.md)。本页适用于 Claude。
+
 项目文件保存在项目主机上。项目主机负责运行反向 bootstrap 和执行路由后的 Bash 命令。
 Agent 主机同时运行 Claude 和 Paseo。手机配对到该 Paseo 守护进程后，即可打开原生 Claude 会话。
 文件工具通过 SSHFS 挂载读写，Claude 的 Git 和 ripgrep 扫描通过路由在项目主机上执行。
@@ -64,7 +66,7 @@ Paseo 模式每次创建新会话。`RH_RESUME` 恢复提示适用于终端启�
 版本控制操作在 Agent 主机运行。需要 Harness 路由时，请使用 Claude 聊天中的工具。
 
 Harness 工作区只接受启动器创建的聊天。在该目录或子目录中手动创建普通聊天时，已配置的
-Claude 包装器会在 Agent 启动前拒绝；其他项目仍可创建普通聊天。每个启用的 Claude
+Claude/Codex 包装器会在 Agent 启动前拒绝；其他项目仍可创建普通聊天。每个启用的 Claude/Codex
 provider 都应配置对应包装器。界面可能仍会出现无法使用的标签页，关闭这个额外标签页并返回原聊天即可。
 需要另一个 Harness 聊天时，在项目主机重新运行原启动命令。请保留 `$RH_HOME/.paseo-workspaces`，
 这些路径预留记录在清理后仍保留，防止旧工作区悄悄变成普通聊天。正在运行的旧会话需重新启动，才能获得

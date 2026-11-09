@@ -1,5 +1,7 @@
 # Native Paseo chat for Claude
 
+For Codex, follow the [native Codex setup](codex-native.md). This page covers Claude.
+
 The project host keeps the files, runs the reverse bootstrap, and executes routed Bash commands.
 The agent host runs both Claude and Paseo. Open the native Claude conversation on a phone paired
 with that Paseo daemon. File tools use the SSHFS mount, and Claude's routed Git and ripgrep scans
@@ -70,9 +72,9 @@ Harness Claude session. Paseo's own workspace terminals, scripts and source-cont
 on the agent host. Use the Claude chat tools for Harness routing.
 
 Only launcher-created chats may use a Harness workspace. A manually created ordinary chat in
-that directory or a subdirectory is refused by the configured Claude wrappers before the
+that directory or a subdirectory is refused by the configured Claude/Codex wrappers before the
 agent starts; ordinary chats in other projects are allowed. Configure the corresponding wrapper
-for each Claude provider you enable. The UI may still create an unusable tab: close that
+for each Claude/Codex provider you enable. The UI may still create an unusable tab: close that
 extra tab and return to the original Harness conversation. For another Harness conversation,
 rerun the original bootstrap on the project host. Keep `$RH_HOME/.paseo-workspaces`: these path
 reservations remain after cleanup so an old workspace cannot silently become an ordinary chat.

@@ -75,7 +75,8 @@ Git UI and workspace scripts operate on the agent host. Run project commands in 
 The configured Claude wrapper refuses an ordinary chat opened with **+** inside a Harness
 workspace, including its subdirectories, before starting Claude. Use the launcher-created chat
 or start another Harness launch. Ordinary chats in other projects still work. The **+** button
-itself remains available, so an extra failed tab may appear.
+itself remains available, so an extra failed tab may appear. If both Claude and Codex are enabled,
+configure both providers' Harness wrappers; each wrapper protects launches of its own provider.
 
 ## Smoke test
 

@@ -33,7 +33,7 @@
 #   --project-dir <d>     laptop project dir to mount (validated; prompts again if invalid)
 #   --launch <cmd>        coding-agent CLI to start on the remote (default: claude;
 #                         Codex passes 'codex', opencode passes 'opencode')
-#   --ui terminal|paseo|orca  terminal (default), or a native chat for Claude
+#   --ui terminal|paseo|orca  terminal (default), or a native chat for Claude or Codex
 #   --approval <mode>     approvals on the launched agent: 'auto' (default; claude
 #                         --permission-mode auto, codex --approve-for-me, normal where the CLI
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
@@ -781,6 +781,7 @@ LAUNCH_BASE="$LAUNCH"
 if [ "$APPROVAL" = yolo ]; then
   case "$LAUNCH_BASE:$UI" in
     claude:paseo|claude:orca) warn "YOLO: $ui_label Claude bypassPermissions";;
+    codex:paseo|codex:orca) warn "YOLO: $ui_label Codex full access";;
     claude:terminal) EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex:terminal) EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
     opencode:terminal) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
@@ -1580,7 +1581,7 @@ remote_launch_prelude() {
   _warm=$(tr2 "Prewarmed project metadata (.git, settings files)" "预热项目元数据（.git、设置文件）")
   _start=$(tr2 "Starting ${LAUNCH_BASE} (a folder used for the first time asks whether you trust it)..." \
                "启动 ${LAUNCH_BASE}（第一次进入的目录会先询问是否信任）…")
-  [ "$UI" = terminal ] || _start=$(tr2 "Creating a native Claude conversation in $ui_label..." "正在 $ui_label 中创建原生 Claude 会话…")
+  [ "$UI" = terminal ] || _start=$(tr2 "Creating a native ${LAUNCH_BASE} conversation in $ui_label..." "正在 $ui_label 中创建原生 ${LAUNCH_BASE} 会话…")
   # The marks take this terminal's colors (empty when it has none), like ok() and the local steps.
   cat <<EOF
 printf '  %s\342\234\223%s %s\n' $(sq "$_G") $(sq "$_0") $(sq "$_conn")

@@ -1,4 +1,4 @@
-// Agent-host bridge. The Harness PTY owns this process, while Paseo owns Claude.
+// Agent-host bridge. The Harness PTY owns this process, while Paseo owns the agent.
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -110,7 +110,25 @@ function checkProviderCommand(config, wrapper, label) {
   return wrapper;
 }
 
-async function permissionMode(client, approval) {
+function checkCodexCommand(config) {
+  return checkProviderCommand(config, join(harnessHome, "scripts", "native-codex.py"), "Codex");
+}
+
+function checkCodex(config, python) {
+  const wrapper = checkCodexCommand(config);
+  try {
+    execFileSync(python, ["-EsB", wrapper, "check-harness-version"], { stdio: ["ignore", "ignore", "ignore"], timeout: 10000 });
+  } catch {
+    throw new BridgeError("Native Harness Codex requires Python 3.11+, codex-cli 0.167.0 and the private codex.json.");
+  }
+}
+
+async function permissionMode(client, approval, provider) {
+  if (provider === "codex") {
+    const modes = { normal: "auto", auto: "auto-review", yolo: "full-access" };
+    if (!Object.hasOwn(modes, approval)) throw new BridgeError("Invalid Paseo approval mode.");
+    return modes[approval];
+  }
   if (approval === "normal") return "default";
   if (approval === "yolo") return "bypassPermissions";
   if (approval !== "auto") throw new BridgeError("Invalid Paseo approval mode.");
@@ -122,10 +140,12 @@ async function permissionMode(client, approval) {
   return "default";
 }
 
-function agentEnvironment() {
+function agentEnvironment(provider) {
   const env = {};
-  for (const key of ["PATH", "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-    "CLAUDE_CODE_BASH_EDIT_DIFF", "USE_BUILTIN_RIPGREP", "SSH_CONNECTION", "SSH_CLIENT"]) {
+  const keys = ["PATH", "SSH_CONNECTION", "SSH_CLIENT"];
+  if (provider === "claude") keys.push("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+    "CLAUDE_CODE_BASH_EDIT_DIFF", "USE_BUILTIN_RIPGREP");
+  for (const key of keys) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   if (!env.PATH || realpathSync(env.PATH.split(delimiter)[0]) !== join(session, "bin")) {
@@ -162,13 +182,15 @@ function publishLease(token, config) {
 }
 
 async function main() {
-  const [approval, python] = process.argv.slice(2);
-  if (!python) throw new BridgeError("Start the Paseo bridge through the Harness launcher.");
+  const [approval, python, provider = "claude"] = process.argv.slice(2);
+  if (!python || !["claude", "codex"].includes(provider)) {
+    throw new BridgeError("Start the Paseo bridge through the Harness launcher.");
+  }
   const cwd = process.cwd();
-  const env = agentEnvironment();
+  const env = agentEnvironment(provider);
   const agentId = randomUUID();
   const token = randomUUID();
-  const settings = agentSettings(python, token);
+  const settings = provider === "claude" ? agentSettings(python, token) : null;
   const systemPrompt = readFileSync(join(session, "rule.md"), "utf8");
   const DaemonClient = await loadClient();
   const quiet = () => {};
@@ -201,17 +223,20 @@ async function main() {
     await bounded(10000, "Could not connect to Paseo. Check RH_PASEO_URL and RH_PASEO_PASSWORD.",
       () => client.connect());
     if (stop.signal.aborted) return;
-    stage = "verify the daemon's Claude provider";
-    await checkClaude(client, (await providerConfig(client)).claude);
+    stage = `verify the daemon's ${provider} provider`;
+    const providers = await providerConfig(client);
+    if (provider === "claude") await checkClaude(client, providers.claude);
+    else checkCodex(providers.codex, python);
     if (stop.signal.aborted) return;
-    const modeId = await permissionMode(client, approval);
+    const modeId = await permissionMode(client, approval, provider);
     if (stop.signal.aborted) return;
-    stage = "create the native Claude session";
+    const label = provider === "codex" ? "Codex" : "Claude";
+    stage = `create the native ${label} session`;
     execFileSync(python, ["-EsB", join(impl, "native_workspace.py"), "reserve", harnessHome, cwd],
       { stdio: ["ignore", "ignore", "ignore"], timeout: 5000 });
-    writeFileSync(join(session, "paseo-claude-settings.json"), settings,
+    if (settings) writeFileSync(join(session, "paseo-claude-settings.json"), settings,
       { flag: "wx", mode: 0o600 });
-    publishLease(token, { provider: "claude", approval, python, cwd, env });
+    publishLease(token, { provider, approval, python, cwd, env });
     leased = true;
     createAttempted = true;
     const model = process.env.RH_PASEO_MODEL?.trim();
@@ -219,20 +244,20 @@ async function main() {
       () => client.createAgent({
         agentId,
         idempotencyKey: agentId,
-        provider: "claude",
+        provider,
         cwd,
         title: `Remote Harness · ${basename(cwd)}`,
         modeId,
         ...(model ? { model } : {}),
-        systemPrompt,
-        providerOptions: { extraArgs: { settings } },
-        env: { ...env, RH_CLAUDE_SESSION: session, RH_CLAUDE_TOKEN: token },
+        ...(settings ? { systemPrompt, providerOptions: { extraArgs: { settings } },
+                         env: { ...env, RH_CLAUDE_SESSION: session, RH_CLAUDE_TOKEN: token } }
+                     : { env: { RH_CODEX_SESSION: session, RH_CODEX_TOKEN: token } }),
         labels: { "remote-harness": "true" },
       }));
     if (agent.id !== agentId) throw new BridgeError("Paseo returned an unexpected agent identity.");
     if (stop.signal.aborted) return;
-    console.log(`remote-harness: Paseo Claude agent ${agentId} is ready. Open it in Paseo.`);
-    stage = "monitor the native Claude session";
+    console.log(`remote-harness: Paseo ${label} agent ${agentId} is ready. Open it in Paseo.`);
+    stage = `monitor the native ${label} session`;
     let failedSince;
     while (!stop.signal.aborted) {
       await delay(2000, undefined, { signal: stop.signal });
@@ -251,8 +276,11 @@ async function main() {
           throw new BridgeError("Lost contact with Paseo. Releasing the Harness session.");
         }
       }
-      if (currentProviders) checkProviderCommand(currentProviders.claude,
-        join(harnessHome, "scripts", "paseo-claude.py"), "Claude");
+      if (currentProviders) {
+        if (provider === "codex") checkCodexCommand(currentProviders.codex);
+        else checkProviderCommand(currentProviders.claude,
+          join(harnessHome, "scripts", "paseo-claude.py"), "Claude");
+      }
     }
   } catch (error) {
     if (!stop.signal.aborted) {
