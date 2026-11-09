@@ -23,7 +23,7 @@ from fixtures.codex_native_model import Model
 from test_native_codex import CODEX
 from test_paseo import ROOT, SCRIPTS
 
-ORCA = None  # Orca Codex integration is added by patch 4.
+ORCA = os.environ.get("RH_TEST_ORCA_CLI")
 PASEO = os.environ.get("RH_TEST_PASEO_NODE_MODULES")
 PASEO_DRIVER = ROOT / "tests" / "fixtures" / "codex_native_paseo.mjs"
 PROMPT = "RH_START_CHILD Start the fixture subagent."
@@ -243,6 +243,12 @@ supports_websockets = false
                 "type": "command", "agent": "codex", "value": str(self.scripts / "native-codex.py"),
             })
             with self.bridge("orca") as (bridge, session_id):
+                catalog = orca.call("worktree.ps", {"limit": 10000,
+                                                    "supportsWorktreeVisibilitySourceDefaults": True})
+                visible = [row for row in catalog["worktrees"] if row["path"] == str(self.mount)]
+                self.assertEqual(len(visible), 1, "The desktop client must discover the Harness workspace")
+                self.assertEqual(visible[0]["workspaceKind"], "folder-workspace")
+
                 def page():
                     return orca.call("agentSession.history", {
                         "sessionId": session_id, "direction": "tail", "limit": 80,

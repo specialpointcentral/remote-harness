@@ -216,15 +216,15 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
 
 ### Paseo 原生聊天
 
-在项目主机运行 bootstrap 时选择 `--launch claude --ui paseo`。Harness 先建立挂载和本机命令路由，
-再由远端 Paseo 创建 Claude 会话。项目主机保持启动器运行，手机连接同一台远端 Paseo 后即可打开会话。
-[安装与会话生命周期](docs/paseo.cn.md)
+在项目主机运行 bootstrap，选择 `--launch claude` 或 `--launch codex` 并追加 `--ui paseo`。
+Harness 建立挂载和本机命令路由，再由远端 Paseo 创建会话。保持项目主机的启动器运行，在已配对的
+Paseo 客户端中打开会话。[Claude 设置](docs/paseo.cn.md) · [Codex 设置](docs/codex-native.cn.md)
 
 ### Orca 原生聊天
 
-在项目主机运行 bootstrap 时选择 `--launch claude --ui orca`。同一台 Agent 主机上的 Orca Server
-和 Claude 使用该会话的专用挂载和命令路由。项目主机保持启动器运行，手机或桌面客户端打开原生会话。
-[安装与会话生命周期](docs/orca.cn.md)
+在项目主机运行 bootstrap，选择 `--launch claude` 或 `--launch codex` 并追加 `--ui orca`。
+Agent 主机上的 Orca Server 为聊天建立专用挂载和命令路由。保持项目主机的启动器运行，在已配对的手机
+或桌面客户端打开会话。[Claude 设置](docs/orca.cn.md) · [Codex 设置](docs/codex-native.cn.md)
 
 ### 断线与会话恢复
 
@@ -357,7 +357,7 @@ remote-harness/
   Agent 自动审核审批请求；远端 CLI 不支持时（以及 opencode）退回普通审批并给出提示。`--approval normal`
   恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 1.x 的 `permission:allow`
   只写进**本次会话**的配置，2.x 改用本次启动的 `--auto` 参数，退出即失效。
-- Claude、Codex、opencode 的每个 Bash 调用都被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
+- Claude、终端 Codex 和 opencode 的 Bash 调用被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
   自动审核看到的是原命令。Claude 仍按你选的审批模式处理：普通模式询问，auto 模式由自动审核判断，YOLO
   不询问。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
   deny 规则命中命令中任一段（含 `$(...)`、`sudo` 包装）即拒绝，ask 规则强制询问；allow 规则只在普通、
@@ -628,17 +628,17 @@ Notes:
 
 ### Native Paseo chat
 
-Select `--launch claude --ui paseo` in the bootstrap on the project host. Harness sets up the
-mount and command routing, then the remote Paseo daemon creates a Claude conversation. Keep the
-launcher running on the project host and open the conversation from the phone paired to that daemon.
-[Setup and session lifecycle](docs/paseo.md)
+Select `--launch claude` or `--launch codex` and add `--ui paseo` to the project-host bootstrap.
+Harness sets up the mount and command routing, then the remote Paseo daemon creates the chat.
+Keep the launcher running and open the chat on the paired client.
+[Claude setup](docs/paseo.md) · [Codex setup](docs/codex-native.md)
 
 ### Native Orca chat
 
-Select `--launch claude --ui orca` in the bootstrap on the project host. Orca Server and Claude
-run on the same agent host and use this chat's mount and command routing. Keep the project-host
-launcher running while using the native chat from a paired phone or desktop.
-[Setup and session lifecycle](docs/orca.md)
+Select `--launch claude` or `--launch codex` and add `--ui orca` to the project-host bootstrap.
+Orca Server runs on the agent host. The chat has a dedicated mount and command route. Keep the
+project-host launcher running while using the chat from a paired phone or desktop.
+[Claude setup](docs/orca.md) · [Codex setup](docs/codex-native.md)
 
 ### Disconnects and resuming
 
@@ -797,7 +797,7 @@ remote-harness/
   prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode 1.x's
   `permission:allow` goes into the **per-session** config only, 2.x gets this launch's `--auto` flag,
   and both are gone on exit.
-- Claude, Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
+- Claude, terminal Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
   approval prompts and automatic review show the original command. Claude still applies your approval
   mode: normal asks, auto lets the classifier decide, YOLO does not ask. Claude can match permission
   rules only against the rewritten text, so the hook checks the original command against your

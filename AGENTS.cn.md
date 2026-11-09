@@ -20,9 +20,9 @@
 - `scripts/run-on-project-host.sh`：校验后的本机项目命令和工具 dispatcher。
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
-- `scripts/paseo-session.mjs` / `paseo-guard.py`：创建并保护 Paseo 原生 Claude 会话。
-- `scripts/orca-session.py`：创建 Orca 原生 Claude 会话。
-  `orca-claude.py` 和 `orca_native.py` 将配置的 Claude 命令绑定到私有会话身份和 lease。
+- `scripts/paseo-session.mjs` / `orca-session.py`：创建原生 Claude 和 Codex 会话。
+  `paseo-guard.py` / `orca-claude.py` 保护 Claude 工具调用。`native-codex.py` 将 Codex
+  app server 绑定到会话的私有 lease，`codex-project-tools.py` 提供路由工具。
 - `scripts/channel-guard.py`：在路由 Bash 命令存续期间持有其 SSH 通道。
 - `scripts/warm_pool.py`：每会话一个、在 gateway 的 wait 动词上预先打开通道的通道池（`serve`），以及
   channel-guard 和工具垫片使用的客户端部分。
@@ -44,8 +44,11 @@
   启动主 Agent。桥接进程在归档和退出前撤销 lease；通道清理后，全工具 hook 拒绝旧 Paseo 会话的
   工具调用。
 - 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
-  创建原生 Claude 聊天。包装器将 Claude UUID 和挂载绑定到 lease。清理后需保留 UUID 和挂载的
+  创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
   预留记录，避免旧聊天获得新路由。
+- 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
+  使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
+  文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。
 - Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。
 - 生成的 Claude 会话设置会保持 hooks 启用，即使项目设置了 `disableAllHooks`。
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成

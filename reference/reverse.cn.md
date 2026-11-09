@@ -101,15 +101,15 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 
 ## Paseo 原生聊天
 
-选择 `--launch claude --ui paseo` 时，第 6 步在 Agent 主机启动 Harness 桥接进程，由它请求 Paseo
-守护进程创建原生 Claude 会话，继续使用相同的会话级路由。在 Paseo 中归档或删除该会话会结束 Harness
-会话。第 9 步的 CLI 恢复提示适用于终端会话。[设置与会话生命周期](../docs/paseo.cn.md)
+为 `--launch claude` 或 `--launch codex` 选择 `--ui paseo` 时，第 6 步在 Agent 主机启动 Harness 桥接进程，由它请求 Paseo
+守护进程创建原生会话，继续使用相同的会话级路由。在 Paseo 中归档或删除该会话会结束 Harness
+会话。第 9 步的 CLI 恢复提示适用于终端会话。[Claude 设置](../docs/paseo.cn.md) · [Codex 设置](../docs/codex-native.cn.md)
 
 ## Orca 原生聊天
 
-选择 `--launch claude --ui orca` 时，启动器在第 6 步前为此会话预留专用挂载点。Agent 主机上的
-桥接进程请求 Orca Server 创建原生 Claude 标签页。关闭会话或归档其文件夹工作区会结束 Harness
-会话。[设置与会话生命周期](../docs/orca.cn.md)
+为 `--launch claude` 或 `--launch codex` 选择 `--ui orca` 时，启动器在第 6 步前为此会话预留专用挂载点。Agent 主机上的
+桥接进程请求 Orca Server 创建原生聊天标签页。关闭会话或归档其文件夹工作区会结束 Harness
+会话。[Claude 设置](../docs/orca.cn.md) · [Codex 设置](../docs/codex-native.cn.md)
 
 ## 前置条件
 

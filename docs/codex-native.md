@@ -1,7 +1,4 @@
-# Native Codex chat in Paseo
-
-> Patch 3 enables Paseo + Codex only. Orca + Claude remains available; patch 4 enables Orca + Codex.
-
+# Native Codex chat in Paseo and Orca
 
 The reverse launcher runs on the project host. The agent host runs the manager and a private
 Codex app server for each Harness chat. Open the conversation on a client paired to that manager.
@@ -10,7 +7,8 @@ Project files remain on the project host.
 ## Agent host setup
 
 Install the current Harness scripts. Native Codex requires **codex-cli 0.167.0** and **Python
-3.11+** in the Harness SSH login environment. Use Paseo daemon **0.15.3** with Node.js 22+. The manager and the Harness login must run as the same Unix user.
+3.11+** in the Harness SSH login environment. Use Paseo daemon **0.15.3** with Node.js 22+, or
+Orca Server **1.4.251**. The manager and the Harness login must run as the same Unix user.
 For client installation and pairing, see the [Paseo guide](paseo.md) or [Orca guide](orca.md).
 
 On the agent host, set the actual Codex executable in a private file. Substitute its absolute path.
@@ -29,7 +27,13 @@ printf '%s\n' "$rh/scripts/native-codex.py"
   In the daemon config this is `agents.providers.codex.command = ["<absolute wrapper path>"]`
   (JSON). Install the pinned Paseo client as described in the [Paseo guide](paseo.md). Optionally
   set `RH_PASEO_MODEL` in the Harness SSH login environment.
-
+- **Orca.** Set the server's Codex **Command** to the same wrapper path, with empty Codex
+  **Arguments**. Create a private `$RH_HOME/orca/codex.json` containing `{}` if you use the default
+  server profile and project group. Set mode 700 on the `orca` directory and mode 600 on the file.
+  Optional keys `profile`, `projectGroupId` and `model` select the server profile, local project
+  group and initial Codex model as in the [Orca guide](orca.md). The group must have a folder path
+  so the workspace appears in the desktop client's remote workspace list. Harness checks that
+  list before reporting the chat ready.
 
 Keep the wrapper selected when reopening native Harness chats. For ordinary manager chats the
 wrapper passes through to the configured Codex executable. The wrapper uses the manager's selected
@@ -50,7 +54,7 @@ with the appropriate UI.
 ```bash
 bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh" \
   --mode reverse --launch codex --ui paseo --approval normal
-# Patch 4 adds Orca Codex support.
+# For Orca, use --ui orca.
 ```
 
 Open the Codex conversation in the paired app and send the first prompt there. The chat uses
@@ -75,6 +79,12 @@ default full-history fork or start with fresh context via `fork_turns="none"`. C
 model's collaboration metadata to decide whether a child can spawn further descendants. Separate
 workspaces require separate launches.
 
+In an Orca Harness workspace, use the chat created by the launcher. Clicking **+** to open
+another Codex chat does not register a new Harness connection: the configured wrapper refuses
+that chat before starting Codex and tells you to return to the existing chat or rerun your
+original Harness launch command on the project host. Orca Server 1.4.251 has no per-workspace
+setting to disable **+**, so an unusable chat tab may still appear. Close only that extra tab.
+Keep the configured wrapper selected for this protection to apply.
 Paseo also reserves each Harness workspace under `$RH_HOME/.paseo-workspaces`; its Codex wrapper
 refuses ordinary chats in those directories while allowing ordinary chats elsewhere. Preserve
 these reservations after cleanup. If Claude is also enabled, configure its wrapper as described

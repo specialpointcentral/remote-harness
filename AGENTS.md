@@ -18,9 +18,9 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/run-on-project-host.sh`: validated local project command and tool dispatcher.
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
-- `scripts/paseo-session.mjs` / `paseo-guard.py` create and guard a native Paseo Claude session.
-- `scripts/orca-session.py` creates a native Orca Claude chat. `orca-claude.py` and
-  `orca_native.py` bind the configured Claude command to a private session identity and lease.
+- `scripts/paseo-session.mjs` / `orca-session.py` create native Claude and Codex chats.
+  `paseo-guard.py` / `orca-claude.py` protect Claude tool calls. `native-codex.py` binds the
+  Codex app server to the chat's private lease, and `codex-project-tools.py` provides its routed tools.
 - `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
 - `scripts/warm_pool.py`: per-session pool of channels opened ahead of time on the gateway's wait
   verb (`serve`), and the client half channel-guard and the tool shim use.
@@ -45,22 +45,27 @@ it provides files over SSHFS and executes project commands through a forced gate
   With Claude and `--ui paseo`, the same SSH session owns the Harness bridge while the same-host
   Paseo daemon starts the main agent with the injected settings. The bridge revokes its lease
   before archive and exit. An all-tool hook blocks a stale Paseo agent after transport cleanup.
-- With `--ui orca`, the bridge owns one reserved mount and creates a native Claude chat on the
-  same-host Orca Server. The configured wrapper binds the provider UUID and mount to a lease.
+- With `--ui orca`, the bridge owns one reserved mount and creates a native chat on the
+  same-host Orca Server. The configured wrapper binds the chat identity and mount to a lease.
   Keep the identity and mount reservations across cleanup so old chats cannot acquire a new route.
-- Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
+- With Codex and either native UI, the configured wrapper starts a private stdio app server with
+  built-in shell and code execution disabled. The app server enforces native approval on the
+  private MCP command tool. The command tool checks the lease, gateway policy and Codex rules
+  before running the project-host runner. Native file edits use the mount. The app server stops
+  when the bridge lease ends, and old sessions cannot resume with a different mount or account.
+- Claude/Codex/opencode shell commands route locally. Agent/Spawn tools stay on the remote host.
 - Claude requires 2.1.295+ and its routing hook must set `onFailure: "block"`; a cancelled or broken
   hook must never let the original Bash command run on the agent host. Generated session settings
   keep hooks enabled even when project settings set `disableAllHooks`. Routing hook budgets exceed
   the inner command-policy timeout. New settings require a new harness session.
 - The Claude hook never returns a permission decision for a routed call: `allow` skips Claude's
   prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so
-  the user's approval mode judges the original command. The Codex hook and the opencode plugin write
+  the user's approval mode judges the original command. The terminal Codex hook and the opencode plugin write
   the same form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
 - Since Claude sees only rh-run, its hook applies the user's own rules to the original command:
   `Bash(...)` deny/ask on any simple command the shared lexer finds, allow only for a plain single
   command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their
-  identity changes. Codex and opencode check the original themselves: their rewrite repeats it on a
+  identity changes. Terminal Codex and opencode check the original themselves: their rewrite repeats it on a
   new line after `exit`, which the shell never parses, and Codex's exec policy (`.rules`, forced `rm`)
   and opencode's bash rules read it; the opencode plugin also sets the original's own workdir.
 - Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc`. `rh-session` blanks the

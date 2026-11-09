@@ -1,5 +1,7 @@
 # 在 Orca 原生聊天中使用 Claude
 
+Codex 请参阅[原生 Codex 设置](codex-native.cn.md)。本页适用于 Claude。
+
 在项目主机运行反向 bootstrap。项目文件保留在项目主机，经过路由的 Bash 命令由项目主机上的强制
 SSH 网关执行。Agent 主机运行 Orca Server 和 Claude Code。Claude 通过 SSHFS 挂载读写文件，
 经过路由的 Git 和 ripgrep 扫描也在项目主机执行。

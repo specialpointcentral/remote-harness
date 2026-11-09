@@ -108,16 +108,16 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 
 ## Native Paseo chat
 
-With `--launch claude --ui paseo`, step 6 starts the Harness bridge on the agent host. The bridge
-creates a native Claude conversation through the Paseo daemon using the same per-session routing.
+With `--ui paseo` and `--launch claude` or `--launch codex`, step 6 starts the Harness bridge on the agent host. The bridge
+creates a native conversation through the Paseo daemon using per-session routing.
 Archiving or deleting it in Paseo ends the Harness session. The CLI resume offer in step 9 applies
-to terminal sessions. [Setup and session lifecycle](../docs/paseo.md)
+to terminal sessions. [Claude setup](../docs/paseo.md) · [Codex setup](../docs/codex-native.md)
 
 ## Native Orca chat
 
-With `--launch claude --ui orca`, the launcher reserves a mount for this chat before step 6. The
-agent-host bridge requests a native Claude tab from Orca Server. Closing the chat or archiving
-its folder workspace ends the Harness session. [Setup and session lifecycle](../docs/orca.md)
+With `--ui orca` and `--launch claude` or `--launch codex`, the launcher reserves a mount for this chat before step 6. The
+agent-host bridge requests a native chat tab from Orca Server. Closing the chat or archiving
+its folder workspace ends the Harness session. [Claude setup](../docs/orca.md) · [Codex setup](../docs/codex-native.md)
 
 ## Preconditions
 

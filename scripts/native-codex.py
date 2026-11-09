@@ -23,6 +23,11 @@ PASEO_LEASE = "paseo-lease.json"
 PASEO_SESSION_ENV = "RH_CODEX_SESSION"
 PASEO_TOKEN_ENV = "RH_CODEX_TOKEN"
 MAX_FRAME = 128 * 1024 * 1024
+ORCA_CHAT_REQUIRED = (
+    "This Codex invocation is outside its registered Orca Harness chat. "
+    "Open the existing Harness chat instead of using '+'. "
+    "To open another chat, rerun the original Harness launch command on the project host."
+)
 MCP_ONLY_APPROVAL = {"granular": {
     "sandbox_approval": False,
     "rules": False,
@@ -95,10 +100,10 @@ def orca_binding(home, cwd, env):
     protected = home / MOUNTS
     if record is None:
         if cwd == protected or protected in cwd.parents:
-            raise OrcaError("This Codex invocation is outside its registered Orca Harness chat.")
+            raise OrcaError(ORCA_CHAT_REQUIRED)
         return None
     if not env.get("ORCA_AGENT_SESSION_SPAWN_TOKEN") or record["cwd"] != str(cwd):
-        raise OrcaError("This Codex invocation is outside its registered Orca Harness chat.")
+        raise OrcaError(ORCA_CHAT_REQUIRED)
     if not SESSION_NAME.fullmatch(record["session"]):
         raise OrcaError("Invalid Orca Harness session registration.")
     return home / ".sessions" / record["session"], LEASE, record["token"]

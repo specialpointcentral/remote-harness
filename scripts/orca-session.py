@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one native Orca Claude chat while the reverse Harness owns its transport."""
+"""Run one native Orca chat while the reverse Harness owns its transport."""
 import fcntl
 import hashlib
 import json
@@ -13,7 +13,7 @@ import sys
 import time
 import uuid
 
-from orca_native import (IDENTITIES, LEASE, MOUNTS, OrcaError, check_version, claude_command,
+from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, OrcaError, check_version, claude_command,
                          config, private_dir, private_json, probe_claude, process_identity,
                          write_once)
 
@@ -96,11 +96,11 @@ def native_create(session_id, fields):
     return {"envelope": envelope, **fields}
 
 
-def check_wrapper(settings, wrapper):
-    configured = Path(settings.get("agentCmdOverrides", {}).get("claude") or "")
+def check_wrapper(settings, wrapper, agent):
+    configured = Path(settings.get("agentCmdOverrides", {}).get(agent) or "")
     if (not configured.is_absolute() or configured.parent.parent.resolve() != wrapper.parent.parent
             or configured.resolve() != wrapper.resolve()):
-        raise OrcaError(f"Set the Orca Server Claude Command to {wrapper} before using --ui orca.")
+        raise OrcaError(f"Set the Orca Server {agent.title()} Command to {wrapper} before using --ui orca.")
 
 
 def project_group(client, home, configuration):
@@ -163,44 +163,60 @@ def published_workspace(client, workspace, cwd):
                for row in catalog["worktrees"])
 
 
-def lease_environment(session):
+def lease_environment(session, agent):
     shim, _, rest = os.environ.get("PATH", "").partition(os.pathsep)
     if not shim or Path(shim).resolve() != session / "bin":
         raise OrcaError("Orca cannot start without the Harness PATH shims.")
-    env = {key: os.environ[key] for key in ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
-           "CLAUDE_CODE_BASH_EDIT_DIFF", "USE_BUILTIN_RIPGREP", "SSH_CONNECTION", "SSH_CLIENT")
-           if key in os.environ}
+    keys = ["SSH_CONNECTION", "SSH_CLIENT"]
+    if agent == "claude":
+        keys.extend(("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "CLAUDE_CODE_BASH_EDIT_DIFF",
+                     "USE_BUILTIN_RIPGREP"))
+    env = {key: os.environ[key] for key in keys if key in os.environ}
     env["PATH"] = os.pathsep.join((str(session / "bin"), rest))
     return env
 
 
 def main():
-    approval, python = sys.argv[1:]
+    approval, python, *args = sys.argv[1:]
+    agent = args[0] if args else "claude"
+    if agent not in ("claude", "codex"):
+        raise OrcaError("Unsupported Orca Harness agent.")
+    label = agent.title()
     session = Path(__file__).resolve().parent.parent
     project = (session / "orca-project-title").read_text(encoding="utf8")
     home = session.parent.parent
     cwd = Path.cwd()
     if cwd.parent != private_dir(home / MOUNTS):
         raise OrcaError("Orca Harness requires a reserved per-launch mount.")
-    wrapper = home / "scripts" / "orca-claude.py"
-    configuration = config(home)
+    wrapper = home / "scripts" / ("native-codex.py" if agent == "codex" else "orca-claude.py")
+    configuration = config(home, agent)
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
-        raise OrcaError("Install the Orca Harness Claude wrapper on the agent host.")
-    command = claude_command(configuration, wrapper)
+        raise OrcaError("Install the Orca Harness command wrapper on the agent host.")
     client = OrcaClient(configuration)
     status = client.call("status.get")
     if status.get("appVersion") != ORCA_VERSION:
         raise OrcaError(f"Orca Harness requires Orca Server {ORCA_VERSION}.")
     if status.get("graphStatus") != "ready":
         raise OrcaError("Start Orca Server and wait for its workspace graph to become ready.")
-    check_wrapper(client.call("settings.get")["settings"], wrapper)
-    check_version(command)
-    if approval == "auto" and '"auto"' not in probe_claude(command, "--help"):
-        print("remote-harness: Claude does not advertise auto. Using normal approvals.", file=sys.stderr)
-        approval = "normal"
-    session_id = f"claude_{uuid.uuid4().hex}"
-    provider_id = str(uuid.UUID(bytes=hashlib.sha256(f"orca-claude:{session_id}".encode()).digest()[:16],
-                                version=4))
+    check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
+    launch_settings = {}
+    session_id = f"{agent}_{uuid.uuid4().hex}"
+    if agent == "claude":
+        command = claude_command(configuration, wrapper)
+        check_version(command)
+        if approval == "auto" and '"auto"' not in probe_claude(command, "--help"):
+            print("remote-harness: Claude does not advertise auto. Using normal approvals.", file=sys.stderr)
+            approval = "normal"
+        launch_settings["claude"] = str(command.resolve())
+        provider_id = str(uuid.UUID(bytes=hashlib.sha256(
+            f"orca-claude:{session_id}".encode()).digest()[:16], version=4))
+    else:
+        try:
+            subprocess.run([python, "-EsB", str(wrapper), "check-harness-version"], check=True,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise OrcaError("Native Harness Codex requires Python 3.11+, codex-cli 0.167.0 and the private codex.json.") from error
+        provider_id = session_id
     lease_path = session / LEASE
     token = str(uuid.uuid4())
     stopped = False
@@ -236,23 +252,23 @@ def main():
         if stopped:
             return
         selector = f"id:folder:{workspace}"
-        fields = {"agent": "claude", "worktree": selector}
+        fields = {"agent": agent, "worktree": selector}
         if client.call("agentSession.createSupport", fields).get("supported") is not True:
-            raise OrcaError("Orca Server cannot create a native Claude chat in this folder.")
-        check_wrapper(client.call("settings.get")["settings"], wrapper)
+            raise OrcaError(f"Orca Server cannot create a native {label} chat in this folder.")
+        check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
         fields["options"] = {"permissionMode": PERMISSION_MODES[approval]}
         if model := configuration.get("model"):
             fields["options"]["model"] = model
         # Reserve this identity forever. Removing transport state cannot turn an old chat
         # into a normal Claude launch, including a resume from a different working directory.
-        registry = private_dir(home / IDENTITIES, create=True)
+        registry = private_dir(home / (CODEX_CHATS if agent == "codex" else IDENTITIES), create=True)
         write_once(registry / f"{provider_id}.json", {
             "cwd": str(cwd), "session": session.name, "token": token,
         })
         write_once(lease_path, {
             "token": token, "pid": os.getpid(), "identity": process_identity(os.getpid()),
-            "python": python, "approval": approval, "claude": str(command.resolve()),
-            "env": lease_environment(session),
+            "python": python, "approval": approval, "cwd": str(cwd), **launch_settings,
+            "env": lease_environment(session, agent),
         })
         leased = True
         if stopped:
@@ -260,14 +276,14 @@ def main():
         create_attempted = True
         receipt = client.call("agentSession.create", native_create(session_id, fields), timeout=30)
         if receipt.get("ok") is not True or receipt.get("value", {}).get("sessionId") != session_id:
-            raise OrcaError("Orca Server did not confirm the requested native Claude chat.")
+            raise OrcaError(f"Orca Server did not confirm the requested native {label} chat.")
         if stopped:
             return
         if not visible_chat(client, selector, session_id):
-            raise OrcaError("Orca Server did not publish the native Claude chat.")
+            raise OrcaError(f"Orca Server did not publish the native {label} chat.")
         if not published_workspace(client, workspace, cwd):
             raise OrcaError("Orca Server did not publish the Harness workspace in its remote workspace list.")
-        print(f"remote-harness: Orca Claude chat {session_id} is ready. Open it in Orca.", flush=True)
+        print(f"remote-harness: Orca {label} chat {session_id} is ready. Open it in Orca.", flush=True)
         unavailable = None
         while not stopped:
             time.sleep(2)
@@ -286,7 +302,7 @@ def main():
                     raise OrcaError("Lost contact with Orca Server. Releasing the Harness session.")
             else:
                 unavailable = None
-                check_wrapper(settings, wrapper)
+                check_wrapper(settings, wrapper, agent)
     finally:
         revoke()
         if create_attempted and not closed:

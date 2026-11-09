@@ -60,7 +60,56 @@ def prepare_proxy(fixture, cli, account_config):
 
 
 class NativeCodexTests(PaseoFixture):
-    def test_reverse_injector_prepares_paseo_native_codex_bridge(self):
+    def test_orca_extra_chats_are_blocked_before_codex_starts(self):
+        scripts = self.rh / "scripts"
+        scripts.mkdir(parents=True)
+        for name in ("native-codex.py", "orca_native.py", "native_workspace.py"):
+            shutil.copy2(SCRIPTS / name, scripts / name)
+        cli = self.script("codex", 'touch "$HOME/codex-started"\n')
+        config = self.rh / "codex.json"
+        config.write_text(json.dumps({"codex": str(cli)}))
+        config.chmod(0o600)
+        mounts = self.rh / ".orca-mounts"
+        mounts.mkdir(mode=0o700)
+        mount = mounts / "registered project"
+        mount.mkdir()
+        subdir = mount / "subdir"
+        subdir.mkdir()
+        registry = self.rh / ".orca-codex-chats"
+        registry.mkdir(mode=0o700)
+        registered = "codex_" + "a" * 32
+        record = registry / (registered + ".json")
+        record.write_text(json.dumps({"cwd": str(mount), "session": "bound", "token": "test"}))
+        record.chmod(0o600)
+        launch = [sys.executable, "-EsB", str(scripts / "native-codex.py"), "app-server"]
+        # Orca generates underscored UUIDs for chats opened through '+'. Also cover a
+        # missing identity, an unregistered Harness-shaped ID, and a mismatched mount.
+        extra = "codex_12345678_1234_1234_1234_123456789abc"
+        for cwd, identity, spawn_token in (
+            (mount, extra, "spawn"), (subdir, extra, "spawn"),
+            (mounts, extra, "spawn"), (mount, "", "spawn"),
+            (mount, "codex_" + "b" * 32, "spawn"),
+            (mount, registered, ""), (self.home, registered, "spawn"),
+        ):
+            with self.subTest(cwd=cwd, identity=identity, spawn_token=spawn_token):
+                env = {**self.env, "ORCA_AGENT_SESSION_ID": identity,
+                       "ORCA_AGENT_SESSION_SPAWN_TOKEN": spawn_token}
+                result = subprocess.run(launch, cwd=cwd, env=env, input="",
+                                        capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Open the existing Harness chat", result.stderr)
+                self.assertIn("original Harness launch command on the project host", result.stderr)
+                self.assertFalse((self.home / "codex-started").exists())
+        # The same normal Orca identity still launches outside a Harness workspace.
+        env = {**self.env, "ORCA_AGENT_SESSION_ID": extra,
+               "ORCA_AGENT_SESSION_SPAWN_TOKEN": "spawn"}
+        result = subprocess.run(launch, cwd=self.home, env=env, input="",
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.home / "codex-started").exists())
+
+    def test_reverse_injector_prepares_both_native_codex_bridges(self):
         self.script("ssh", "exit 1\n")
         self.script("node", "exit 1\n")
         self.env.update(RH_WARM_MAX="0", RH_HEARTBEAT_TIMEOUT="0")
@@ -70,7 +119,7 @@ class NativeCodexTests(PaseoFixture):
         transport.mkdir(parents=True)
         config = transport / "ssh_config"
         config.touch()
-        for manager in ("paseo",):
+        for manager in ("paseo", "orca"):
             with self.subTest(manager=manager):
                 result = subprocess.run(
                     ["bash", str(SCRIPTS / "inject-rule.sh"), "on", "codex", "/project", "testbox",

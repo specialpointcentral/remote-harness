@@ -1,7 +1,4 @@
-# 在 Paseo 中使用原生 Codex 聊天
-
-> 本系列第 3 个补丁仅启用 Paseo + Codex；Orca + Claude 保持可用，Orca + Codex 由第 4 个补丁启用。
-
+# 在 Paseo 和 Orca 中使用原生 Codex 聊天
 
 反向启动器运行在项目主机。Agent 主机运行管理器，并为每个 Harness 会话启动独立的 Codex app server。
 在已配对的管理器客户端中打开聊天。项目文件留在项目主机。
@@ -9,7 +6,7 @@
 ## Agent 主机设置
 
 安装当前版本的 Harness 脚本。原生 Codex 要求 **codex-cli 0.167.0**，且 Harness 的 SSH 登录环境
-需要 **Python 3.11+**。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+。
+需要 **Python 3.11+**。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+，或 Orca Server **1.4.251**。
 管理器和 Harness 登录必须使用同一个 Unix 账号。安装客户端和配对的步骤见
 [Paseo 指南](paseo.cn.md)或 [Orca 指南](orca.cn.md)。
 
@@ -28,7 +25,12 @@ printf '%s\n' "$rh/scripts/native-codex.py"
 - **Paseo**。把 Codex provider 的 command 设为只包含上述包装器绝对路径的数组。守护进程 JSON 配置
   中对应 `agents.providers.codex.command`。按 [Paseo 指南](paseo.cn.md)安装固定版本的 Paseo 客户端。
   可在 Harness SSH 登录环境设置 `RH_PASEO_MODEL`。
-
+- **Orca**。把服务端 Codex **Command** 设为同一个包装器路径，Codex **Arguments** 留空。
+  使用默认服务端 profile 和项目分组时，创建只含 `{}` 的私有 `$RH_HOME/orca/codex.json`。
+  将 `orca` 目录权限设为 700，文件权限设为 600。可选的 `profile`、`projectGroupId` 和 `model`
+  分别选择服务端 profile、本地项目分组和初始 Codex 模型，规则见 [Orca 指南](orca.cn.md)。分组
+  必须带有目录路径，工作区才能出现在桌面客户端的远程工作区列表中。Harness 会检查该列表后再报告
+  聊天就绪。
 
 重新打开原生 Harness 聊天时也保留该包装器。管理器的普通聊天由包装器直接交给已配置的 Codex。
 包装器使用管理器所选 Codex 账号（`CODEX_HOME`，默认 `~/.codex`）及 provider 环境。
@@ -45,7 +47,7 @@ ID、协作元数据及所配置的 provider。仅用系统钥匙串登录时，
 ```bash
 bash "${RH_HOME:-$HOME/.remote-harness}/scripts/simple-bootstrap.sh" \
   --mode reverse --launch codex --ui paseo --approval normal
-# Orca Codex 接入由下一个补丁提供。
+# 使用 Orca 时改为 --ui orca。
 ```
 
 在已配对的应用中打开 Codex 聊天并发送首条消息。聊天通过 Harness 的私有 `remote_harness` MCP
@@ -64,6 +66,10 @@ MCP 审批。该会话排除项目 Codex 配置、外部 MCP server、插件和�
 默认继承完整历史，也可以用 `fork_turns="none"` 从空白上下文开始。Codex 根据模型的协作元数据判断
 子代理能否继续派生。不同工作区分别启动会话。
 
+在 Orca 的 Harness 工作区中，请使用启动器创建的聊天。点击 **＋** 新建 Codex 聊天不会登记新的
+Harness 连接：已配置的包装器会在启动 Codex 前拒绝该聊天，并提示返回已有聊天，或在项目主机重新
+运行原来的 Harness 启动命令。Orca Server 1.4.251 没有按工作区禁用 **＋** 的设置，因此界面仍可能
+出现一个无法使用的聊天标签页，只需关闭这个额外标签页。保持已配置的包装器设置，此保护才会生效。
 Paseo 也会在 `$RH_HOME/.paseo-workspaces` 预留各个 Harness 工作区，Codex 包装器会拒绝在这些
 目录中创建普通聊天，其他目录不受影响。清理后仍需保留这些记录。如果同时启用 Claude，按
 [Paseo 指南](paseo.cn.md)或 [Orca 指南](orca.cn.md)配置其包装器，防止切换 provider 后绕过

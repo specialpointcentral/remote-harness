@@ -38,10 +38,10 @@ class OrcaOptionTests(PaseoFixture):
     def test_public_bootstrap_rejects_other_providers(self):
         result = subprocess.run(
             ["bash", str(SCRIPTS / "simple-bootstrap.sh"), "--mode", "reverse",
-             "--launch", "codex", "--ui", "orca"],
+             "--launch", "opencode", "--ui", "orca"],
             env=self.env, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("--ui orca requires --launch claude", result.stderr)
+        self.assertIn("--ui orca requires --launch claude or codex", result.stderr)
 
     def test_explicit_mount_is_refused_before_ssh(self):
         self.script("ssh", 'touch "$HOME/ssh-ran"\nexit 1\n')

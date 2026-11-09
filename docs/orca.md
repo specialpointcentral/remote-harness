@@ -1,5 +1,7 @@
 # Native Orca chat for Claude
 
+For Codex, follow the [native Codex setup](codex-native.md). This page covers Claude.
+
 Run the reverse bootstrap on the project host. Its files stay there and its forced SSH gateway
 executes routed Bash commands there. The agent host runs Orca Server and Claude Code. Read and
 edit tools use the SSHFS mount. Claude's routed Git and ripgrep scans also run on the project host.

@@ -89,8 +89,7 @@ case "$LAUNCH" in claude|codex|opencode) ;; *) printf 'unsupported --launch %s\n
 
 case "$UI" in
   terminal) ;;
-  paseo) case "$LAUNCH" in claude|codex) ;; *) printf '%s\n' "--ui $UI requires --launch claude or codex" >&2; exit 2;; esac;;
-  orca) [ "$LAUNCH" = claude ] || { printf '%s\n' "--ui $UI requires --launch claude" >&2; exit 2; };;
+  paseo|orca) case "$LAUNCH" in claude|codex) ;; *) printf '%s\n' "--ui $UI requires --launch claude or codex" >&2; exit 2;; esac;;
   *) printf 'unsupported --ui %s (expected terminal|paseo|orca)\n' "$UI" >&2; exit 2;;
 esac
 
