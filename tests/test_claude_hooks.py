@@ -138,8 +138,12 @@ class ModelFixture(BaseHTTPRequestHandler):
 
 @unittest.skipUnless(CLAUDE, 'set RH_TEST_CLAUDE_CLI to test an installed Claude on the agent host')
 class ClaudeHookRuntimeTests(ClaudeSessionFixture):
-    def run_cli(self, failure=None, protect=True):
+    def run_cli(self, failure=None, protect=True, project_disables_hooks=False):
         settings = self.settings()
+        if project_disables_hooks:
+            project_settings = self.mount / '.claude'
+            project_settings.mkdir()
+            (project_settings / 'settings.local.json').write_text('{"disableAllHooks":true}')
         hook = settings['hooks']['PreToolUse'][0]['hooks'][0]
         if failure == 'timeout':
             # Sleep before Python can catch anything. Use the real generated timeout, not a mock
@@ -171,8 +175,8 @@ class ClaudeHookRuntimeTests(ClaudeSessionFixture):
                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', DISABLE_AUTOUPDATER='1',
                    CLAUDE_CODE_AUTO_MODE_SERVER='0')
         command = [CLAUDE, '-p', 'Run the fixture command once.', '--model', 'claude-sonnet-4-6',
-                   '--permission-mode', 'bypassPermissions', '--setting-sources', '',
-                   '--settings', str(path), '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+                   '--permission-mode', 'bypassPermissions', '--setting-sources',
+                   'user,project,local' if project_disables_hooks else '', '--settings', str(path), '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
                    '--tools', 'Bash', '--output-format', 'json', '--max-turns', '3']
         process = subprocess.Popen(command, cwd=self.mount, env=env, text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -191,6 +195,11 @@ class ClaudeHookRuntimeTests(ClaudeSessionFixture):
 
     def test_success_routes_without_executing_in_agent_directory(self):
         self.run_cli()
+        self.assertFalse((self.mount / 'execution-marker').exists())
+        self.assertEqual((self.project / 'execution-marker').read_text(), 'executed')
+
+    def test_project_settings_cannot_disable_harness_routing_hooks(self):
+        self.run_cli(project_disables_hooks=True)
         self.assertFalse((self.mount / 'execution-marker').exists())
         self.assertEqual((self.project / 'execution-marker').read_text(), 'executed')
 

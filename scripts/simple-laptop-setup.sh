@@ -178,13 +178,14 @@ cache_save() (
   chmod 600 "$_tmp" && mv "$_tmp" "$_cache" 2>/dev/null
 )
 
-VIA="" LAUNCH="codex" APPROVAL=""
+VIA="" LAUNCH="codex" APPROVAL="" UI=terminal
 NAMESPACE="" PROJECT_DIR="" REMOTE_MP="" ASSUME_YES=0
 LOCAL_SSHD="${RH_LOCAL_SSHD:-auto}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --via)               need_arg "$1" "${2-}"; VIA="$2"; shift 2;;
     --launch)            need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
+    --ui)                need_arg "$1" "${2-}"; UI="$2"; shift 2;;
     --approval)          need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
     --yolo)              APPROVAL=yolo; shift;;
     --namespace)         need_arg "$1" "${2-}"; NAMESPACE="$2"; shift 2;;
@@ -199,6 +200,7 @@ case "$LAUNCH" in
   claude|codex|opencode) ;;
   *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
 esac
+validate_launch_ui "$UI" "$LAUNCH" || exit 2
 case "$APPROVAL" in
   ""|normal|auto|yolo) ;;
   *) printf 'unsupported --approval %s (expected normal|auto|yolo)\n' "$APPROVAL" >&2; exit 2;;
@@ -333,6 +335,7 @@ else
   if is_zh; then say "远端挂载点：     远端 ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; else say "Remote mountpoint: remote ~/.remote-harness/mounts/$(basename "$PROJECT_DIR")"; fi
 fi
 if is_zh; then say "启动命令：       ${LAUNCH}（审批模式 ${APPROVAL}）"; else say "Launch:           ${LAUNCH} (approval: ${APPROVAL})"; fi
+[ "$UI" = terminal ] || say "$(tr2 "Interface:        Paseo (native chat)" "交互界面：       Paseo 原生聊天")"
 if [ "$LOCAL_SSHD" = user ]; then
   say "$(tr2 "Local SSH server: per-session user-mode sshd (RH_LOCAL_SSHD=system switches back)" "本机 SSH 服务：   会话级用户态 sshd（RH_LOCAL_SSHD=system 可改回）")"
 else
@@ -398,6 +401,7 @@ cmd=(bash "$SCRIPT_DIR/laptop-setup.sh"
   --launch "$LAUNCH")
 [ -n "$PUBKEY" ] && cmd+=(--pubkey "$PUBKEY")
 [ -n "$REMOTE_MP" ] && cmd+=(--remote-mountpoint "$REMOTE_MP")
+[ "$UI" = terminal ] || cmd+=(--ui "$UI")
 cmd+=(--approval "$APPROVAL")
 cmd+=(--local-sshd "$LOCAL_SSHD")
 

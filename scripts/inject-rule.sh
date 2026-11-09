@@ -24,7 +24,7 @@
 #   experimental.chat.messages.transform plugin hook), because the rule alone sits at the start of the
 #   context and loses to long tool output in another language.
 #
-#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id]
+#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id] [terminal|paseo]
 #              approval: 0|normal, 1|yolo, or auto = the agent's automatic approval review when this CLI
 #              supports it (claude --permission-mode auto, codex --approve-for-me), else normal.
 #   inject-rule.sh off <agent> <mountpoint> [session_id]
@@ -37,6 +37,7 @@
 #               RH_READY_FILE=<opencode marker>  RH_OPENCODE_MAJOR=<1|2, empty for other agents>
 #               RH_PROCESS_LIST_SHARED=<1 when other users here can read process arguments>
 #               RH_LAUNCH_PREFIX=<session launcher for the final launch>
+#               RH_PASEO_LAUNCH=<bridge command, only in Paseo mode>
 # 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
 # Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
 # from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
@@ -280,6 +281,7 @@ session_warm_paths() {  # $1=ssh config $2=session id -> sets warm_socket, warm_
 write_session_meta() {  # $1=session dir $2=agent $3=mountpoint $4=alias $5=ssh config $6=control path
   {
     printf 'AGENT=%s\n' "$(b64_value "$2")"
+    [ "$ui" = terminal ] || printf 'UI=%s\n' "$(b64_value "$ui")"
     if [ -n "${SESSION_LEASE:-}" ]; then
       printf 'MOUNTPOINT=%s\n' "$(sed -n 's/^MOUNTPOINT=//p' "$SESSION_LEASE/lease.env")"
     else
@@ -551,6 +553,7 @@ for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
 print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
   cat > "$1" <<EOF
 {
+  "disableAllHooks": false,
   "permissions": {
     "deny": $_wcs_deny
   },
@@ -636,7 +639,12 @@ case "${1:-}" in
     transport_settings_load || { echo 'RH_STATUS=ERROR'; exit 2; }
     agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; approval="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
     case "$agent" in claude|codex|opencode) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
-    if [ "$agent" = claude ] && ! claude_supports_hook_failure; then
+    ui="${9:-terminal}"
+    if ! validate_launch_ui "$ui" "$agent"; then
+      echo 'RH_STATUS=ERROR'
+      exit 2
+    fi
+    if [ "$agent" = claude ] && [ "$ui" = terminal ] && ! claude_supports_hook_failure; then
       printf 'remote-harness: Claude Code 2.1.295 or newer is required to block commands when the routing hook fails; upgrade Claude and create a new harness session.\n' >&2
       echo 'RH_STATUS=ERROR'
       exit 2
@@ -674,6 +682,11 @@ case "${1:-}" in
     for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
       impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
     done
+    if [ "$ui" = paseo ]; then
+      for impl_file in paseo-session.mjs paseo-guard.py native_workspace.py orca_native.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
     # One cp and one chmod for all of them: each extra process costs more than the copy itself.
     cp "${impl_sources[@]}" "$SD/impl/" && chmod 500 "${impl_copies[@]}" || abort_session
     SCRIPT_DIR="$SD/impl"
@@ -689,7 +702,7 @@ case "${1:-}" in
     fi
     RULE="$SD/rule.md"
 
-    env_out=""; flags_out=""; ready_file=""; prefix_out=""; control_path=""; opencode_major=""
+    env_out=""; flags_out=""; paseo_launch=""; ready_file=""; prefix_out=""; control_path=""; opencode_major=""
     if [ -n "$ssh_config" ]; then
       control_path="$(session_control_path "$ssh_config")" || abort_session
       diagnostic_dir="$(dirname "$ssh_config")/runtime/diagnostics"
@@ -801,7 +814,15 @@ case "${1:-}" in
         # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
         [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
         flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
-        if [ "$approval" = auto ]; then
+        if [ "$ui" = paseo ]; then
+          node_bin=$(command -v node 2>/dev/null)
+          if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
+            printf '%s\n' 'remote-harness: --ui paseo requires Node.js on the agent host' >&2
+            abort_session
+          fi
+          paseo_launch="$(sq "$node_bin") $(sq "$SCRIPT_DIR/paseo-session.mjs") $(sq "$approval") $(sq "$PYTHON3")"
+          flags_out=""
+        elif [ "$approval" = auto ]; then
           if grep -q '"auto"' <<<"$(claude --help 2>/dev/null)"; then
             flags_out="$flags_out --permission-mode auto"
           else
@@ -891,7 +912,11 @@ case "${1:-}" in
         fi
         ;;
     esac
-    resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
+    resume_out=""; resume_args=""
+    if [ "$ui" = terminal ]; then
+      resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
+      case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
+    fi
     # Every process's arguments, the agent's own Bash commands among them, are readable by all users
     # unless /proc is mounted with hidepid. Tell the laptop when other users have accounts or
     # processes here; only an administrator can change it.
@@ -902,7 +927,6 @@ case "${1:-}" in
       { ps -e -o uid= 2>/dev/null; awk -F: '$7 !~ /(nologin|false)$/ { print $3 }' /etc/passwd 2>/dev/null; } \
         | awk -v me="$me" '$1 >= 1000 && $1 < 65534 && $1 != me { f = 1 } END { exit !f }' && shared_ps=1
     fi
-    case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
     printf 'RH_STATUS=INJECTED\n'
     printf 'RH_RESUME_AVAILABLE=%s\n' "$resume_out"
     printf 'RH_RESUME_ARGS=%s\n' "$resume_args"
@@ -914,6 +938,7 @@ case "${1:-}" in
     printf 'RH_PROCESS_LIST_SHARED=%s\n' "$shared_ps"
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"
+    [ -z "$paseo_launch" ] || printf 'RH_PASEO_LAUNCH=%s\n' "$paseo_launch"
     ;;
   off)
     mp="${3:-}"; sid="${4:-}"
@@ -935,6 +960,6 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] | off <agent> <box_mountpoint> [session_id]" >&2
+    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] [terminal|paseo] | off <agent> <box_mountpoint> [session_id]" >&2
     echo "RH_STATUS=ERROR"; exit 2;;
 esac

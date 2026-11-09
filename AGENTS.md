@@ -18,6 +18,7 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/run-on-project-host.sh`: validated local project command and tool dispatcher.
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
+- `scripts/paseo-session.mjs` / `paseo-guard.py` create and guard a native Paseo Claude session.
 - `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
 - `scripts/warm_pool.py`: per-session pool of channels opened ahead of time on the gateway's wait
   verb (`serve`), and the client half channel-guard and the tool shim use.
@@ -38,7 +39,10 @@ it provides files over SSHFS and executes project commands through a forced gate
   remote CLI's automatic review (`claude --permission-mode auto`, `codex --approve-for-me`) and falls
   back to normal approvals where the CLI lacks it.
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
-- The main agent starts only through `ssh -tt <remote> ... <claude|codex|opencode>`.
+- The terminal path starts the main agent through `ssh -tt <remote> ... <claude|codex|opencode>`.
+  With Claude and `--ui paseo`, the same SSH session owns the Harness bridge while the same-host
+  Paseo daemon starts the main agent with the injected settings. The bridge revokes its lease
+  before archive and exit. An all-tool hook blocks a stale Paseo agent after transport cleanup.
 - Claude/Codex/opencode Bash calls route locally. Agent/Spawn tools stay on the remote host.
 - Claude requires 2.1.295+ and its routing hook must set `onFailure: "block"`; a cancelled or broken
   hook must never let the original Bash command run on the agent host. Routing hook budgets exceed

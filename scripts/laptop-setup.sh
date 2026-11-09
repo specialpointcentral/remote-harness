@@ -6,7 +6,7 @@
 #   Phase 2 — Reconnect automatically (establishes the reverse tunnel)
 #   Phase 3 — Pick a project dir on THIS laptop (readline prompt, defaults to cwd)
 #   Phase 4 — Mount the chosen dir on the remote box via sshfs (over the tunnel)
-#   Phase 5 — Launch the chosen agent (claude/codex/opencode) on the box in the mounted dir (ssh -tt)
+#   Phase 5 — Start the agent in the mounted dir through the terminal or the native Paseo bridge.
 #
 # Usage (emitted by the skill — paste as-is). This script sources _common.sh from beside it, so the
 # command fetches BOTH files into one temp dir (the laptop usually has no install):
@@ -33,6 +33,7 @@
 #   --project-dir <d>     laptop project dir to mount (validated; prompts again if invalid)
 #   --launch <cmd>        coding-agent CLI to start on the remote (default: claude;
 #                         Codex passes 'codex', opencode passes 'opencode')
+#   --ui terminal|paseo   terminal (default), or native Paseo chat for Claude
 #   --approval <mode>     approvals on the launched agent: 'auto' (default; claude
 #                         --permission-mode auto, codex --approve-for-me, normal where the CLI
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
@@ -61,7 +62,7 @@ need_arg() {
 
 # ---- argument parsing -----------------------------------------------------
 HOST="" PORT="" PUBKEY="" VIA="" BOX_ALIAS="" BOX_SSH_CONFIG="" ASSUME_YES=0 SETUP_ONLY=0
-BOX_USER="" REMOTE_MP="" LAUNCH="claude" PROJ_DIR_ARG=""
+BOX_USER="" REMOTE_MP="" LAUNCH="claude" PROJ_DIR_ARG="" UI=terminal
 APPROVAL=auto; EFF_LAUNCH=""; LAUNCH_BASE="claude"
 LOCAL_SSHD_MODE="${RH_LOCAL_SSHD:-system}"
 while [ $# -gt 0 ]; do
@@ -71,6 +72,7 @@ while [ $# -gt 0 ]; do
     --pubkey)        need_arg "$1" "${2-}"; PUBKEY="$2";         shift 2;;
     --via)           need_arg "$1" "${2-}"; VIA="$2";            shift 2;;
     --launch)        need_arg "$1" "${2-}"; LAUNCH="$2";         shift 2;;   # CLI to start on the remote (claude/codex/opencode)
+    --ui)            need_arg "$1" "${2-}"; UI="$2";            shift 2;;
     --approval)      need_arg "$1" "${2-}"; APPROVAL="$2";       shift 2;;   # normal|auto|yolo
     --yolo)          APPROVAL=yolo;       shift;;     # bypass approvals on the launched agent
     --box-alias)     need_arg "$1" "${2-}"; BOX_ALIAS="$2";      shift 2;;
@@ -105,6 +107,11 @@ if [ -f "$RH_COMMON" ]; then
   # shellcheck source=./_common.sh
   . "$RH_COMMON"
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
+validate_launch_ui "$UI" "$LAUNCH" || exit 2
+if [ "$UI" = paseo ] && [ "$SETUP_ONLY" = 1 ]; then
+  printf '%s\n' '--ui paseo needs a full session (not --setup-only)' >&2
+  exit 2
+fi
 transport_settings_load "$LOCAL_SSHD_MODE" || exit 2
 
 # Its own RH_LAPTOP_STEPS steps, after any simple-laptop-setup.sh steps (RH_STEP_BASE).
@@ -764,10 +771,11 @@ esac
 EFF_LAUNCH="$LAUNCH"
 LAUNCH_BASE="$LAUNCH"
 if [ "$APPROVAL" = yolo ]; then
-  case "$LAUNCH_BASE" in
-    claude)   EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
-    codex)    EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
-    opencode) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
+  case "$LAUNCH_BASE:$UI" in
+    claude:paseo) warn "YOLO: Paseo Claude bypassPermissions";;
+    claude:terminal) EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
+    codex:terminal) EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
+    opencode:terminal) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
   esac
 fi
 
@@ -1376,6 +1384,7 @@ step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "�
 # Discover Python/git/rg/Codex in the same login+interactive environment as the final agent launch.
 # A plain SSH command often has only /usr/bin in PATH, hiding ~/.local/bin/codex and its bundled rg.
 inject_remote_cmd="$(transport_settings_env) \"\${RH_HOME:-\$HOME/.remote-harness}/scripts/inject-rule.sh\" on $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$BOX_ALIAS") $(sq "$REMOTE_MOUNTPOINT") $(sq "$APPROVAL") $(sq "$BOX_SSH_CONFIG") $(sq "$RULE_SESSION_ID")"
+[ "$UI" = terminal ] || inject_remote_cmd="$inject_remote_cmd $(sq "$UI")"
 # Without a terminal, a startup file that waits for input or execs another program (tmux, a nested
 # shell) would hang here forever, so bound the whole step on the box and keep its stderr.
 inject_shell="\"\${SHELL:-/bin/bash}\" -lic $(sq "$inject_remote_cmd")"
@@ -1391,7 +1400,7 @@ if [ "$rh_status" = INJECTED ]; then
   RULE_INJECTED=1
   rh_env=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_ENV)
   rh_flags=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_FLAGS)
-  if [ "$APPROVAL" = auto ]; then
+  if [ "$UI" = terminal ] && [ "$APPROVAL" = auto ]; then
     if [ "$(printf '%s\n' "$rh_out" | kv_value RH_APPROVAL)" = auto ]; then
       ok "$(tr2 "Approvals: ${LAUNCH_BASE} automatic review (auto mode)" "审批模式：${LAUNCH_BASE} 自动审核（auto 模式）")"
     else
@@ -1413,39 +1422,48 @@ if [ "$rh_status" = INJECTED ]; then
     _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
     REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
   fi
-  # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
-  # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
-  rh_resume=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_AVAILABLE)
-  rh_resume_args=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_ARGS)
-  # The remote watcher cannot record a disconnect that the agent outran by exiting on SIGHUP; the
-  # local marker from an interactive ssh that lost its connection covers that case.
-  if [ -f "$LOCAL_RESUME_MARKER" ]; then
-    _local_resume_at=$(cat "$LOCAL_RESUME_MARKER" 2>/dev/null)
-    rm -f "$LOCAL_RESUME_MARKER"
-    case "$_local_resume_at" in ''|*[!0-9]*) ;; *)
-      [ -n "$rh_resume" ] || [ $(( $(date +%s) - _local_resume_at )) -gt 604800 ] \
-        || rh_resume="disconnected,$_local_resume_at" ;;
+  if [ "$UI" = paseo ]; then
+    rh_paseo_launch=$(printf '%s\n' "$rh_out" | kv_value RH_PASEO_LAUNCH)
+    if [ -z "$rh_paseo_launch" ] || [ -z "$rh_prefix" ]; then
+      err "Remote Harness does not support --ui paseo on this host; update its scripts."
+      exit 1
+    fi
+    EFF_LAUNCH="export $rh_env; exec $rh_prefix $rh_paseo_launch"
+  else
+    # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
+    # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
+    rh_resume=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_AVAILABLE)
+    rh_resume_args=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_ARGS)
+    # The remote watcher cannot record a disconnect that the agent outran by exiting on SIGHUP; the
+    # local marker from an interactive ssh that lost its connection covers that case.
+    if [ -f "$LOCAL_RESUME_MARKER" ]; then
+      _local_resume_at=$(cat "$LOCAL_RESUME_MARKER" 2>/dev/null)
+      rm -f "$LOCAL_RESUME_MARKER"
+      case "$_local_resume_at" in ''|*[!0-9]*) ;; *)
+        [ -n "$rh_resume" ] || [ $(( $(date +%s) - _local_resume_at )) -gt 604800 ] \
+          || rh_resume="disconnected,$_local_resume_at" ;;
+      esac
+    fi
+    RESUME=0
+    case "${RH_RESUME:-}" in
+      1|yes) RESUME=1;;
+      0|no) ;;
+      *)
+        if [ -n "$rh_resume" ]; then
+          _resume_at=${rh_resume#*,}
+          case "$_resume_at" in ''|*[!0-9]*) _resume_ago="?";; *) _resume_ago=$(( ($(date +%s) - _resume_at) / 60 ));; esac
+          warn "$(tr2 "The last ${LAUNCH_BASE} session of this project ended on a lost connection (${_resume_ago} min ago)." \
+                      "该项目上一次的 ${LAUNCH_BASE} 会话因断线结束（${_resume_ago} 分钟前）。")"
+          ask "$(tr2 "Continue that conversation?" "继续该会话？")" y && RESUME=1
+        fi
+        ;;
     esac
+    if [ "$RESUME" = 1 ] && [ -n "$rh_resume_args" ]; then
+      EFF_LAUNCH="$LAUNCH_BASE $rh_resume_args${EFF_LAUNCH#"$LAUNCH_BASE"}"
+      ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
+    fi
+    EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   fi
-  RESUME=0
-  case "${RH_RESUME:-}" in
-    1|yes) RESUME=1;;
-    0|no) ;;
-    *)
-      if [ -n "$rh_resume" ]; then
-        _resume_at=${rh_resume#*,}
-        case "$_resume_at" in ''|*[!0-9]*) _resume_ago="?";; *) _resume_ago=$(( ($(date +%s) - _resume_at) / 60 ));; esac
-        warn "$(tr2 "The last ${LAUNCH_BASE} session of this project ended on a lost connection (${_resume_ago} min ago)." \
-                    "该项目上一次的 ${LAUNCH_BASE} 会话因断线结束（${_resume_ago} 分钟前）。")"
-        ask "$(tr2 "Continue that conversation?" "继续该会话？")" y && RESUME=1
-      fi
-      ;;
-  esac
-  if [ "$RESUME" = 1 ] && [ -n "$rh_resume_args" ]; then
-    EFF_LAUNCH="$LAUNCH_BASE $rh_resume_args${EFF_LAUNCH#"$LAUNCH_BASE"}"
-    ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
-  fi
-  EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
   err "could not install strict run-on-laptop routing (${rh_status:-no status}); refusing to launch the agent"
@@ -1508,7 +1526,11 @@ fi
 
 step_begin "$(tr2 "Launching ${LAUNCH} on the remote" "在远端启动 ${LAUNCH}")"
 step_end ok "${REMOTE_MOUNTPOINT}"
-say "  $(tr2 "Your terminal becomes the remote ${LAUNCH} session. Exit ${LAUNCH} to return here." "终端将切换为远端 ${LAUNCH} 会话；退出 ${LAUNCH} 即返回这里。")"
+if [ "$UI" = paseo ]; then
+  say "  $(tr2 "Open the conversation in Paseo when it appears. Keep this launcher running. Archive the conversation or press Ctrl-C here to end it." "会话出现后请在 Paseo 中打开。保持此启动器运行。归档会话或在此按 Ctrl-C 可结束。")"
+else
+  say "  $(tr2 "Your terminal becomes the remote ${LAUNCH} session. Exit ${LAUNCH} to return here." "终端将切换为远端 ${LAUNCH} 会话；退出 ${LAUNCH} 即返回这里。")"
+fi
 sep
 
 # Use a LOGIN+INTERACTIVE shell so the remote PATH (e.g. ~/.local/bin from ~/.profile / ~/.zshrc)
@@ -1531,6 +1553,7 @@ remote_launch_prelude() {
   _warm=$(tr2 "Prewarmed project metadata (.git, settings files)" "预热项目元数据（.git、设置文件）")
   _start=$(tr2 "Starting ${LAUNCH_BASE} (a folder used for the first time asks whether you trust it)..." \
                "启动 ${LAUNCH_BASE}（第一次进入的目录会先询问是否信任）…")
+  [ "$UI" = terminal ] || _start=$(tr2 "Creating a native Claude conversation in Paseo..." "正在 Paseo 中创建原生 Claude 会话…")
   # The marks take this terminal's colors (empty when it has none), like ok() and the local steps.
   cat <<EOF
 printf '  %s\342\234\223%s %s\n' $(sq "$_G") $(sq "$_0") $(sq "$_conn")
@@ -1590,14 +1613,14 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
     exec 3<&-
     return "$_rc"
   fi
-  warn "no controlling tty found; remote ${LAUNCH} TUI may not start"
+  [ "$UI" = paseo ] || warn "no controlling tty found; remote ${LAUNCH} TUI may not start"
   ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd"
 }
 start_tunnel_supervisor
 launch_remote_agent
 CLAUDE_EXIT=$?
 stop_tunnel_supervisor
-if [ "$CLAUDE_EXIT" = 255 ]; then
+if [ "$UI" = terminal ] && [ "$CLAUDE_EXIT" = 255 ]; then
   (umask 077
     private_local_dirs "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null \
       && [ ! -L "$LOCAL_RESUME_MARKER" ] && date +%s > "$LOCAL_RESUME_MARKER" \
@@ -1610,7 +1633,7 @@ fi
 sep
 if [ "$CLAUDE_EXIT" = 0 ]; then
   ok "${LAUNCH} session ended."
-elif [ "$CLAUDE_EXIT" = 255 ]; then
+elif [ "$CLAUDE_EXIT" = 255 ] && [ "$UI" = terminal ]; then
   warn "$(tr2 "Lost the connection to the remote ${LAUNCH} session; the next launch of this project offers to continue it." \
               "与远端 ${LAUNCH} 会话的连接已断开；下次启动该项目时会询问是否继续该会话。")"
 else
@@ -1619,3 +1642,4 @@ fi
 report_tunnel_supervisor
 # cleanup() (armed via trap) auto-unmounts and drops the tunnel as this script exits.
 printf "\n${_B}Done.${_0}\n"
+[ "$UI" = terminal ] || exit "$CLAUDE_EXIT"

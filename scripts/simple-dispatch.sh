@@ -27,12 +27,13 @@ normalize_mode() {
   esac
 }
 
-MODE="" SOURCE_VIA="" LAUNCH="codex" APPROVAL=""
+MODE="" SOURCE_VIA="" LAUNCH="codex" APPROVAL="" UI=terminal
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode)       need_arg "$1" "${2-}"; MODE="$2"; shift 2;;
     --source-via) need_arg "$1" "${2-}"; SOURCE_VIA="$2"; shift 2;;
     --launch)     need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
+    --ui)         need_arg "$1" "${2-}"; UI="$2"; shift 2;;
     --approval)   need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
     --yolo)       APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
@@ -42,6 +43,8 @@ case "$LAUNCH" in
   claude|codex|opencode) ;;
   *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
 esac
+
+validate_launch_ui "$UI" "$LAUNCH" || exit 2
 
 if [ -n "$MODE" ]; then
   MODE="$(normalize_mode "$MODE")" || { printf 'unsupported --mode %s\n' "$MODE" >&2; exit 2; }
@@ -55,6 +58,7 @@ fi
 
 [ -x "$SCRIPT_DIR/simple-laptop-setup.sh" ] || { err "missing simple-laptop-setup.sh in $SCRIPT_DIR"; exit 2; }
 args=(--launch "$LAUNCH")
+[ "$UI" = terminal ] || args+=(--ui "$UI")
 [ -n "$SOURCE_VIA" ] && args+=(--via "$SOURCE_VIA")
 [ -n "$APPROVAL" ] && args+=(--approval "$APPROVAL")
 exec bash "$SCRIPT_DIR/simple-laptop-setup.sh" "${args[@]}"

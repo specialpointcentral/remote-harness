@@ -231,6 +231,7 @@ heartbeat_lost() {  # $1=session dir; uses hb_next / hb_failing_since
 
 # The next launch of the same mountpoint and agent offers to continue the conversation (resume-take).
 resume_marker() {  # $1=session dir
+  [ "$(kv_b64 "$1/session.env" UI)" != paseo ] || return 1
   _rm_mp=$(kv "$1/session.env" MOUNTPOINT)
   _rm_agent=$(kv_b64 "$1/session.env" AGENT)
   case "$_rm_agent" in claude|codex|opencode) ;; *) return 1 ;; esac

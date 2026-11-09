@@ -28,6 +28,11 @@ Select the remote agent CLI:
 - Claude Code: `--launch claude`
 - opencode: `--launch opencode`
 
+Use the terminal interface by default. When the user asks for native Paseo chat, select
+`--launch claude`, append `--ui paseo` to the final bootstrap command, and point them to
+[the Paseo setup guide](docs/paseo.md). The project host keeps the launcher running while they use
+Paseo on their phone.
+
 Append the settled approval mode: `--approval auto`, `--approval normal`, or `--yolo` (only when the
 user explicitly requests bypass/no-approval mode). Use `RH_LANG=zh` for Chinese and `RH_LANG=en`
 otherwise.

@@ -214,6 +214,12 @@ sshd 使用 `AuthorizedKeysCommand`，或 `:22` 上没有 SSH 服务时，也会
   只能执行 gateway，不构成提权；但如果所在机构要求所有登录都经过 IPA 策略，请先确认是否允许。
 - 挂载失败时，错误信息会附上用户态 sshd 日志里的拒绝原因（例如目录权限不满足 `StrictModes`）。
 
+### Paseo 原生聊天
+
+在项目主机运行 bootstrap 时选择 `--launch claude --ui paseo`。Harness 先建立挂载和本机命令路由，
+再由远端 Paseo 创建 Claude 会话。项目主机保持启动器运行，手机连接同一台远端 Paseo 后即可打开会话。
+[安装与会话生命周期](docs/paseo.cn.md)
+
 ### 断线与会话恢复
 
 - **sshfs 不是同步**：远端没有项目副本，每次读写都实时经 SFTP 落到本机磁盘；`close` 会等写入完成，
@@ -613,6 +619,13 @@ Notes:
   whether your organization requires every login to pass IPA policy.
 - When the mount fails, the error includes the refusal reasons from the user-mode sshd log (for
   example a directory that fails `StrictModes`).
+
+### Native Paseo chat
+
+Select `--launch claude --ui paseo` in the bootstrap on the project host. Harness sets up the
+mount and command routing, then the remote Paseo daemon creates a Claude conversation. Keep the
+launcher running on the project host and open the conversation from the phone paired to that daemon.
+[Setup and session lifecycle](docs/paseo.md)
 
 ### Disconnects and resuming
 

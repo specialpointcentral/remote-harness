@@ -106,6 +106,13 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    unreachable remote after `RH_RELEASE_RETRY_DELAYS` (10 20 30) seconds, then stops only a tunnel
    this launch created, with its user-mode sshd and local authorization.
 
+## Native Paseo chat
+
+With `--launch claude --ui paseo`, step 6 starts the Harness bridge on the agent host. The bridge
+creates a native Claude conversation through the Paseo daemon using the same per-session routing.
+Archiving or deleting it in Paseo ends the Harness session. The CLI resume offer in step 9 applies
+to terminal sessions. [Setup and session lifecycle](../docs/paseo.md)
+
 ## Preconditions
 
 - The laptop can SSH into the remote box with the user's existing SSH key.

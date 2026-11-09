@@ -1521,6 +1521,7 @@ HOME="$install_home" CODEX_HOME="$install_home/.codex" RH_HOME="$install_home/.r
 [ -f "$install_home/.codex/skills/remote-harness/docs/claude-multi-agent.md" ] || fail "codex copy install did not include Claude multi-agent docs"
 [ -f "$install_home/.codex/skills/remote-harness/SKILL.cn.md" ] || fail "codex copy install did not include SKILL.cn.md"
 [ -x "$install_home/.remote-harness/scripts/simple-bootstrap.sh" ] || fail "manage install did not install executable simple-bootstrap.sh"
+[ -f "$install_home/.remote-harness/scripts/paseo-session.mjs" ] || fail "manage install did not copy Paseo bridge"
 [ -x "$install_home/.remote-harness/scripts/route-command.py" ] || fail "manage install did not install executable route-command.py"
 [ -x "$install_home/.remote-harness/scripts/run-on-project-host.sh" ] || fail "manage install did not install project-host runner"
 [ -x "$install_home/.remote-harness/scripts/project-host-gateway.sh" ] || fail "manage install did not install forced project-host gateway"
@@ -2128,6 +2129,7 @@ python3 "$ROOT/tests/test_diagnostics.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v
 python3 "$ROOT/tests/test_permission_rules.py" -v
 python3 "$ROOT/tests/test_claude_hooks.py" -v
+python3 "$ROOT/tests/test_paseo.py" -v
 python3 "$ROOT/tests/test_transport_capacity.py" -v
 bash "$ROOT/tests/resources.sh"
 

@@ -73,12 +73,13 @@ case "${BASH_SOURCE[0]:-}" in
   */*) self_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || self_dir="";;
 esac
 
-VIA="${RH_VIA:-}" MODE="" LAUNCH="codex" APPROVAL=""
+VIA="${RH_VIA:-}" MODE="" LAUNCH="codex" APPROVAL="" UI=terminal
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode)   need_arg "$1" "${2-}"; MODE="$2"; shift 2;;
     --via)    need_arg "$1" "${2-}"; VIA="$2"; shift 2;;
     --launch) need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
+    --ui)     need_arg "$1" "${2-}"; UI="$2"; shift 2;;
     --approval) need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
     --yolo)   APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
@@ -86,7 +87,14 @@ while [ $# -gt 0 ]; do
 done
 case "$LAUNCH" in claude|codex|opencode) ;; *) printf 'unsupported --launch %s\n' "$LAUNCH" >&2; exit 2;; esac
 
+case "$UI" in
+  terminal) ;;
+  paseo) [ "$LAUNCH" = claude ] || { printf '%s\n' '--ui paseo requires --launch claude' >&2; exit 2; };;
+  *) printf 'unsupported --ui %s (expected terminal|paseo)\n' "$UI" >&2; exit 2;;
+esac
+
 dispatch_args=(--launch "$LAUNCH")
+[ "$UI" = terminal ] || dispatch_args+=(--ui "$UI")
 [ -n "$MODE" ] && dispatch_args=(--mode "$MODE" "${dispatch_args[@]}")
 [ -n "$APPROVAL" ] && dispatch_args+=(--approval "$APPROVAL")
 

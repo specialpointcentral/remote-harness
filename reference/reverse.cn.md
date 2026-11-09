@@ -99,6 +99,12 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    清理在远端不可达时按 `RH_RELEASE_RETRY_DELAYS`（10 20 30）秒重试，之后只停止本次启动创建的隧道及其
    用户态 sshd 和本机授权。
 
+## Paseo 原生聊天
+
+选择 `--launch claude --ui paseo` 时，第 6 步在 Agent 主机启动 Harness 桥接进程，由它请求 Paseo
+守护进程创建原生 Claude 会话，继续使用相同的会话级路由。在 Paseo 中归档或删除该会话会结束 Harness
+会话。第 9 步的 CLI 恢复提示适用于终端会话。[设置与会话生命周期](../docs/paseo.cn.md)
+
 ## 前置条件
 
 - 笔记本可以用用户已有 SSH key 登录远端盒子。

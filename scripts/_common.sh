@@ -219,6 +219,15 @@ transport_settings_env() {
   done
 }
 
+# Shared UI validation for entry points that have loaded this file.
+validate_launch_ui() {  # $1=UI $2=agent
+  case "$1" in
+    terminal) ;;
+    paseo) [ "$2" = claude ] || { printf '%s\n' '--ui paseo requires --launch claude' >&2; return 2; };;
+    *) printf 'unsupported --ui %s (expected terminal|paseo)\n' "$1" >&2; return 2;;
+  esac
+}
+
 # Option parsing: a flag without a value is a usage error that ends the script.
 need_arg() {
   if [ -z "${2+x}" ] || [ -z "$2" ]; then

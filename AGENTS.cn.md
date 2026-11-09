@@ -20,6 +20,7 @@
 - `scripts/run-on-project-host.sh`：校验后的本机项目命令和工具 dispatcher。
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
+- `scripts/paseo-session.mjs` / `paseo-guard.py`：创建并保护 Paseo 原生 Claude 会话。
 - `scripts/channel-guard.py`：在路由 Bash 命令存续期间持有其 SSH 通道。
 - `scripts/warm_pool.py`：每会话一个、在 gateway 的 wait 动词上预先打开通道的通道池（`serve`），以及
   channel-guard 和工具垫片使用的客户端部分。
@@ -36,7 +37,10 @@
   向导会询问，默认沿用上次的选择，否则为 auto；auto 使用远端 CLI 的自动审核（`claude --permission-mode
   auto`、`codex --approve-for-me`），CLI 不支持时退回普通审批。
 - `laptop-setup.sh` 必须可与下载到同目录的 sibling helper 独立运行。
-- 主 Agent 只能通过 `ssh -tt <远端> ... <claude|codex|opencode>` 在远端启动。
+- 终端模式通过 `ssh -tt <远端> ... <claude|codex|opencode>` 启动主 Agent。Claude 选择
+  `--ui paseo` 时，同一 SSH 会话监管 Harness 桥接进程，由同一主机的 Paseo 守护进程带注入设置
+  启动主 Agent。桥接进程在归档和退出前撤销 lease；通道清理后，全工具 hook 拒绝旧 Paseo 会话的
+  工具调用。
 - Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成
   可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 和 opencode
