@@ -25,7 +25,8 @@ class PaseoFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='rh-paseo-')
         self.addCleanup(temporary.cleanup)
-        self.home = Path(temporary.name)
+        # Match the physical paths used by the injector and lease checks (macOS /var is a symlink).
+        self.home = Path(temporary.name).resolve()
         self.bin = self.home / 'bin'
         self.bin.mkdir()
         self.env = {k: v for k, v in os.environ.items()
