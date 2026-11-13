@@ -2,7 +2,13 @@
 """Exercise the reverse launch, local Orca RPC boundary, and real Claude wrapper."""
 import hashlib
 import json
+import fcntl
 import os
+import pty
+import re
+import select
+import struct
+import termios
 from pathlib import Path
 import shlex
 import shutil
@@ -56,6 +62,51 @@ class OrcaOptionTests(PaseoFixture):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("--remote-mountpoint", result.stderr)
                 self.assertFalse((self.home / "ssh-ran").exists())
+
+    def menu(self, *keys, options=("New chat", "rev.one · 1 h ago · first", "rev.two · 2 d ago · second"),
+             columns=100):
+        """Drive pick_menu in a pseudo-terminal, as the launcher does, and return the picked index."""
+        script = '. "$1"; shift; pick=$(pick_menu "Continue?" "$@"); printf "\\nPICK=%s\\n" "$pick"'
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe("bash", ["bash", "-c", script, "menu", str(SCRIPTS / "_common.sh"), *options],
+                       {**self.env, "TERM": "xterm", "LC_ALL": "C.UTF-8"})
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
+        output = bytearray()
+
+        def read_until(pattern):
+            deadline = time.monotonic() + 10
+            while not re.search(pattern, output) and time.monotonic() < deadline:
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        output.extend(os.read(fd, 4096))
+                    except OSError:
+                        break
+            match = re.search(pattern, output)
+            self.assertIsNotNone(match, output.decode(errors="replace"))
+            return match
+        read_until(re.escape(options[-1][:6].encode()))
+        for key in keys:
+            os.write(fd, key)
+            time.sleep(0.2)
+        pick = int(read_until(rb"PICK=(\d+)\r?\n").group(1))
+        os.waitpid(pid, 0)
+        os.close(fd)
+        return pick, output.decode()
+
+    def test_launcher_menu_picks_with_arrow_keys(self):
+        self.assertEqual(self.menu(b"\r")[0], 0)
+        self.assertEqual(self.menu(b"\x1b[B", b"\x1b[B", b"\x1b[A", b"\r")[0], 1)
+        self.assertEqual(self.menu(b"\x1bOA", b"\r")[0], 2)  # wraps; application cursor keys
+        self.assertEqual(self.menu(b"j", b"j", b"\r")[0], 2)
+        self.assertEqual(self.menu(b"\x1b[B", b"\x1b")[0], 0)  # Esc keeps the first option
+        self.assertEqual(self.menu(b"\x1b[B", b"q")[0], 0)
+        pick, text = self.menu(b"\x1b[B", b"\r", options=("新建会话", "rev.one · 继续" + "很长的中文消息" * 8),
+                               columns=40)
+        self.assertEqual(pick, 1)
+        line = next(line for line in text.splitlines() if "rev.one" in line)
+        self.assertIn("…", line)
+        self.assertLessEqual(len(line.split("rev.one")[1]), 17)
 
 
 def provider_id(session_id):
@@ -116,6 +167,7 @@ fi
         self.requests = []
         self.sessions = {}
         self.closed = set()
+        self.modes = {}
         self.command = str(self.wrapper)
         self.version = "1.4.251"
         self.env.update(RH_WARM_MAX="0", RH_HEARTBEAT_TIMEOUT="0", ORCA_APP_VERSION="1.4.251",
@@ -160,6 +212,7 @@ fi
         if method == "agentSession.create":
             identity = params["envelope"]["sessionId"]
             self.sessions[params["worktree"]] = identity
+            self.modes[identity] = params["options"]["permissionMode"]
             return {"ok": True, "value": {"sessionId": identity, "tabId": "agent-session:" + identity,
                                            "page": {"items": []}}}
         if method == "session.tabs.list":
@@ -173,7 +226,23 @@ fi
         if method == "agentSession.history":
             # Orca keeps a closed chat's history, so only a forgotten chat lacks a page.
             known = params["sessionId"] in self.sessions.values() and not self.forget_chats
-            return {"ok": True, "page": {"sessionId": params["sessionId"]} if known else {}}
+            item = {"itemId": "orca:1", "observedAt": 1794500000000, "body": {
+                "kind": "message", "role": "user",
+                "blocks": [{"type": "text", "text": "where were we?\x1b[2J\u202e"}]}}
+            page = {"sessionId": params["sessionId"], "fence": 1, "items": [item]}
+            return {"ok": True, "page": page if known else {}}
+        if method == "agentSession.reveal":
+            worktree = next((key for key, value in self.sessions.items() if value == params["sessionId"]), None)
+            if worktree is None or self.forget_chats:
+                return {"ok": False, "refusal": {"code": "not_found"}}
+            self.closed.discard(params["sessionId"])
+            return {"ok": True, "sessionId": params["sessionId"], "agent": "claude", "readable": True,
+                    "workspaceId": worktree.removeprefix("id:")}
+        if method == "agentSession.options":
+            return {"current": {"permissionMode": self.modes[params["sessionId"]]}}
+        if method == "agentSession.setOption":
+            self.modes[params["envelope"]["sessionId"]] = params["value"]
+            return {"ok": True}
         return {}
 
     def start_runtime(self, runtime_id):
@@ -205,16 +274,20 @@ fi
             time.sleep(0.05)
         self.fail(f"No {method} reached the restarted runtime. {log.read_text()}")
 
-    def start_bridge(self, label, approval="normal"):
-        reserved = subprocess.run(
-            ["python3", "-I", "-S", str(self.scripts / "orca_native.py"), "reserve", str(self.rh), label],
-            env=self.env, text=True, capture_output=True, timeout=5)
-        self.assertEqual(reserved.returncode, 0, reserved.stderr)
-        project = Path(reserved.stdout.strip())
-        self.assertEqual(project, self.mounts / label)
+    def start_bridge(self, label, approval="normal", launch=None):
+        """Start a launch on a new reservation, or with `launch`, a new launch on the mount `label`."""
+        if launch is None:
+            reserved = subprocess.run(
+                ["python3", "-I", "-S", str(self.scripts / "orca_native.py"), "reserve", str(self.rh), label],
+                env=self.env, text=True, capture_output=True, timeout=5)
+            self.assertEqual(reserved.returncode, 0, reserved.stderr)
+            project = Path(reserved.stdout.strip())
+            self.assertEqual(project, self.mounts / label)
+        else:
+            project = self.mounts / label
         result = subprocess.run(
             ["bash", str(self.scripts / "inject-rule.sh"), "on", "claude", "/local/project",
-             "testbox", str(project), approval, str(self.config), label, "orca"],
+             "testbox", str(project), approval, str(self.config), launch or label, "orca"],
             env=self.env, text=True, capture_output=True, timeout=12)
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split("=", 1) for line in result.stdout.splitlines())
@@ -297,6 +370,173 @@ fi
     def guard(hook, tool):
         return subprocess.run(shlex.split(hook["command"]), input=json.dumps({"tool_name": tool}),
                               capture_output=True, text=True, timeout=5)
+
+    def chats(self, project="/local/project"):
+        result = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "chats",
+                                 str(self.rh), "claude", project], env=self.env, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.removeprefix("RH_ORCA_CHAT=").split("\t") for line in result.stdout.splitlines()]
+
+    def claim(self, label, launch, project="/local/project"):
+        return subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "claim",
+                               str(self.rh), "claude", label, launch, project],
+                              env=self.env, text=True, capture_output=True, timeout=10)
+
+    def end_launch(self, bridge, session):
+        """The bridge exits on Ctrl-C, then the launcher's cleanup removes the session."""
+        bridge.terminate()
+        self.assertEqual(bridge.wait(timeout=8), 0)
+        shutil.rmtree(session)
+
+    def test_ended_chat_continues_only_in_a_launch_that_claims_it(self):
+        bridge, log, session, project = self.start_bridge("first", "yolo")
+        identity = self.ready(bridge, log)
+        record_path = self.rh / ".orca-identities" / (provider_id(identity) + ".json")
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record["chat"], record["agent"], record["project"]),
+                         (identity, "claude", "/local/project"))
+        # A running launch's chat is not offered and cannot be claimed.
+        self.assertEqual(self.chats(), [])
+        self.assertNotEqual(self.claim("first", "second").returncode, 0)
+        self.end_launch(bridge, session)
+        self.assertIn(("folderWorkspace.update", {"folderWorkspaceId": "folder-id-0",
+                                                  "updates": {"isArchived": True}}), self.requests)
+        ended = self.wrapper_call(project, "--resume", provider_id(identity))
+        self.assertNotEqual(ended.returncode, 0)
+        self.assertIn("This Harness session has ended. To continue this chat", ended.stderr)
+
+        # Only a launch of the same project offers it, with a terminal-safe last message.
+        self.assertEqual(self.chats("/other/project"), [])
+        self.assertEqual(self.chats(), [["first", "1794500000", "1", "where were we? [2J"]])
+        # A new reservation never takes the chat over.
+        refused, refused_log, _, _ = self.start_bridge("first", launch="unclaimed")
+        self.assertEqual(refused.wait(timeout=8), 1)
+        self.assertIn("belongs to an earlier Orca chat", refused_log.read_text())
+        self.assertNotEqual(self.claim("first", "second", "/other/project").returncode, 0)
+        self.assertNotEqual(self.claim("../first", "second").returncode, 0)
+        self.assertNotEqual(self.claim("unknown", "second").returncode, 0)
+
+        claimed = self.claim("first", "second")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        self.assertEqual(claimed.stdout, f"MOUNTPOINT={project}\n")
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record["session"], str(project).replace("/", "_") + ".second")
+        self.assertEqual(record["token"], "")
+        # Until its bridge grants a lease, the claimed chat has no tools.
+        self.assertNotEqual(self.wrapper_call(project, "--resume", provider_id(identity)).returncode, 0)
+
+        start = len(self.requests)
+        bridge, log, session, _ = self.start_bridge("first", "normal", launch="second")
+        self.assertEqual(self.ready(bridge, log), identity)
+        self.assertIn("is ready again. Continue it in Orca.", log.read_text())
+        requests = self.requests[start:]
+        self.assertNotIn("agentSession.create", [method for method, _ in requests])
+        self.assertIn(("folderWorkspace.update", {"folderWorkspaceId": "folder-id-0",
+                                                  "updates": {"isArchived": False}}), requests)
+        self.assertIn(("agentSession.reveal", {"sessionId": identity}), requests)
+        # The chat takes this launch's approval mode, not the earlier yolo.
+        self.assertEqual(self.modes[identity], "ask")
+        result = self.wrapper_call(project, "--resume", provider_id(identity), "--dangerously-skip-permissions")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads(result.stdout)["args"]
+        self.assertEqual(args[args.index("--permission-mode") + 1], "default")
+        self.assertNotIn("--dangerously-skip-permissions", args)
+        self.assertNotEqual(self.claim("first", "third").returncode, 0)
+        self.end_launch(bridge, session)
+        self.assertIn(("agentSession.close", {"sessionId": identity}), self.requests[start:])
+
+    def test_chat_whose_launcher_was_killed_continues_from_its_open_tab(self):
+        bridge, log, session, project = self.start_bridge("killed")
+        identity = self.ready(bridge, log)
+        # A killed bridge neither closes the chat nor archives the workspace.
+        bridge.kill()
+        bridge.wait(timeout=5)
+        shutil.rmtree(session)
+        # Identity records written before chat and project records were kept.
+        record_path = self.rh / ".orca-identities" / (provider_id(identity) + ".json")
+        record = json.loads(record_path.read_text())
+        record_path.unlink()
+        record_path.write_text(json.dumps({key: record[key] for key in ("cwd", "session", "token")}))
+        record_path.chmod(0o600)
+        self.assertEqual(self.chats("/other/project"), [["killed", "1794500000", "0", "where were we? [2J"]])
+        claimed = self.claim("killed", "next")
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record["chat"], record["project"]), (identity, "/local/project"))
+        self.assertEqual(self.chats(), [["killed", "1794500000", "1", "where were we? [2J"]])
+        bridge, log, session, _ = self.start_bridge("killed", launch="next")
+        self.assertEqual(self.ready(bridge, log), identity)
+        result = self.wrapper_call(project, "--session-id", provider_id(identity))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def transcript(self, project, provider, text, at):
+        """A Claude transcript as Claude Code keeps it for a session started in `project`."""
+        path = (self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(project))
+                / (provider + ".jsonl"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries = [{"type": "user", "message": {"role": "user", "content": text}},
+                   {"type": "user", "message": {"role": "user", "content": [
+                       {"type": "tool_result", "tool_use_id": "t", "content": "output"}]}},
+                   {"type": "user", "isMeta": True, "message": {"role": "user", "content": "meta"}},
+                   {"type": "assistant", "message": {"role": "assistant", "content": [
+                       {"type": "text", "text": "answer"}]}}]
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        os.utime(path, (at, at))
+
+    def continue_chat(self, label, launch):
+        claimed = self.claim(label, launch)
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        start = len(self.requests)
+        bridge, log, session, _ = self.start_bridge(label, launch=launch)
+        chat = self.ready(bridge, log)
+        self.assertIn("is ready again", log.read_text())
+        return bridge, session, chat, self.requests[start:]
+
+    def test_chat_gone_from_orca_continues_its_claude_conversation_in_a_new_chat(self):
+        bridge, log, session, project = self.start_bridge("gone", "auto")
+        identity = self.ready(bridge, log)
+        provider = provider_id(identity)
+        record_path = self.rh / ".orca-identities" / (provider + ".json")
+        self.end_launch(bridge, session)
+        self.forget_chats = True
+        # Without the chat in Orca or its Claude conversation, nothing can continue.
+        self.assertEqual(self.chats(), [])
+        self.transcript(project, provider, "older\x07 question", 1794400000)
+        self.assertEqual(self.chats(), [["gone", "1794400000", "1", "older question"]])
+
+        # The workspace is still there: a new chat in it resumes the Claude conversation.
+        bridge, session, chat, requests = self.continue_chat("gone", "second")
+        self.assertNotEqual(chat, identity)
+        created = next(params for method, params in requests if method == "agentSession.create")
+        self.assertEqual(created["resumeFrom"], {"providerSessionId": provider})
+        self.assertEqual(created["options"]["permissionMode"], "ask")
+        self.assertNotIn("folderWorkspace.create", [method for method, _ in requests])
+        self.assertIn(("folderWorkspace.update", {"folderWorkspaceId": "folder-id-0",
+                                                  "updates": {"isArchived": False}}), requests)
+        self.assertEqual(json.loads(record_path.read_text())["chat"], chat)
+        result = self.wrapper_call(project, "--resume=" + provider)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Only the Claude conversation is registered, not one derived from the new chat.
+        self.assertNotEqual(self.wrapper_call(project, "--session-id", provider_id(chat)).returncode, 0)
+        self.end_launch(bridge, session)
+
+        # The workspace was deleted as well: the launch creates it again.
+        self.workspaces.clear()
+        bridge, session, chat, requests = self.continue_chat("gone", "third")
+        self.assertIn("folderWorkspace.create", [method for method, _ in requests])
+        self.assertEqual(next(params for method, params in requests
+                              if method == "agentSession.create")["resumeFrom"], {"providerSessionId": provider})
+        self.end_launch(bridge, session)
+
+        # Once Orca has the new chat again, the next launch reopens that chat.
+        self.forget_chats = False
+        bridge, session, reopened, requests = self.continue_chat("gone", "fourth")
+        self.assertEqual(reopened, chat)
+        self.assertIn(("agentSession.reveal", {"sessionId": chat}), requests)
+        self.assertNotIn("agentSession.create", [method for method, _ in requests])
+        result = self.wrapper_call(project, "--resume=" + provider)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_concurrent_same_project_cannot_use_other_or_unknown_identity(self):
         first, first_log, _, first_project = self.start_bridge("first", "auto")

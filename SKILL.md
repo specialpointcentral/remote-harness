@@ -32,7 +32,8 @@ Use the terminal interface by default. For a native Paseo or Orca chat, preserve
 selected `--launch claude` or `--launch codex` and append `--ui paseo` or `--ui orca` to the
 bootstrap. Link the setup guide for [Codex](docs/codex-native.md), [Paseo Claude](docs/paseo.md),
 or [Orca Claude](docs/orca.md). The project host keeps its launcher running while the paired
-client is in use. Orca mode reserves a mount for each chat.
+client is in use. Orca mode reserves a mount for each chat; a later launch of the project with the
+same agent can continue an ended chat, which the user chooses in the launcher.
 
 Append the settled approval mode: `--approval auto`, `--approval normal`, or `--yolo` (only when the
 user explicitly requests bypass/no-approval mode). Use `RH_LANG=zh` for Chinese and `RH_LANG=en`

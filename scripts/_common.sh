@@ -120,6 +120,57 @@ ask() {  # question [y]   (y: default yes)
   case "$a" in y|Y|yes|YES) return 0;; *) return 1;; esac
 }
 
+# Arrow-key menu on the tty: question, then the options; prints the chosen option's index (0 is the
+# first). Up/Down (or k/j) move and Enter picks; Esc or q picks the first option. Each option is cut
+# to one terminal line, counting text with non-ASCII characters as double width. Bash 3.2 compatible.
+pick_menu() {
+  local _pm_question="$1" _pm_cur=0 _pm_done=0 _pm_key _pm_rest _pm_i _pm_cols _pm_max _pm_item
+  shift
+  local _pm_n=$#
+  local -a _pm_items=()
+  _pm_cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+  case "$_pm_cols" in ''|*[!0-9]*) _pm_cols=80;; esac
+  [ "$_pm_cols" -ge 20 ] || _pm_cols=80
+  for _pm_item in "$@"; do
+    _pm_max=$((_pm_cols - 6))
+    if printf '%s' "$_pm_item" | LC_ALL=C grep -q '[^ -~]'; then _pm_max=$((_pm_max / 2)); fi
+    [ "${#_pm_item}" -le "$_pm_max" ] || _pm_item="${_pm_item:0:$((_pm_max - 1))}…"
+    _pm_items[${#_pm_items[@]}]="$_pm_item"
+  done
+  step_freeze
+  printf "${_Y}?${_0} %s\n" "$_pm_question" >/dev/tty
+  while :; do
+    _pm_i=0
+    while [ "$_pm_i" -lt "$_pm_n" ]; do
+      if [ "$_pm_i" -eq "$_pm_cur" ]; then
+        printf "\r\033[K  ${_B}❯ %s${_0}\n" "${_pm_items[$_pm_i]}"
+      else
+        printf '\r\033[K    %s\n' "${_pm_items[$_pm_i]}"
+      fi
+      _pm_i=$((_pm_i + 1))
+    done >/dev/tty
+    [ "$_pm_done" = 0 ] || break
+    _pm_key=""
+    IFS= read -rsn1 _pm_key </dev/tty || { _pm_cur=0; _pm_done=1; }
+    case "$_pm_key" in
+      $'\033')
+        _pm_rest=""
+        IFS= read -rsn2 -t 1 _pm_rest </dev/tty || true
+        case "$_pm_rest" in
+          '[A'|OA) _pm_cur=$(( (_pm_cur + _pm_n - 1) % _pm_n ));;
+          '[B'|OB) _pm_cur=$(( (_pm_cur + 1) % _pm_n ));;
+          '') _pm_cur=0; _pm_done=1;;
+        esac;;
+      k) _pm_cur=$(( (_pm_cur + _pm_n - 1) % _pm_n ));;
+      j) _pm_cur=$(( (_pm_cur + 1) % _pm_n ));;
+      q) _pm_cur=0; _pm_done=1;;
+      '') _pm_done=1;;
+    esac
+    printf '\033[%dA' "$_pm_n" >/dev/tty
+  done
+  printf '%s' "$_pm_cur"
+}
+
 # A process's start time as `ps -o lstart` prints it, trimmed: with the pid it identifies the process.
 proc_start() { ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
 

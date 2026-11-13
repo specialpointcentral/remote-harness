@@ -24,6 +24,13 @@ class OrcaError(Exception):
     pass
 
 
+class SessionEnded(OrcaError):
+    """The chat's Harness session ended; its launcher's cleanup removed the session and lease."""
+
+    def __init__(self):
+        super().__init__("This Harness session has ended.")
+
+
 def version_support(version, verified):
     """True for a verified build, False for a newer patch of a verified major.minor, else None."""
     if version in verified:
@@ -123,16 +130,29 @@ def process_identity(pid):
     )
     state, identity = output.strip().split(maxsplit=1)
     if state[0] in "XZ":
-        raise OrcaError("The Orca Harness bridge has ended.")
+        raise SessionEnded()
     return identity
 
 
+def live_session(path):
+    """The private directory of a running Harness session."""
+    try:
+        return private_dir(private_dir(path.parent) / path.name)
+    except FileNotFoundError as error:
+        raise SessionEnded() from error
+
+
 def active_lease(path, token):
-    lease = private_json(path)
-    pid = lease["pid"]
-    if (lease["token"] != token or type(pid) is not int or pid <= 1
-            or process_identity(pid) != lease["identity"]):
-        raise OrcaError("The Orca Harness bridge has ended.")
+    try:
+        lease = private_json(path)
+        pid = lease["pid"]
+        if (lease["token"] != token or type(pid) is not int or pid <= 1
+                or process_identity(pid) != lease["identity"]):
+            raise SessionEnded()
+    except FileNotFoundError as error:
+        raise SessionEnded() from error
+    except subprocess.CalledProcessError as error:  # ps found no such process
+        raise SessionEnded() from error
     return lease
 
 

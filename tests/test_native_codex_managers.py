@@ -14,6 +14,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -143,12 +144,12 @@ supports_websockets = false
 """)
 
     @contextmanager
-    def bridge(self, manager):
-        (self.mount / "sub").mkdir(parents=True)
+    def bridge(self, manager, launch="native-v2"):
+        (self.mount / "sub").mkdir(parents=True, exist_ok=True)
         self.server.mount = str(self.mount)
         started = subprocess.run(
             ["bash", str(self.scripts / "inject-rule.sh"), "on", "codex", str(self.project),
-             "fixture", str(self.mount), "normal", str(self.ssh), "native-v2", manager],
+             "fixture", str(self.mount), "normal", str(self.ssh), launch, manager],
             env=self.env, text=True, capture_output=True, timeout=20,
         )
         self.assertEqual(started.returncode, 0, started.stderr)
@@ -321,6 +322,47 @@ supports_websockets = false
                 bridge.terminate()
             self.verify_effects(True)
             self.assertNotIn("Lost contact", (self.home / "bridge.log").read_text())
+
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to a supported Orca CLI")
+    def test_orca_codex_chat_continues_in_a_new_launch(self):
+        orca, port = self.prepare_orca(ORCA)
+        self.mount.mkdir(mode=0o700)  # as orca_native.py reserves it
+        with ExitStack() as servers:
+            self.serve_orca(servers, ORCA, orca, port, "server")
+            orca.call("settings.mutateAgentLaunch", {
+                "type": "command", "agent": "codex", "value": str(self.scripts / "native-codex.py"),
+            })
+            with self.bridge("orca") as (bridge, session_id):
+                page, send, pending, respond = self.orca_chat(orca, session_id)
+                send("remember the word heliotrope")
+                wait_for(self.backend_pid, 40, detail=lambda: json.dumps(page())[-3000:])
+                wait_for(lambda: not page()["working"], 40)
+                thread = self.root_thread()
+                bridge.terminate()
+            # The launcher's cleanup unmounts the project and removes the session.
+            shutil.rmtree(self.session)
+            for child in self.mount.iterdir():
+                shutil.rmtree(child)
+            tool = [sys.executable, "-EsB", str(self.scripts / "orca-session.py")]
+            listed = subprocess.run([*tool, "chats", str(self.rh), "codex", str(self.project)],
+                                    env=self.env, text=True, capture_output=True, timeout=20)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertEqual([line.split("\t")[::3] for line in listed.stdout.splitlines()],
+                             [["RH_ORCA_CHAT=native-v2", "remember the word heliotrope"]])
+            claimed = subprocess.run([*tool, "claim", str(self.rh), "codex", "native-v2", "next",
+                                      str(self.project)], env=self.env, text=True, capture_output=True,
+                                     timeout=20)
+            self.assertEqual(claimed.stdout, f"MOUNTPOINT={self.mount}\n", claimed.stderr)
+            before = len(self.server.requests)
+            with self.bridge("orca", "next") as (bridge, resumed):
+                self.assertEqual(resumed, session_id)
+                send("which word?")
+                wait_for(lambda: len(self.server.requests) > before, 40,
+                         detail=lambda: json.dumps(page())[-3000:])
+                wait_for(lambda: not page()["working"], 40)
+                self.assertEqual(self.root_thread(), thread, "The chat must resume its Codex thread")
+                self.assertIn("remember the word heliotrope", json.dumps(self.server.requests[before]))
+                bridge.terminate()
 
     def exercise_orca(self, approve):
         orca, port = self.prepare_orca(ORCA)

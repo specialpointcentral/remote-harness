@@ -99,7 +99,10 @@ Keep the project host and its launcher running. An idle chat or a disconnected p
 end the lease. Archive or delete the agent in Paseo, close the chat or archive the folder in
 Orca, or press Ctrl-C in the project-host terminal to end it. When the bridge's lease expires,
 the private Codex app server stops and the routed tools refuse further calls. A later launch
-creates a new chat. Existing app history may remain visible. Keep the Orca mount and identity
+creates a new chat. In Orca, a later launch can instead
+[continue an ended chat](orca.md#continue-an-ended-chat) while Orca still has it; Harness keeps
+that chat's Codex conversation outside the session for this. A Paseo chat cannot continue.
+Existing app history may remain visible. Keep the Orca mount and identity
 reservations. Manager terminals, workspace scripts, and Git UI still run on the agent host.
 An Orca Server restart keeps the chat as described in the [Orca guide](orca.md#start-and-stop).
 

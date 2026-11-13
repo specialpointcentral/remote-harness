@@ -81,8 +81,9 @@ Paseo 也会在 `$RH_HOME/.paseo-workspaces` 预留各个 Harness 工作区，Co
 
 保持项目主机和启动器运行。聊天空闲或手机断开不会结束 lease。在 Paseo 归档或删除 Agent，
 在 Orca 关闭聊天或归档文件夹，或在项目主机终端按 Ctrl-C，均可结束会话。桥接 lease 失效后，
-私有 Codex app server 停止，路由工具拒绝继续调用。再次启动会创建新聊天。应用可能保留旧聊天
-历史。请保留 Orca 的挂载和身份预留记录。管理器终端、工作区脚本和 Git 界面仍运行在 Agent 主机。
+私有 Codex app server 停止，路由工具拒绝继续调用。再次启动会创建新聊天。在 Orca 中，只要 Orca
+仍保留已结束的聊天，之后的启动也可以[继续它](orca.cn.md#继续已结束的聊天)；为此 Harness 把该聊天的
+Codex 对话保存在会话之外。Paseo 聊天无法继续。应用可能保留旧聊天历史。请保留 Orca 的挂载和身份预留记录。管理器终端、工作区脚本和 Git 界面仍运行在 Agent 主机。
 Orca Server 重启时的处理见 [Orca 指南](orca.cn.md#启动与退出)。
 
 可用临时项目做冒烟测试。在聊天中读取并修改一个文件，再审批一个打印 `pwd` 和 `hostname` 的路由

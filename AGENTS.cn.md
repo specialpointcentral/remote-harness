@@ -45,7 +45,10 @@
   工具调用。
 - 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
   创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
-  预留记录，避免旧聊天获得新路由。桥接进程仅在重启后的 Orca Server 再次通过启动检查后才接管它；
+  预留记录，已结束的聊天不会自行获得路由。只有在本地终端认领它的同一 Agent 启动
+  （`orca-session.py claim`）才能在其原挂载点继续；桥接进程重新打开该聊天，Orca 已没有 Claude
+  聊天时，则新建聊天接着原对话继续。Orca Codex 聊天的线程和 rollout 保存在
+  `.orca-codex-chats/<chat>.state`（会话 `codex-home` 的 `sessions` 链接到这里），凭据副本仍留在会话中。桥接进程仅在重启后的 Orca Server 再次通过启动检查后才接管它；
   两个包装器都会拒绝由不受支持的 Orca 版本（`ORCA_APP_VERSION`）启动的已绑定聊天。不在
   `ORCA_VERSIONS` 中的版本，仅当它是已列出主次版本的更新补丁时才受支持，并在启动器中警告；
   codex-cli 按 `CODEX_VERSIONS` 适用同一规则。

@@ -7,8 +7,8 @@ import subprocess
 import sys
 
 from native_workspace import CHAT_REQUIRED, protected
-from orca_native import (SESSION_NAME, OrcaError, active_lease, check_version,
-                         claude_command, private_dir, private_json)
+from orca_native import (SESSION_NAME, OrcaError, SessionEnded, active_lease, check_version,
+                         claude_command, live_session, private_json)
 
 SESSION_ENV = "RH_CLAUDE_SESSION"
 TOKEN_ENV = "RH_CLAUDE_TOKEN"
@@ -36,7 +36,7 @@ def main():
     if (not session.is_absolute() or session.parent.resolve() != sessions
             or not SESSION_NAME.fullmatch(session.name) or not token):
         raise OrcaError("Invalid Paseo Harness session registration.")
-    session = private_dir(private_dir(sessions) / session.name)
+    session = live_session(sessions / session.name)
     lease = active_lease(session / "paseo-lease.json", token)
     if lease.get("provider") != "claude" or lease["cwd"] != str(cwd):
         raise OrcaError(CHAT_REQUIRED)
@@ -65,6 +65,8 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except SessionEnded as error:
+        sys.exit(f"remote-harness: {error} Start a new Harness session.")
     except OrcaError as error:
         sys.exit("remote-harness: " + str(error))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):

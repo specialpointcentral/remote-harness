@@ -72,7 +72,8 @@ if [ -n "${RH_TEST_CODEX_CLI:-}" ]; then
     env RH_TEST_ORCA_CLI="$new" python3 test_native_codex_managers.py -v \
     NativeCodexManagerTests.test_orca_approves_child_command_and_applies_child_edit \
     NativeCodexManagerTests.test_orca_revokes_lease_with_child_approval_pending \
-    NativeCodexManagerTests.test_orca_codex_chat_survives_server_restart
+    NativeCodexManagerTests.test_orca_codex_chat_survives_server_restart \
+    NativeCodexManagerTests.test_orca_codex_chat_continues_in_a_new_launch
   if [ -n "$previous" ]; then
     run "native Codex across an update to Orca $version" \
       env RH_TEST_ORCA_CLI="$previous" RH_TEST_ORCA_AFTER="$new" python3 test_native_codex_managers.py -v \

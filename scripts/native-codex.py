@@ -15,9 +15,10 @@ import sys
 import threading
 
 from native_workspace import CHAT_REQUIRED, protected
-from orca_native import (CODEX_CHATS, LEASE, MOUNTS, SESSION_NAME, OrcaError, active_lease,
-                         describe_versions, private_dir, private_json, require_orca_version,
-                         shown_version, unverified_warning, version_support, write_once)
+from orca_native import (CODEX_CHATS, LEASE, MOUNTS, SESSION_NAME, OrcaError, SessionEnded,
+                         active_lease, describe_versions, live_session, private_dir, private_json,
+                         require_orca_version, shown_version, unverified_warning, version_support,
+                         write_once)
 
 # codex-cli builds whose app-server protocol Harness has been verified against.
 CODEX_VERSIONS = ("0.167.0",)
@@ -115,7 +116,8 @@ def orca_binding(home, cwd, env):
     require_orca_version(env.get("ORCA_APP_VERSION"))
     if not SESSION_NAME.fullmatch(record["session"]):
         raise OrcaError("Invalid Orca Harness session registration.")
-    return home / ".sessions" / record["session"], LEASE, record["token"]
+    # The chat's Codex conversation outlives the session, so a later launch can continue it.
+    return home / ".sessions" / record["session"], LEASE, record["token"], registry / (identity + ".state")
 
 
 def paseo_binding(home, env):
@@ -128,7 +130,7 @@ def paseo_binding(home, env):
     if (not path.is_absolute() or path.parent.resolve() != sessions
             or not SESSION_NAME.fullmatch(path.name) or not token):
         raise OrcaError("Invalid Paseo Harness session registration.")
-    return sessions / path.name, PASEO_LEASE, token
+    return sessions / path.name, PASEO_LEASE, token, None
 
 
 def toml(value):
@@ -221,6 +223,13 @@ def selected_account(session, mount, lease, binding, policy, command):
     private_dir(tmp, create=True)
     for path in ("config.toml", "auth.json", "harness-account.json", "models.json"):
         (tmp / path).unlink(missing_ok=True)
+    if state := binding[3]:
+        # Codex writes the chat's conversation (its rollouts) to the chat's private state; the
+        # credentials and settings stay in the session.
+        conversation = private_dir(private_dir(state, create=True) / "sessions", create=True)
+        if (tmp / "sessions").is_symlink():
+            (tmp / "sessions").unlink()
+        (tmp / "sessions").symlink_to(conversation, target_is_directory=True)
     catalog = native_model_catalog(account, catalog_source, tmp, command)
     private_file(tmp / "models.json", json.dumps(catalog).encode())
     config["model_catalog_json"] = str(target / "models.json")
@@ -265,9 +274,9 @@ def frames(fd):
 class SessionProxy:
     """Keep manager and Codex on native JSON-RPC while pinning execution policy to the lease."""
 
-    def __init__(self, session, lease_name, token, policy, mount, child):
+    def __init__(self, session, lease_name, token, policy, mount, child, state=None):
         self.session, self.lease_name, self.token = session, lease_name, token
-        self.policy, self.mount, self.child = policy, mount, child
+        self.policy, self.mount, self.child, self.state = policy, mount, child, state
         self.thread_file = session / "codex-thread.json"
         self.thread = private_json(self.thread_file)["thread"] if self.thread_file.exists() else None
         self.start_id = None
@@ -305,6 +314,8 @@ class SessionProxy:
                         if not isinstance(thread, str) or not thread:
                             raise OrcaError("Codex did not return a valid thread ID.")
                         write_once(self.thread_file, {"thread": thread})
+                        if self.state:
+                            write_once(self.state / "thread.json", {"thread": thread})
                         self.thread = thread
                     self.start_id = None
                 method = frame.get("method")
@@ -420,8 +431,8 @@ def stop_child(child):
 
 
 def serve(command, binding):
-    session, lease_name, token = binding
-    private_dir(private_dir(session.parent) / session.name)
+    session, lease_name, token, state = binding
+    live_session(session)
     lease = active_lease(session / lease_name, token)
     check_version(command)
     mount = Path(lease["cwd"]).resolve(strict=True)
@@ -442,6 +453,13 @@ def serve(command, binding):
             raise OrcaError("Invalid Codex writer lock.")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         env["CODEX_HOME"] = str(selected_account(session, mount, lease, binding, policy, command))
+        thread_file = session / "codex-thread.json"
+        if state and (state / "thread.json").exists() and not thread_file.exists():
+            # A launch that continues the chat resumes its Codex thread.
+            thread = private_json(state / "thread.json")["thread"]
+            if not isinstance(thread, str) or not thread:
+                raise OrcaError("Invalid Codex thread of the Orca chat to continue.")
+            write_once(thread_file, {"thread": thread})
         # These session flags also override same-named project or machine defaults at load time.
         flags = [flag for key, value in FEATURES.items()
                  for flag in ("-c", f"features.{key}={toml(value)}")]
@@ -451,7 +469,7 @@ def serve(command, binding):
                                  cwd=mount, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  start_new_session=True)
         try:
-            proxy = SessionProxy(session, lease_name, token, policy, mount, child)
+            proxy = SessionProxy(session, lease_name, token, policy, mount, child, state)
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 signal.signal(sig, lambda signum, _: sys.exit(128 + signum))
             proxy.run()
@@ -479,14 +497,19 @@ def main():
         os.execv(command, [str(command), *args])
     if args not in (["app-server"], ["app-server", "--enable", "goals"]):
         raise OrcaError("The native Harness Codex command requires an unmodified app-server stdio launch.")
-    if sys.version_info < (3, 11):
-        session, lease_name, token = binding
-        private_dir(private_dir(session.parent) / session.name)
-        python = active_lease(session / lease_name, token)["python"]
-        subprocess.run([python, "-EsB", "-c", "import tomllib"], check=True,
-                       stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        os.execv(python, [python, "-EsB", str(wrapper), *args])
-    serve(command, binding)
+    try:
+        if sys.version_info < (3, 11):
+            session, lease_name, token, _ = binding
+            live_session(session)
+            python = active_lease(session / lease_name, token)["python"]
+            subprocess.run([python, "-EsB", "-c", "import tomllib"], check=True,
+                           stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            os.execv(python, [python, "-EsB", str(wrapper), *args])
+        serve(command, binding)
+    except SessionEnded as error:
+        hint = ("To continue this chat, start a new Orca Harness launch for the project and choose "
+                "the chat when the launcher offers it." if binding[3] else "Start a new Harness chat.")
+        raise OrcaError(f"{error} {hint}") from error
 
 
 if __name__ == "__main__":

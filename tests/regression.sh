@@ -1649,6 +1649,8 @@ PY
       printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'
       [ -z "${MOUNT_FOLLOW_SYMLINKS:-}" ] || printf 'FOLLOW_SYMLINKS=%s\n' "$MOUNT_FOLLOW_SYMLINKS"
       exit 0;;
+    *'orca-session.py'*' claim '*) printf 'MOUNTPOINT=/tmp/rh-remote-orca\n'; exit 0;;
+    *'orca-session.py'*' chats '*) printf 'RH_ORCA_CHAT=rev.old\t1\t1\tfixture\n'; exit 0;;
     *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\nRH_APPROVAL=auto\n'; exit 0;;
   esac
 done
@@ -1698,6 +1700,25 @@ assert_grep_e "$ssh_log" "ControlMaster=no -o ControlPath=/tmp/rh\.[^ ]+/m -n " 
 refute_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -tt " "the interactive agent session must keep its own connection"
 assert_grep_e "$ssh_log" "ControlPath=/tmp/rh\.[^ ]+/m -O exit" "cleanup stops the multiplexing master"
 assert_grep_e "$tmp/project-valid.out" "project host: rg (found|not found)" "launch preflight reports rg"
+# An Orca launch continues an ended chat only when this terminal chose it: RH_RESUME_CHAT names the
+# chat, the agent host's claim returns its mount, and the launch mounts the project there.
+orca_launch() {  # output file, extra arguments; the caller's environment is passed through
+  laptop_setup "$proj_home" --host example.com --port 32025 --via "ssh user@example.com" \
+    --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+    --project-dir "$valid_project" --launch claude --ui orca "${@:2}" > "$1" 2>&1 || true
+}
+SSH_LOG="$tmp/orca-continue.ssh.log" RH_RESUME_CHAT=rev.old orca_launch "$tmp/orca-continue.out"
+assert_grep_e "$tmp/orca-continue.ssh.log" "orca-session\.py.* claim .* 'claude' 'rev\.old' 'rev\.[A-Za-z0-9]+' '$valid_project'" \
+  "an Orca launch claims the chat the terminal chose for its own project and agent"
+assert_grep "$tmp/orca-continue.ssh.log" "mp='/tmp/rh-remote-orca'" "the launch mounts the project at the claimed chat's mount"
+refute_grep "$tmp/orca-continue.ssh.log" "orca_native.py" "a launch that continues a chat reserves no new mount"
+assert_grep "$tmp/orca-continue.out" "Continuing Orca chat rev.old" "the launcher reports the chat it continues"
+SSH_LOG="$tmp/orca-codex.ssh.log" RH_RESUME_CHAT=rev.old orca_launch "$tmp/orca-codex.out" --launch codex
+assert_grep_e "$tmp/orca-codex.ssh.log" "orca-session\.py.* claim .* 'codex' 'rev\.old' " \
+  "a Codex Orca launch claims a Codex chat"
+SSH_LOG="$tmp/orca-new.ssh.log" orca_launch "$tmp/orca-new.out"
+refute_grep "$tmp/orca-new.ssh.log" "orca-session.py" "--yes never offers or claims an earlier Orca chat"
+assert_grep "$tmp/orca-new.ssh.log" "orca_native.py" "a new Orca chat reserves a new mount"
 assert_grep_e "$ssh_log" "inject-rule\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*auto[^ ]* " "setup passes the default auto approval to the injector"
 assert_grep "$tmp/project-valid.out" "Approvals: codex automatic review" "setup reports the auto approval mode"
 SSH_LOG="$tmp/approval-normal.ssh.log" project_launch "$tmp/approval-normal-launch.out" --approval normal

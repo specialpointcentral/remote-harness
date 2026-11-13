@@ -935,6 +935,8 @@ case "${1:-}" in
       flags_out=""
     elif [ "$ui" = orca ]; then
       printf '%s' "${lp##*/}" > "$SD/orca-project-title" || abort_session
+      # Records which project a new chat belongs to, so only its own launches offer to continue it.
+      printf '%s' "$lp" > "$SD/orca-project" || abort_session
       orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3") $(sq "$agent")"
       flags_out=""
     fi

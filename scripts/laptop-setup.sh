@@ -1273,6 +1273,51 @@ ok "Selected: ${_B}${PROJ_DIR}${_0}"
 PROJ_NAME="$(basename "$PROJ_DIR")"
 register_gateway_project || { err "could not register the project with the forced gateway"; exit 1; }
 
+# Ended Orca chats of this project and agent can continue in this launch instead of a new chat. Only
+# this local terminal chooses one, in an arrow-key menu that starts on a new chat:
+# RH_RESUME_CHAT=<chat> continues that chat without asking, and RH_RESUME=0, --yes or a terminal
+# without cursor control never offers one. The agent host's claim checks the choice again.
+ORCA_CONTINUE=""
+choose_orca_chat() {
+  local listing label at recorded said ago pick
+  local -a labels=() items=()
+  if [ -n "${RH_RESUME_CHAT:-}" ]; then
+    ORCA_CONTINUE="$RH_RESUME_CHAT"
+    return 0
+  fi
+  case "${RH_RESUME:-}" in 0|no) return 0;; esac
+  [ "$ASSUME_YES" != 1 ] && [ "${TERM:-dumb}" != dumb ] && { : </dev/tty; } 2>/dev/null || return 0
+  listing=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    exec python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR")
+  " 2>/dev/null | sed -n 's/^RH_ORCA_CHAT=//p')
+  [ -n "$listing" ] || return 0
+  items[0]="$(tr2 "Start a new chat" "新建会话")"
+  while IFS=$'\t' read -r label at recorded said; do
+    case "$label" in ""|*[!A-Za-z0-9._-]*) continue;; esac
+    case "$at" in ""|*[!0-9]*) continue;; esac
+    ago=$(( $(date +%s) - at ))
+    [ "$ago" -ge 0 ] || ago=0
+    if [ "$ago" -lt 3600 ]; then ago="$(tr2 "$((ago / 60)) min ago" "$((ago / 60)) 分钟前")"
+    elif [ "$ago" -lt 172800 ]; then ago="$(tr2 "$((ago / 3600)) h ago" "$((ago / 3600)) 小时前")"
+    else ago="$(tr2 "$((ago / 86400)) d ago" "$((ago / 86400)) 天前")"; fi
+    said=$(printf '%s' "$said" | LC_ALL=C tr -d '\000-\037\177')
+    [ "$recorded" = 1 ] || said="$(tr2 "(project not recorded)" "（未记录项目）") $said"
+    labels[${#labels[@]}]="$label"
+    items[${#items[@]}]="${label} · ${ago} · ${said}"
+  done <<EOF
+$listing
+EOF
+  [ "${#labels[@]}" -gt 0 ] || return 0
+  pick=$(pick_menu "$(tr2 "Continue an earlier Orca chat of this project? (Up/Down, Enter)" \
+                          "要继续该项目之前的 Orca 会话吗？（上下键选择，回车确认）")" "${items[@]}")
+  case "$pick" in ''|*[!0-9]*|0) return 0;; esac
+  ORCA_CONTINUE="${labels[$((pick - 1))]}"
+}
+if [ "$UI" = orca ]; then
+  choose_orca_chat
+fi
+
 # ===========================================================================
 # Phase 4: Mount on the remote box
 # ===========================================================================
@@ -1283,7 +1328,18 @@ step_begin "$(tr2 "Mounting the project on the remote (sshfs)" "在远端挂载�
 #  - otherwise default to <remote $RH_HOME>/mounts/<project-name>.
 #    The mount call itself resolves that default, so it costs no extra round trip.
 REMOTE_MOUNTPOINT="$REMOTE_MP"
-if [ "$UI" = orca ]; then
+if [ -n "$ORCA_CONTINUE" ]; then
+  # The claim binds the chat to this launch and returns its mount; the bridge then reopens it.
+  REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    exec python3 -EsB \"\$rh/scripts/orca-session.py\" claim \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$ORCA_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")
+  " | kv_value MOUNTPOINT)
+  if [ -z "$REMOTE_MOUNTPOINT" ]; then
+    err "$(tr2 "Could not continue Orca chat ${ORCA_CONTINUE}." "无法继续 Orca 会话 ${ORCA_CONTINUE}。")"
+    exit 1
+  fi
+  ok "$(tr2 "Continuing Orca chat ${ORCA_CONTINUE}" "将继续 Orca 会话 ${ORCA_CONTINUE}")"
+elif [ "$UI" = orca ]; then
   if ! REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
     exec python3 -I -S \"\$rh/scripts/orca_native.py\" reserve \"\$rh\" $(sq "$RULE_SESSION_ID")
@@ -1313,6 +1369,10 @@ while :; do
   [ -z "$_mounted_path" ] || REMOTE_MOUNTPOINT="$_mounted_path"
   case "$STATUS" in
     mounted|already-mounted)
+      if [ "$UI" = orca ] && [ "$STATUS" = already-mounted ]; then
+        err "The Orca mount is already in use by another launch. Start a new Harness launch."
+        exit 1
+      fi
       _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
       REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
       ok "Mounted ${PROJ_DIR} → remote:${REMOTE_MOUNTPOINT}"
@@ -1554,6 +1614,8 @@ step_begin "$(tr2 "Launching ${LAUNCH} on the remote" "在远端启动 ${LAUNCH}
 step_end ok "${REMOTE_MOUNTPOINT}"
 if [ "$UI" = paseo ]; then
   say "  $(tr2 "Open the conversation in Paseo when it appears. Keep this launcher running. Archive the conversation or press Ctrl-C here to end it." "会话出现后请在 Paseo 中打开。保持此启动器运行。归档会话或在此按 Ctrl-C 可结束。")"
+elif [ "$UI" = orca ] && [ -n "$ORCA_CONTINUE" ]; then
+  say "  $(tr2 "Continue the chat in Orca when it reopens. Keep this launcher running. Close the chat, archive its workspace, or press Ctrl-C here to end it." "会话重新打开后请在 Orca 中继续。保持此启动器运行。关闭会话、归档工作区或在此按 Ctrl-C 可结束。")"
 elif [ "$UI" = orca ]; then
   say "  $(tr2 "Open the chat in Orca when it appears. Keep this launcher running. Close the chat, archive its workspace, or press Ctrl-C here to end it." "会话出现后请在 Orca 中打开。保持此启动器运行。关闭会话、归档工作区或在此按 Ctrl-C 可结束。")"
 else

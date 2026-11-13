@@ -47,7 +47,12 @@ it provides files over SSHFS and executes project commands through a forced gate
   before archive and exit. An all-tool hook blocks a stale Paseo agent after transport cleanup.
 - With `--ui orca`, the bridge owns one reserved mount and creates a native chat on the
   same-host Orca Server. The configured wrapper binds the chat identity and mount to a lease.
-  Keep the identity and mount reservations across cleanup so old chats cannot acquire a new route.
+  Keep the identity and mount reservations across cleanup: an ended chat never acquires a route by
+  itself. Only a launch of the same agent that claims it in the local terminal
+  (`orca-session.py claim`) continues it at its own mount; the bridge reopens the chat, or for
+  Claude resumes its conversation in a new chat when Orca no longer has it. An Orca Codex chat's
+  thread and rollouts live in `.orca-codex-chats/<chat>.state` (the session `codex-home` links
+  `sessions` there); its credential copy stays in the session.
   The bridge adopts a restarted Orca Server only after it passes the startup checks again, and both
   wrappers refuse a bound chat launched by an unsupported Orca build (`ORCA_APP_VERSION`). A build
   outside `ORCA_VERSIONS` is supported only as a newer patch of a listed major.minor, with a

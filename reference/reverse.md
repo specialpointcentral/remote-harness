@@ -115,8 +115,9 @@ to terminal sessions. [Claude setup](../docs/paseo.md) · [Codex setup](../docs/
 
 ## Native Orca chat
 
-With `--ui orca` and `--launch claude` or `--launch codex`, the launcher reserves a mount for this chat before step 6. The
-agent-host bridge requests a native chat tab from Orca Server. Closing the chat or archiving
+With `--ui orca` and `--launch claude` or `--launch codex`, the launcher reserves a mount for this chat before step 6. A
+launch can instead continue an ended chat of the project and agent, chosen in the launcher; it
+then claims that chat's mount. The agent-host bridge requests a native chat tab from Orca Server. Closing the chat or archiving
 its folder workspace ends the Harness session. [Claude setup](../docs/orca.md) · [Codex setup](../docs/codex-native.md)
 
 ## Preconditions

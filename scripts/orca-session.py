@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Run one native Orca chat while the reverse Harness owns its transport."""
+"""Run one native Orca chat while the reverse Harness owns its transport.
+
+The launcher also uses `chats` to list a project's ended chats of one agent and `claim` to bind
+one of them to a new launch, which then continues that chat instead of creating one.
+"""
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 
-from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, ORCA_VERSIONS, OrcaError, check_version,
-                         claude_command, config, private_dir, private_json, probe_claude,
+from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, ORCA_VERSIONS, SESSION_NAME, UUID, OrcaError,
+                         check_version, claude_command, config, private_dir, private_json, probe_claude,
                          process_identity, require_orca_version, unverified_warning, write_once)
 
 # How long Orca Server may stay unreachable, for example while an automatic update restarts it.
@@ -22,6 +29,10 @@ RESTART_GRACE = 120
 PERMISSION_MODES = {"normal": "ask", "auto": "auto", "yolo": "full-access"}
 MAX_FRAME = 8 * 1024 * 1024
 WARNED = set()
+CLAUDE_CHAT = re.compile(r"claude_[0-9a-f]{32}")
+CODEX_CHAT = re.compile(r"codex_[0-9a-f]{32}")
+OWNED = "This mount belongs to an earlier Orca chat. Continue that chat from the launcher instead."
+CODEX_GONE = "Orca no longer has this Codex chat, so it cannot continue. Start a new chat."
 
 
 class OrcaClient:
@@ -89,13 +100,53 @@ class OrcaClient:
         raise OrcaError(f"Orca Server did not complete {method}.")
 
 
-def native_create(session_id, fields):
-    digest = json.dumps({"method": "agentSession.create", "sessionId": session_id, "fields": fields},
+def envelope(method, session_id, fields, fence=None):
+    digest = json.dumps({"method": method, "sessionId": session_id, "fields": fields},
                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    envelope = {"sessionId": session_id, "clientOperationId": f"{time.time_ns() // 1_000_000}-{uuid.uuid4().hex}",
-                "expectedRuntimeFence": None,
-                "payloadFingerprint": hashlib.sha256(digest.encode()).hexdigest()}
-    return {"envelope": envelope, **fields}
+    return {"sessionId": session_id, "clientOperationId": f"{time.time_ns() // 1_000_000}-{uuid.uuid4().hex}",
+            "expectedRuntimeFence": fence, "payloadFingerprint": hashlib.sha256(digest.encode()).hexdigest()}
+
+
+def native_create(session_id, fields):
+    return {"envelope": envelope("agentSession.create", session_id, fields), **fields}
+
+
+def claude_identity(session_id):
+    """The Claude session ID Orca launches a native chat with."""
+    return str(uuid.UUID(bytes=hashlib.sha256(f"orca-claude:{session_id}".encode()).digest()[:16], version=4))
+
+
+def session_key(mountpoint):
+    """The session directory key that inject-rule.sh derives from a mountpoint."""
+    key = re.sub(rb"[^A-Za-z0-9._-]", b"_", os.fsencode(mountpoint)).decode("ascii")
+    return "default" if key in ("", ".", "..") else key
+
+
+@contextmanager
+def private_lock(path, busy):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise OrcaError("Invalid Orca Harness lock.")
+        deadline = time.monotonic() + 12
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OrcaError(busy)
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
+def replace_record(path, data):
+    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
+    write_once(temporary, data)
+    os.replace(temporary, path)
 
 
 def check_wrapper(settings, wrapper, agent):
@@ -108,21 +159,8 @@ def check_wrapper(settings, wrapper, agent):
 def project_group(client, home, configuration):
     group_id = configuration.get("projectGroupId")
     # Concurrent first launches must not create duplicate groups.
-    lock = os.open(home / "orca" / "group.lock",
-                   os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    try:
-        info = os.fstat(lock)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise OrcaError("Invalid Orca Harness project-group lock.")
-        deadline = time.monotonic() + 12
-        while True:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise OrcaError("Another Orca Harness launch is preparing the project group.")
-                time.sleep(0.1)
+    with private_lock(home / "orca" / "group.lock",
+                      "Another Orca Harness launch is preparing the project group."):
         groups = [group for group in client.call("projectGroup.list")["groups"]
                   if not group.get("connectionId")]
         if group_id is not None:
@@ -141,8 +179,6 @@ def project_group(client, home, configuration):
         if candidates:
             return candidates[0]
         return client.call("projectGroup.create", {"name": "Remote Harness", "parentPath": parent})["group"]["id"]
-    finally:
-        os.close(lock)
 
 
 def live_workspace(client, workspace, cwd):
@@ -209,6 +245,208 @@ def lease_environment(session, agent):
     return env
 
 
+def chat_records(home, agent):
+    """The readable registered chats of one agent as (path, record)."""
+    try:
+        registry = private_dir(home / (CODEX_CHATS if agent == "codex" else IDENTITIES))
+    except FileNotFoundError:
+        return []
+    records = []
+    for path in sorted(registry.glob("*.json")):
+        try:
+            records.append((path, private_json(path)))
+        except (OrcaError, OSError, ValueError):
+            continue
+    return records
+
+
+def claimed_chat(home, agent, cwd, session):
+    """The earlier chat a launch claimed for this mount; None for a newly reserved mount.
+
+    Reservations are unique, so only a claimed record, written by this user's launcher, names one.
+    """
+    for kind in ("claude", "codex"):
+        for path, record in chat_records(home, kind):
+            if record.get("cwd") != str(cwd):
+                continue
+            if kind != agent or record.get("session") != session.name or record.get("token") != "":
+                raise OrcaError(OWNED)
+            return path, record
+    return None, None
+
+
+def chat_workspace(folders, cwd):
+    matches = [folder for folder in folders
+               if folder.get("folderPath") == str(cwd) and not folder.get("connectionId")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def registered_chat(client, path, record, workspace):
+    chat = record.get("chat")
+    if chat is None and workspace is not None:
+        # Records from before chat IDs were kept: an open tab still names the chat.
+        tabs = client.call("session.tabs.list", {"worktree": f"id:folder:{workspace['id']}"})["tabs"]
+        chat = next((tab["sessionId"] for tab in tabs if tab.get("type") == "agent-session"
+                     and isinstance(tab.get("sessionId"), str)
+                     and claude_identity(tab["sessionId"]) == path.stem), None)
+    return chat if isinstance(chat, str) and CLAUDE_CHAT.fullmatch(chat) else None
+
+
+def claude_transcript(cwd, provider):
+    """Where Claude Code keeps the conversation of the session `provider` started in `cwd`."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return base / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{provider}.jsonl"
+
+
+def text_of(content):
+    if isinstance(content, list):
+        content = " ".join(block["text"] for block in content if isinstance(block, dict)
+                           and block.get("type") == "text" and isinstance(block.get("text"), str))
+    return content if isinstance(content, str) else ""
+
+
+def last_message(items):
+    for item in reversed(items):
+        body = item.get("body") if isinstance(item, dict) else None
+        if isinstance(body, dict) and body.get("kind") == "message" and body.get("role") == "user":
+            if (text := text_of(body.get("blocks"))).strip():
+                return text
+    return ""
+
+
+def transcript_message(path):
+    """The last message the user typed, from the end of a Claude transcript."""
+    with path.open("rb") as stream:
+        stream.seek(max(0, stream.seek(0, os.SEEK_END) - 262144))
+        lines = stream.read().splitlines()
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "user" or entry.get("isMeta"):
+            continue
+        message = entry.get("message")
+        text = text_of(message.get("content")) if isinstance(message, dict) else ""
+        # Skip tool results, command output and other text Claude Code inserts as user turns.
+        if text.strip() and not text.lstrip().startswith("<"):
+            return text
+    return ""
+
+
+def shown(text, limit=60):
+    """One terminal-safe line: no control, format or unassigned characters."""
+    text = " ".join("".join(" " if unicodedata.category(ch).startswith("C") else ch for ch in text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def codex_state(path):
+    """The private state, kept beyond the session, that holds an Orca Codex chat's conversation."""
+    return path.with_name(path.stem + ".state")
+
+
+def codex_conversation(path):
+    state = codex_state(path)
+    private_dir(state)
+    return (state / "thread.json").is_file() and any((state / "sessions").rglob("rollout-*.jsonl"))
+
+
+def resumable_chats(home, client, project, agent="claude"):
+    """Ended chats of one agent that a new launch of this project may continue, newest first.
+
+    A chat continues in its Orca chat when Orca still has it. Otherwise a Claude chat continues in
+    a new Orca chat that resumes its Claude conversation; a Codex chat cannot.
+    """
+    mounts = private_dir(home / MOUNTS)
+    folders = client.call("folderWorkspace.list")["folderWorkspaces"]
+    named = UUID if agent == "claude" else CODEX_CHAT
+    chats = []
+    for path, record in chat_records(home, agent):
+        try:
+            cwd = Path(record["cwd"])
+            # A record without a project predates project records; the user identifies it.
+            if (not named.fullmatch(path.stem) or cwd.parent != mounts or not SESSION_NAME.fullmatch(cwd.name)
+                    or not SESSION_NAME.fullmatch(record["session"])
+                    or record.get("project", project) != project):
+                continue
+            # The earlier session still runs, or its cleanup has not finished yet.
+            if os.path.lexists(home / ".sessions" / record["session"]):
+                continue
+            private_dir(cwd)
+            if os.path.ismount(cwd) or any(cwd.iterdir()):
+                continue
+            workspace = chat_workspace(folders, cwd)
+            # A Codex chat's record is named after the chat itself.
+            chat = registered_chat(client, path, record, workspace) if agent == "claude" else path.stem
+            page = chat and client.call("agentSession.history", {"sessionId": chat, "direction": "tail",
+                                                                 "limit": 20})["page"]
+            items = [item for item in page.get("items", []) if isinstance(item, dict)] if page else []
+            seen = [item["observedAt"] for item in items if type(item.get("observedAt")) in (int, float)]
+            known = bool(workspace and page and page.get("sessionId") == chat)
+            transcript = claude_transcript(cwd, path.stem)
+            if agent == "codex":
+                # Chats from before Codex conversations were kept beyond the session cannot continue.
+                if not known or not codex_conversation(path):
+                    continue
+                last = max(seen) / 1000 if seen else (codex_state(path) / "thread.json").stat().st_mtime
+                said = last_message(items)
+            elif known and seen:
+                last, said = max(seen) / 1000, last_message(items)
+            elif transcript.is_file():
+                last, said = transcript.stat().st_mtime, transcript_message(transcript)
+            else:
+                continue
+            chats.append({"label": cwd.name, "chat": chat, "path": path, "record": record,
+                          "last": int(last), "said": shown(said), "recorded": "project" in record})
+        except (OrcaError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return sorted(chats, key=lambda chat: chat["last"], reverse=True)
+
+
+def list_chats(home, agent, project):
+    if agent not in ("claude", "codex"):
+        raise OrcaError("Unsupported Orca Harness agent.")
+    client = OrcaClient(config(home, agent))
+    for chat in resumable_chats(home, client, project, agent)[:9]:
+        print(f"RH_ORCA_CHAT={chat['label']}\t{chat['last']}\t{int(chat['recorded'])}\t{chat['said']}")
+
+
+def claim_chat(home, agent, label, sid, project):
+    """Bind an ended chat to the launch `sid`, whose bridge then continues it."""
+    if agent not in ("claude", "codex"):
+        raise OrcaError("Unsupported Orca Harness agent.")
+    if not SESSION_NAME.fullmatch(label) or not SESSION_NAME.fullmatch(sid):
+        raise OrcaError("Invalid Orca chat or launch name.")
+    client = OrcaClient(config(home, agent))
+    with private_lock(home / "orca" / "resume.lock", "Another launch is continuing an Orca chat."):
+        chat = next((chat for chat in resumable_chats(home, client, project, agent)
+                     if chat["label"] == label), None)
+        if chat is None:
+            raise OrcaError(f"Orca chat {label} cannot be continued here. It may belong to another "
+                            "project, its earlier launch may still be running, or Orca no longer has it.")
+        cwd = Path(chat["record"]["cwd"])
+        # The launch's bridge sets a new token; until then the chat has no tool lease.
+        record = {**chat["record"], "session": f"{session_key(cwd)}.{sid}", "token": "",
+                  "agent": agent, "project": project}
+        if chat["chat"]:
+            record["chat"] = chat["chat"]
+        replace_record(chat["path"], record)
+    return cwd
+
+
+def set_permission_mode(client, session_id, mode):
+    """Make the chat's own approval mode match this launch, as for a new chat."""
+    if client.call("agentSession.options", {"sessionId": session_id})["current"].get("permissionMode") == mode:
+        return
+    fence = client.call("agentSession.history", {"sessionId": session_id, "direction": "tail",
+                                                 "limit": 1})["page"].get("fence")
+    fields = {"key": "permissionMode", "value": mode}
+    client.call("agentSession.setOption",
+                {"envelope": envelope("agentSession.setOption", session_id, fields, fence), **fields}, timeout=15)
+    if client.call("agentSession.options", {"sessionId": session_id})["current"].get("permissionMode") != mode:
+        raise OrcaError("Orca did not apply this launch's approval mode to the chat.")
+
+
 def main():
     approval, python, *args = sys.argv[1:]
     agent = args[0] if args else "claude"
@@ -216,7 +454,11 @@ def main():
         raise OrcaError("Unsupported Orca Harness agent.")
     label = agent.title()
     session = Path(__file__).resolve().parent.parent
-    project = (session / "orca-project-title").read_text(encoding="utf8")
+    title = (session / "orca-project-title").read_text(encoding="utf8")
+    try:
+        project = (session / "orca-project").read_text(encoding="utf8")
+    except FileNotFoundError:
+        project = None
     home = session.parent.parent
     cwd = Path.cwd()
     if cwd.parent != private_dir(home / MOUNTS):
@@ -225,6 +467,8 @@ def main():
     configuration = config(home, agent)
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
         raise OrcaError("Install the Orca Harness command wrapper on the agent host.")
+    # A launch either continues the chat it claimed for this mount or creates a new chat.
+    record_path, resumed = claimed_chat(home, agent, cwd, session)
     client = OrcaClient(configuration)
     status = client.call("status.get")
     require_server_version(status)
@@ -241,8 +485,7 @@ def main():
             approval = "normal"
         # Record the configured path, not its target: Claude's self-update repoints the symlink.
         launch_settings["claude"] = str(command)
-        provider_id = str(uuid.UUID(bytes=hashlib.sha256(
-            f"orca-claude:{session_id}".encode()).digest()[:16], version=4))
+        provider_id = claude_identity(session_id)
     else:
         try:
             subprocess.run([python, "-EsB", str(wrapper), "check-harness-version"], check=True,
@@ -250,12 +493,27 @@ def main():
         except (OSError, subprocess.SubprocessError) as error:
             raise OrcaError("Native Harness Codex requires Python 3.11+, a supported codex-cli and the private codex.json.") from error
         provider_id = session_id
+    if resumed:
+        # The Claude conversation keeps its session; the Orca chat may be a new one. A Codex
+        # chat's record is named after the chat, which must still exist in Orca.
+        provider_id = record_path.stem
+        if not (UUID if agent == "claude" else CODEX_CHAT).fullmatch(provider_id):
+            raise OrcaError("Invalid registration of the Orca chat to continue.")
     lease_path = session / LEASE
     token = str(uuid.uuid4())
     stopped = False
     leased = False
     workspace = None
     create_attempted = closed = False
+
+    def grant():
+        nonlocal leased
+        write_once(lease_path, {
+            "token": token, "pid": os.getpid(), "identity": process_identity(os.getpid()),
+            "python": python, "approval": approval, "cwd": str(cwd), **launch_settings,
+            "env": lease_environment(session, agent),
+        })
+        leased = True
 
     def revoke():
         nonlocal leased
@@ -275,48 +533,82 @@ def main():
         group_id = project_group(client, home, configuration)
         if stopped:
             return
-        folder = client.call("folderWorkspace.create", {"projectGroupId": group_id,
-                             "name": f"Remote Harness · {project}", "folderPath": str(cwd)}, timeout=15)
-        folder = folder["folderWorkspace"]
-        if (folder["folderPath"] != str(cwd) or folder.get("connectionId")
-                or folder["projectGroupId"] != group_id):
-            raise OrcaError("Orca returned a different workspace location.")
+        folder = resumed and chat_workspace(client.call("folderWorkspace.list")["folderWorkspaces"], cwd)
+        if resumed and not folder and agent == "codex":
+            raise OrcaError(CODEX_GONE)
+        if not folder:
+            folder = client.call("folderWorkspace.create", {"projectGroupId": group_id,
+                                 "name": f"Remote Harness · {title}", "folderPath": str(cwd)}, timeout=15)
+            folder = folder["folderWorkspace"]
+            if (folder["folderPath"] != str(cwd) or folder.get("connectionId")
+                    or folder["projectGroupId"] != group_id):
+                raise OrcaError("Orca returned a different workspace location.")
         workspace = folder["id"]
         if stopped:
             return
         selector = f"id:folder:{workspace}"
-        fields = {"agent": agent, "worktree": selector}
-        if client.call("agentSession.createSupport", fields).get("supported") is not True:
-            raise OrcaError(f"Orca Server cannot create a native {label} chat in this folder.")
-        check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
-        fields["options"] = {"permissionMode": PERMISSION_MODES[approval]}
-        if model := configuration.get("model"):
-            fields["options"]["model"] = model
-        # Reserve this identity forever. Removing transport state cannot turn an old chat
-        # into a normal Claude launch, including a resume from a different working directory.
-        registry = private_dir(home / (CODEX_CHATS if agent == "codex" else IDENTITIES), create=True)
-        write_once(registry / f"{provider_id}.json", {
-            "cwd": str(cwd), "session": session.name, "token": token,
-        })
-        write_once(lease_path, {
-            "token": token, "pid": os.getpid(), "identity": process_identity(os.getpid()),
-            "python": python, "approval": approval, "cwd": str(cwd), **launch_settings,
-            "env": lease_environment(session, agent),
-        })
-        leased = True
-        if stopped:
-            return
-        create_attempted = True
-        receipt = client.call("agentSession.create", native_create(session_id, fields), timeout=30)
-        if receipt.get("ok") is not True or receipt.get("value", {}).get("sessionId") != session_id:
-            raise OrcaError(f"Orca Server did not confirm the requested native {label} chat.")
+        revealed = None
+        if resumed:
+            if folder.get("isArchived"):
+                client.call("folderWorkspace.update", {"folderWorkspaceId": workspace,
+                                                       "updates": {"isArchived": False}})
+            chat = resumed.get("chat") if agent == "claude" else provider_id
+            if isinstance(chat, str) and (CLAUDE_CHAT if agent == "claude" else CODEX_CHAT).fullmatch(chat):
+                try:
+                    revealed = client.call("agentSession.reveal", {"sessionId": chat}, timeout=15)
+                except OrcaError:
+                    revealed = None
+        if revealed and revealed.get("ok") is True:
+            # Orca still has the chat: reopen it with this launch's approval mode.
+            session_id = chat
+            create_attempted = True
+            if revealed.get("workspaceId") != f"folder:{workspace}" or revealed.get("agent") != agent:
+                raise OrcaError(f"Orca Server reopened the native {label} chat somewhere else.")
+            set_permission_mode(client, session_id, PERMISSION_MODES[approval])
+            check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
+            grant()
+            replace_record(record_path, {**resumed, "token": token})
+        else:
+            if resumed and agent == "codex":
+                raise OrcaError(CODEX_GONE)
+            fields = {"agent": agent, "worktree": selector}
+            if resumed:
+                # Orca no longer has the chat here: continue its Claude conversation in a new chat.
+                fields["resumeFrom"] = {"providerSessionId": provider_id}
+            if client.call("agentSession.createSupport", fields).get("supported") is not True:
+                raise OrcaError(f"Orca Server cannot create a native {label} chat in this folder.")
+            check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
+            fields["options"] = {"permissionMode": PERMISSION_MODES[approval]}
+            if model := configuration.get("model"):
+                fields["options"]["model"] = model
+            if resumed:
+                replace_record(record_path, {**resumed, "token": token, "chat": session_id})
+            else:
+                # Reserve this identity forever. Removing transport state cannot turn an old chat
+                # into a normal Claude launch, including a resume from a different working directory.
+                # Only a later launch that claims the chat in the local terminal continues it.
+                registry = private_dir(home / (CODEX_CHATS if agent == "codex" else IDENTITIES), create=True)
+                write_once(registry / f"{provider_id}.json", {
+                    "cwd": str(cwd), "session": session.name, "token": token, "chat": session_id,
+                    "agent": agent, "project": project, "created": int(time.time()),
+                })
+            grant()
+            if stopped:
+                return
+            create_attempted = True
+            receipt = client.call("agentSession.create", native_create(session_id, fields), timeout=30)
+            if receipt.get("ok") is not True or receipt.get("value", {}).get("sessionId") != session_id:
+                raise OrcaError(f"Orca Server did not confirm the requested native {label} chat.")
         if stopped:
             return
         if not visible_chat(client, selector, session_id):
             raise OrcaError(f"Orca Server did not publish the native {label} chat.")
         if not published_workspace(client, workspace, cwd):
             raise OrcaError("Orca Server did not publish the Harness workspace in its remote workspace list.")
-        print(f"remote-harness: Orca {label} chat {session_id} is ready. Open it in Orca.", flush=True)
+        if resumed:
+            print(f"remote-harness: Orca {label} chat {session_id} is ready again. Continue it in Orca.", flush=True)
+        else:
+            print(f"remote-harness: Orca {label} chat {session_id} is ready. Open it in Orca.", flush=True)
         unavailable = None
         confirmed = client.runtime_id  # the runtime that last listed this chat
         while not stopped:
@@ -363,7 +655,12 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:2] == ["chats"] and len(sys.argv) == 5:
+            list_chats(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])
+        elif sys.argv[1:2] == ["claim"] and len(sys.argv) == 7:
+            print(f"MOUNTPOINT={claim_chat(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])}")
+        else:
+            main()
     except OrcaError as error:
         print("remote-harness:", error, file=sys.stderr)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):

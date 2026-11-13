@@ -30,7 +30,7 @@ description: >-
 `--launch codex`，在最终 bootstrap 命令追加 `--ui paseo` 或 `--ui orca`，并提供对应的
 [Codex 设置](docs/codex-native.cn.md)、[Paseo Claude 设置](docs/paseo.cn.md)或
 [Orca Claude 设置](docs/orca.cn.md)。在配对客户端中使用聊天期间，项目主机需保持启动器运行。
-每次 Orca 启动会预留专用挂载点。
+每次 Orca 启动会预留专用挂载点；同一项目、同一 Agent 之后的启动可以继续已结束的聊天，由用户在启动器中选择。
 
 按确定的审批模式追加 `--approval auto`、`--approval normal`，或 `--yolo`（仅当用户明确要求免审批模式时）。中文使用 `RH_LANG=zh`，其他情况使用 `RH_LANG=en`。
 

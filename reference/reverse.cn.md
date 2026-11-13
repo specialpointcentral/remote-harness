@@ -107,7 +107,8 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 
 ## Orca 原生聊天
 
-为 `--launch claude` 或 `--launch codex` 选择 `--ui orca` 时，启动器在第 6 步前为此会话预留专用挂载点。Agent 主机上的
+为 `--launch claude` 或 `--launch codex` 选择 `--ui orca` 时，启动器在第 6 步前为此会话预留专用挂载点。
+启动也可以继续该项目同一 Agent 的一个已结束聊天（在启动器中选择），此时认领该聊天的挂载点。Agent 主机上的
 桥接进程请求 Orca Server 创建原生聊天标签页。关闭会话或归档其文件夹工作区会结束 Harness
 会话。[Claude 设置](../docs/orca.cn.md) · [Codex 设置](../docs/codex-native.cn.md)
 

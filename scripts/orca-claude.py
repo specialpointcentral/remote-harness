@@ -8,9 +8,9 @@ import subprocess
 import sys
 
 from native_workspace import CHAT_REQUIRED, protected
-from orca_native import (IDENTITIES, LEASE, MOUNTS, SESSION_NAME, UUID, OrcaError, active_lease,
-                         check_version, claude_command, config, private_dir, private_json,
-                         require_orca_version)
+from orca_native import (IDENTITIES, LEASE, MOUNTS, SESSION_NAME, UUID, OrcaError, SessionEnded,
+                         active_lease, check_version, claude_command, config, live_session, private_dir,
+                         private_json, require_orca_version)
 
 # These conflict with the Harness route or change the transcript identity. Orca's stream-json
 # flags and account environment pass through. Only the selected Harness chat is subject to this.
@@ -106,7 +106,7 @@ def main():
     session_name = record["session"]
     if not SESSION_NAME.fullmatch(session_name):
         raise OrcaError("Invalid Orca Harness session registration.")
-    session = private_dir(private_dir(home / ".sessions") / session_name)
+    session = live_session(home / ".sessions" / session_name)
     lease_path = session / LEASE
     token = record["token"]
     lease = active_lease(lease_path, token)
@@ -141,6 +141,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except SessionEnded as error:
+        print("remote-harness:", error, "To continue this chat, start a new Orca Harness launch for "
+              "the project and choose the chat when the launcher offers it.", file=sys.stderr)
     except OrcaError as error:
         print("remote-harness:", error, file=sys.stderr)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):

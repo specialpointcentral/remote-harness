@@ -331,6 +331,88 @@ exec {sys.executable!r} {str(fake)!r}
         self.assertNotEqual(stale.returncode, 0)
         self.assertEqual(stale.stdout, "")
 
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires Python 3.11+")
+    def test_orca_chat_keeps_its_conversation_for_a_later_session(self):
+        fake = self.home / "app-server.py"
+        fake.write_text("""
+import json, os, sys
+sessions = os.path.join(os.environ["CODEX_HOME"], "sessions")
+for line in sys.stdin:
+    frame = json.loads(line)
+    response = {"method": frame["method"]}
+    if frame["method"] == "thread/start":
+        response["thread"] = {"id": "private-thread"}
+        with open(os.path.join(sessions, "rollout-private-thread.jsonl"), "w") as rollout:
+            rollout.write("conversation\\n")
+    response["sessions"] = sorted(os.listdir(sessions))
+    print(json.dumps({"id": frame["id"], "result": response}), flush=True)
+""")
+        cli = self.script("codex", f"""
+if [ "$1" = "--version" ]; then echo 'codex-cli 0.167.0'; exit; fi
+if [ "$1" = debug ]; then echo '{{"models":[{{"slug":"fixture"}}]}}'; exit; fi
+exec {sys.executable!r} {str(fake)!r}
+""")
+        launch, lease, _ = prepare_proxy(self, cli, 'model = "fixture"\n')
+        session = lease.parent
+        mounts = self.rh / ".orca-mounts"
+        mounts.mkdir(mode=0o700)
+        mount = mounts / "chat"
+        mount.mkdir()
+        chat = "codex_" + "c" * 32
+        registry = self.rh / ".orca-codex-chats"
+        registry.mkdir(mode=0o700)
+        record = registry / (chat + ".json")
+        record.write_text(json.dumps({"cwd": str(mount), "session": session.name, "token": "test"}))
+        record.chmod(0o600)
+        lease.rename(session / "orca-lease.json")
+        for key in ("RH_CODEX_SESSION", "RH_CODEX_TOKEN"):
+            self.env.pop(key)
+        self.env.update(ORCA_AGENT_SESSION_ID=chat, ORCA_AGENT_SESSION_SPAWN_TOKEN="spawn",
+                        ORCA_APP_VERSION="1.4.254")
+        state = registry / (chat + ".state")
+
+        def serve(*calls):
+            with subprocess.Popen(launch, cwd=mount, env=self.env, text=True, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+                results = []
+                for index, (method, params) in enumerate(calls):
+                    child.stdin.write(json.dumps({"id": index, "method": method, "params": params}) + "\n")
+                    child.stdin.flush()
+                    line = child.stdout.readline()
+                    self.assertTrue(line, child.stderr.read() if not line else "")
+                    results.append(json.loads(line))
+                (session / "orca-lease.json").unlink()
+                self.assertEqual(child.wait(timeout=5), 0, child.stderr.read())
+                return results
+
+        started = serve(("thread/start", {}))[0]["result"]
+        self.assertEqual(started["sessions"], ["rollout-private-thread.jsonl"])
+        self.assertEqual(json.loads((state / "thread.json").read_text()), {"thread": "private-thread"})
+        self.assertEqual((state / "sessions" / "rollout-private-thread.jsonl").read_text(), "conversation\n")
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((session / "codex-home" / "sessions").resolve(), (state / "sessions").resolve())
+
+        # The launcher's cleanup removes the session; a later launch continues the chat.
+        shutil.rmtree(session / "codex-home")
+        (session / "codex-thread.json").unlink()
+        prepared = session / "orca-lease.json"
+        from orca_native import process_identity
+        prepared.write_text(json.dumps({
+            "token": "next", "pid": os.getpid(), "identity": process_identity(os.getpid()),
+            "cwd": str(mount), "approval": "normal", "python": sys.executable,
+            "env": {"PATH": str(session / "bin") + os.pathsep + self.env["PATH"]},
+        }))
+        prepared.chmod(0o600)
+        record.write_text(json.dumps({"cwd": str(mount), "session": session.name, "token": "next"}))
+        started, resumed = serve(("thread/start", {}), ("thread/resume", {"threadId": "private-thread"}))
+        self.assertIn("error", started)
+        self.assertEqual(resumed["result"]["sessions"], ["rollout-private-thread.jsonl"])
+        self.assertEqual(json.loads((session / "codex-thread.json").read_text()), {"thread": "private-thread"})
+        ended = subprocess.run(launch, cwd=mount, env=self.env, input="", capture_output=True,
+                               text=True, timeout=5)
+        self.assertNotEqual(ended.returncode, 0)
+        self.assertIn("This Harness session has ended. To continue this chat", ended.stderr)
+
 
 CODEX = os.environ.get("RH_TEST_CODEX_CLI")
 
