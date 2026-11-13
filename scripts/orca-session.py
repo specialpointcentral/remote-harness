@@ -13,14 +13,15 @@ import sys
 import time
 import uuid
 
-from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, OrcaError, check_version, claude_command,
-                         config, private_dir, private_json, probe_claude, process_identity,
-                         require_orca_version, write_once)
+from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, ORCA_VERSIONS, OrcaError, check_version,
+                         claude_command, config, private_dir, private_json, probe_claude,
+                         process_identity, require_orca_version, unverified_warning, write_once)
 
 # How long Orca Server may stay unreachable, for example while an automatic update restarts it.
 RESTART_GRACE = 120
 PERMISSION_MODES = {"normal": "ask", "auto": "auto", "yolo": "full-access"}
 MAX_FRAME = 8 * 1024 * 1024
+WARNED = set()
 
 
 class OrcaClient:
@@ -172,6 +173,14 @@ def published_workspace(client, workspace, cwd):
                for row in catalog["worktrees"])
 
 
+def require_server_version(status):
+    """Refuse an unsupported server build, and say once when an unverified patch build is accepted."""
+    version = status.get("appVersion")
+    if not require_orca_version(version) and version not in WARNED:
+        WARNED.add(version)
+        print(unverified_warning("Orca Server", version, ORCA_VERSIONS), file=sys.stderr, flush=True)
+
+
 def reconnect(configuration, wrapper, agent):
     """Return a client for the runtime the profile now names, once it passes the launch checks."""
     # A restarted server publishes a new socket and runtime ID in its profile.
@@ -181,8 +190,8 @@ def reconnect(configuration, wrapper, agent):
         settings = client.call("settings.get")["settings"]
     except (OrcaError, OSError, ValueError, KeyError, TypeError):
         return None
-    # An unverified update or a changed command ends the session instead of waiting.
-    require_orca_version(status.get("appVersion"))
+    # An unsupported update or a changed command ends the session instead of waiting.
+    require_server_version(status)
     check_wrapper(settings, wrapper, agent)
     return client if status.get("graphStatus") == "ready" else None
 
@@ -218,7 +227,7 @@ def main():
         raise OrcaError("Install the Orca Harness command wrapper on the agent host.")
     client = OrcaClient(configuration)
     status = client.call("status.get")
-    require_orca_version(status.get("appVersion"))
+    require_server_version(status)
     if status.get("graphStatus") != "ready":
         raise OrcaError("Start Orca Server and wait for its workspace graph to become ready.")
     check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
@@ -239,7 +248,7 @@ def main():
             subprocess.run([python, "-EsB", str(wrapper), "check-harness-version"], check=True,
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=10)
         except (OSError, subprocess.SubprocessError) as error:
-            raise OrcaError("Native Harness Codex requires Python 3.11+, codex-cli 0.167.0 and the private codex.json.") from error
+            raise OrcaError("Native Harness Codex requires Python 3.11+, a supported codex-cli and the private codex.json.") from error
         provider_id = session_id
     lease_path = session / LEASE
     token = str(uuid.uuid4())

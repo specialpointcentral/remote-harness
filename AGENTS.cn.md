@@ -46,7 +46,9 @@
 - 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
   创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
   预留记录，避免旧聊天获得新路由。桥接进程仅在重启后的 Orca Server 再次通过启动检查后才接管它；
-  两个包装器都会拒绝由未验证 Orca 版本（`ORCA_APP_VERSION`）启动的已绑定聊天。
+  两个包装器都会拒绝由不受支持的 Orca 版本（`ORCA_APP_VERSION`）启动的已绑定聊天。不在
+  `ORCA_VERSIONS` 中的版本，仅当它是已列出主次版本的更新补丁时才受支持，并在启动器中警告；
+  codex-cli 按 `CODEX_VERSIONS` 适用同一规则。
 - 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。
@@ -147,3 +149,8 @@ git diff --check
 
 完整远端服务器到本机项目的 SSHFS 流程仍需人工集成测试。未经用户要求不得 commit/push；只推送
 授权 fork。
+
+把 Orca Server 版本加入 `ORCA_VERSIONS` 之前，在 Agent 主机上运行
+`tests/verify-orca-version.sh <orcad 包或 CLI> [<上一版本的包或 CLI>]`；设置 `RH_TEST_CODEX_CLI`
+可同时测试原生 Codex 聊天。它只使用临时 profile。启动测试报告的 Claude 参数需先审查，再加入
+`KNOWN_FLAGS`。

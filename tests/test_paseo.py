@@ -18,7 +18,8 @@ from http.server import ThreadingHTTPServer
 from test_claude_hooks import CLAUDE, ClaudeSessionFixture, ModelFixture
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / 'scripts'
+# tests/verify-orca-version.sh points the native UI tests at a copy that also lists a candidate build.
+SCRIPTS = Path(os.environ.get('RH_TEST_SCRIPTS') or ROOT / 'scripts')
 
 
 class PaseoFixture(unittest.TestCase):

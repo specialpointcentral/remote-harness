@@ -15,6 +15,8 @@ import uuid
 
 from test_paseo import PaseoFixture, SCRIPTS
 
+REFUSED = "requires Orca Server 1.4.251 or 1.4.254, or a newer 1.4 patch release"
+
 
 class OrcaOptionTests(PaseoFixture):
     def test_public_bootstrap_passes_orca_to_reverse_launcher(self):
@@ -427,23 +429,37 @@ fi
         self.assertEqual(bridge.wait(timeout=10), 0, log.read_text())
         self.assertFalse((session / "orca-lease.json").exists())
 
-    def test_restart_into_an_unverified_build_releases_the_session(self):
-        bridge, log, session, _ = self.start_bridge("unverified-update")
+    def test_restart_into_an_unsupported_build_releases_the_session(self):
+        bridge, log, session, _ = self.start_bridge("unsupported-update")
         self.ready(bridge, log)
+        self.stop_runtime()
+        self.version = "1.5.0"
+        start = len(self.requests)
+        self.start_runtime("unsupported-runtime")
+        self.assertNotEqual(bridge.wait(timeout=10), 0, log.read_text())
+        self.assertIn(f"{REFUSED} (this server runs 1.5.0).", log.read_text())
+        self.assertFalse((session / "orca-lease.json").exists())
+        # The bridge only inspects the unsupported build; it never drives its chats or workspaces.
+        self.assertLessEqual({method for method, _ in self.requests[start:]}, {"status.get", "settings.get"})
+
+    def test_restart_into_a_newer_patch_build_keeps_the_session_with_a_warning(self):
+        bridge, log, session, _ = self.start_bridge("patch-update")
+        identity = self.ready(bridge, log)
+        self.assertNotIn("warning", log.read_text())
         self.stop_runtime()
         self.version = "1.4.255"
         start = len(self.requests)
-        self.start_runtime("unverified-runtime")
-        self.assertNotEqual(bridge.wait(timeout=10), 0, log.read_text())
-        self.assertIn("(this server runs 1.4.255).", log.read_text())
-        self.assertFalse((session / "orca-lease.json").exists())
-        # The bridge only inspects the unverified build; it never drives its chats or workspaces.
-        self.assertLessEqual({method for method, _ in self.requests[start:]}, {"status.get", "settings.get"})
+        self.start_runtime("patch-runtime")
+        self.wait_for_request("session.tabs.list", start, bridge, log)
+        self.assertTrue((session / "orca-lease.json").exists())
+        self.closed.add(identity)
+        self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+        self.assertEqual(log.read_text().count("Orca Server 1.4.255 has not been verified"), 1)
 
     def test_registered_chat_refuses_a_launch_from_an_unverified_orca_build(self):
         bridge, log, _, project = self.start_bridge("launch-version")
         identity = provider_id(self.ready(bridge, log))
-        for version in (None, "1.4.255"):
+        for version in (None, "1.5.0", "1.4.250"):
             with self.subTest(version=version):
                 env = {key: value for key, value in self.env.items() if key != "ORCA_APP_VERSION"}
                 if version:
@@ -451,10 +467,14 @@ fi
                 result = self.wrapper_call(project, "--resume", identity, env=env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
-                self.assertIn("requires Orca Server 1.4.251 or 1.4.254", result.stderr)
+                self.assertIn(REFUSED, result.stderr)
         # Ordinary chats elsewhere do not depend on the Orca build.
         normal = self.wrapper_call(self.home, "--session-id", str(uuid.uuid4()), env=env)
         self.assertEqual(normal.returncode, 0, normal.stderr)
+        # A newer patch build may resume the chat; the bridge already warned about it.
+        patched = self.wrapper_call(project, "--resume", identity,
+                                    env={**self.env, "ORCA_APP_VERSION": "1.4.255"})
+        self.assertEqual(patched.returncode, 0, patched.stderr)
 
     def test_orca_management_bash_is_blocked_before_routing_to_project_host(self):
         bridge, log, session, project = self.start_bridge("manager")
@@ -562,26 +582,27 @@ fi
         self.assertFalse(self.sessions)
 
     def test_unverified_runtime_version_refuses_before_workspace_or_chat(self):
-        for label, version, running in (("newer-version", "1.4.252", "1.4.252"),
+        for label, version, running in (("older-patch", "1.4.250", "1.4.250"),
+                                        ("next-minor", "1.5.0", "1.5.0"),
                                         ("odd-version", "1.4.254\nforged", "an unknown version"),
                                         ("missing-version", None, "an unknown version")):
             with self.subTest(version=version):
                 self.version = version
                 bridge, log, _, _ = self.start_bridge(label)
                 self.assertNotEqual(bridge.wait(timeout=8), 0, log.read_text())
-                self.assertIn("requires Orca Server 1.4.251 or 1.4.254 "
-                              f"(this server runs {running}).", log.read_text())
+                self.assertIn(f"{REFUSED} (this server runs {running}).", log.read_text())
                 self.assertFalse(self.workspaces)
                 self.assertFalse(self.sessions)
 
-    def test_each_verified_runtime_version_starts_a_chat(self):
-        for version in ("1.4.251", "1.4.254"):
+    def test_supported_runtime_versions_start_a_chat(self):
+        for version, warned in (("1.4.251", False), ("1.4.254", False), ("1.4.255", True)):
             with self.subTest(version=version):
                 self.version = version
-                bridge, log, _, _ = self.start_bridge("verified-" + version.replace(".", "-"))
+                bridge, log, _, _ = self.start_bridge("supported-" + version.replace(".", "-"))
                 self.ready(bridge, log)
                 bridge.terminate()
                 self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+                self.assertEqual("has not been verified" in log.read_text(), warned, log.read_text())
 
 
 if __name__ == "__main__":

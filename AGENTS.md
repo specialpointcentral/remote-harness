@@ -49,7 +49,9 @@ it provides files over SSHFS and executes project commands through a forced gate
   same-host Orca Server. The configured wrapper binds the chat identity and mount to a lease.
   Keep the identity and mount reservations across cleanup so old chats cannot acquire a new route.
   The bridge adopts a restarted Orca Server only after it passes the startup checks again, and both
-  wrappers refuse a bound chat launched by an unverified Orca build (`ORCA_APP_VERSION`).
+  wrappers refuse a bound chat launched by an unsupported Orca build (`ORCA_APP_VERSION`). A build
+  outside `ORCA_VERSIONS` is supported only as a newer patch of a listed major.minor, with a
+  launcher warning; codex-cli follows the same rule with `CODEX_VERSIONS`.
 - With Codex and either native UI, the configured wrapper starts a private stdio app server with
   built-in shell and code execution disabled. The app server enforces native approval on the
   private MCP command tool. The command tool checks the lease, gateway policy and Codex rules
@@ -171,6 +173,11 @@ CI does: the real local-SFTP mount tests then fail instead of skipping when they
 
 The full remote-server-to-local-project SSHFS flow remains a manual integration test. Never commit
 or push unless the user asks; push only the authorized fork.
+
+Before adding an Orca Server build to `ORCA_VERSIONS`, run
+`tests/verify-orca-version.sh <orcad-bundle-or-cli> [<previous-bundle-or-cli>]` on the agent host,
+with `RH_TEST_CODEX_CLI` set to include native Codex chats. It uses throwaway profiles. Review any
+Claude flag its launch test reports before adding the flag to `KNOWN_FLAGS`.
 
 On the agent host with Claude installed, also run
 `RH_TEST_CLAUDE_CLI=/absolute/path/to/claude python3 tests/test_claude_hooks.py -v`.

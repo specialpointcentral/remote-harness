@@ -15,20 +15,50 @@ CODEX_CHATS = ".orca-codex-chats"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 SESSION_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # Orca Server builds whose runtime RPCs and agent launches Harness has been verified against.
+# tests/verify-orca-version.sh checks a new build before it is added here.
 ORCA_VERSIONS = ("1.4.251", "1.4.254")
+VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
 
 
 class OrcaError(Exception):
     pass
 
 
+def version_support(version, verified):
+    """True for a verified build, False for a newer patch of a verified major.minor, else None."""
+    if version in verified:
+        return True
+    match = VERSION.fullmatch(version) if isinstance(version, str) else None
+    if match:
+        found = tuple(map(int, match.groups()))
+        for known in verified:
+            known = tuple(map(int, known.split(".")))
+            if found[:2] == known[:2] and found[2] > known[2]:
+                return False
+    return None
+
+
+def describe_versions(verified):
+    lines = dict.fromkeys(".".join(version.split(".")[:2]) for version in verified)
+    return f"{' or '.join(verified)}, or a newer {' or '.join(lines)} patch release"
+
+
+def shown_version(version):
+    return version if isinstance(version, str) and VERSION.fullmatch(version) else "an unknown version"
+
+
+def unverified_warning(product, version, verified):
+    return (f"remote-harness: warning: {product} {version} has not been verified with Harness "
+            f"(verified: {', '.join(verified)}). Continuing because it is a newer patch release.")
+
+
 def require_orca_version(version):
-    """Refuse an Orca Server build Harness has not verified, naming the build that is running."""
-    if version not in ORCA_VERSIONS:
-        running = (version if isinstance(version, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}", version)
-                   else "an unknown version")
-        raise OrcaError(f"Orca Harness requires Orca Server {' or '.join(ORCA_VERSIONS)} "
-                        f"(this server runs {running}).")
+    """Return whether the Orca Server build is verified; refuse builds outside the patch policy."""
+    support = version_support(version, ORCA_VERSIONS)
+    if support is None:
+        raise OrcaError(f"Orca Harness requires Orca Server {describe_versions(ORCA_VERSIONS)} "
+                        f"(this server runs {shown_version(version)}).")
+    return support
 
 
 def private_dir(path, create=False):

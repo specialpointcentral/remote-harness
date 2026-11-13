@@ -117,9 +117,10 @@ function checkCodexCommand(config) {
 function checkCodex(config, python) {
   const wrapper = checkCodexCommand(config);
   try {
-    execFileSync(python, ["-EsB", wrapper, "check-harness-version"], { stdio: ["ignore", "ignore", "ignore"], timeout: 10000 });
+    // stderr reaches the launcher: it names an unsupported codex-cli or warns about an unverified patch.
+    execFileSync(python, ["-EsB", wrapper, "check-harness-version"], { stdio: ["ignore", "ignore", "inherit"], timeout: 10000 });
   } catch {
-    throw new BridgeError("Native Harness Codex requires Python 3.11+, codex-cli 0.167.0 and the private codex.json.");
+    throw new BridgeError("Native Harness Codex requires Python 3.11+, a supported codex-cli and the private codex.json.");
   }
 }
 

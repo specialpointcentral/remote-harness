@@ -16,9 +16,11 @@ import threading
 
 from native_workspace import CHAT_REQUIRED, protected
 from orca_native import (CODEX_CHATS, LEASE, MOUNTS, SESSION_NAME, OrcaError, active_lease,
-                         private_dir, private_json, require_orca_version, write_once)
+                         describe_versions, private_dir, private_json, require_orca_version,
+                         shown_version, unverified_warning, version_support, write_once)
 
-CODEX_VERSION = "0.167.0"
+# codex-cli builds whose app-server protocol Harness has been verified against.
+CODEX_VERSIONS = ("0.167.0",)
 PASEO_LEASE = "paseo-lease.json"
 PASEO_SESSION_ENV = "RH_CODEX_SESSION"
 PASEO_TOKEN_ENV = "RH_CODEX_TOKEN"
@@ -81,11 +83,16 @@ def real_command(home, wrapper):
     return command.resolve()
 
 
-def check_version(command):
+def check_version(command, warn=False):
     output = subprocess.check_output([str(command), "--version"], stdin=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, timeout=8, text=True)
-    if output.strip() != "codex-cli " + CODEX_VERSION:
-        raise OrcaError(f"Native Harness Codex requires codex-cli {CODEX_VERSION}.")
+                                     stderr=subprocess.DEVNULL, timeout=8, text=True).strip()
+    version = output[len("codex-cli "):] if output.startswith("codex-cli ") else None
+    support = version_support(version, CODEX_VERSIONS)
+    if support is None:
+        raise OrcaError(f"Native Harness Codex requires codex-cli {describe_versions(CODEX_VERSIONS)} "
+                        f"(this installation runs {shown_version(version)}).")
+    if not support and warn:
+        print(unverified_warning("codex-cli", version, CODEX_VERSIONS), file=sys.stderr, flush=True)
 
 
 def orca_binding(home, cwd, env):
@@ -461,7 +468,7 @@ def main():
     if args == ["check-harness-version"]:
         if sys.version_info < (3, 11):
             raise OrcaError("Native Harness Codex requires Python 3.11 or newer.")
-        check_version(command)
+        check_version(command, warn=True)
         return
     if args in (["--version"], ["-V"], ["--help"], ["-h"]):
         os.execv(command, [str(command), *args])

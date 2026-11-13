@@ -5,9 +5,10 @@
 
 ## Agent 主机设置
 
-安装当前版本的 Harness 脚本。原生 Codex 要求 **codex-cli 0.167.0**，且 Harness 的 SSH 登录环境
-需要 **Python 3.11+**。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+，或 Orca Server
-（**1.4.251** 或 **1.4.254**）。管理器和 Harness 登录必须使用同一个 Unix 账号。安装客户端和配对的步骤见
+安装当前版本的 Harness 脚本。原生 Codex 已验证的版本为 **codex-cli 0.167.0**，且 Harness 的
+SSH 登录环境需要 **Python 3.11+**。更新的 0.167 补丁版本会被接受，并在启动器中显示警告；其他版本
+会被拒绝。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+，或 [Orca 指南](orca.cn.md)所述受支持的
+Orca Server。管理器和 Harness 登录必须使用同一个 Unix 账号。安装客户端和配对的步骤见
 [Paseo 指南](paseo.cn.md)或 [Orca 指南](orca.cn.md)。
 
 在 Agent 主机的私有文件中配置 Codex 可执行文件。请替换示例中的绝对路径。
@@ -88,9 +89,9 @@ Orca Server 重启时的处理见 [Orca 指南](orca.cn.md#启动与退出)。
 命令。确认文件和命令结果都来自项目主机。启动器仍运行时关闭并重开应用，然后发送后续消息。
 结束会话后，确认旧聊天不能执行新命令。
 
-维护者可用独立的本地回环模型测试 app server 和两套真实管理器。管理器测试需要固定版本的 Orca CLI，
+维护者可用独立的本地回环模型测试 app server 和两套真实管理器。管理器测试需要受支持版本的 Orca CLI，
 以及包含 `@getpaseo/client@0.15.3` 和 `@getpaseo/server@0.15.3` 的 `node_modules` 目录。
-两条测试命令均需要 `zstd`。
+两条测试命令均需要 `zstd`。`tests/verify-orca-version.sh` 可从 orcad 包构建 Orca CLI 并运行 Orca 测试。
 
 ```bash
 RH_TEST_CODEX_CLI=/absolute/path/to/codex python3 tests/test_native_codex.py -v

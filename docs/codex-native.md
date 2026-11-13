@@ -6,10 +6,11 @@ Project files remain on the project host.
 
 ## Agent host setup
 
-Install the current Harness scripts. Native Codex requires **codex-cli 0.167.0** and **Python
-3.11+** in the Harness SSH login environment. Use Paseo daemon **0.15.3** with Node.js 22+, or
-Orca Server **1.4.251** or **1.4.254**. The manager and the Harness login must run as the same
-Unix user.
+Install the current Harness scripts. Native Codex is verified with **codex-cli 0.167.0** and
+requires **Python 3.11+** in the Harness SSH login environment. A newer 0.167 patch release of
+codex-cli is accepted with a warning in the launcher; other versions are refused. Use Paseo daemon
+**0.15.3** with Node.js 22+, or a supported Orca Server as described in the [Orca guide](orca.md).
+The manager and the Harness login must run as the same Unix user.
 For client installation and pairing, see the [Paseo guide](paseo.md) or [Orca guide](orca.md).
 
 On the agent host, set the actual Codex executable in a private file. Substitute its absolute path.
@@ -108,8 +109,9 @@ project host. Reopen the app and send a follow-up while the launcher is live. En
 and check that the old chat cannot run a new command.
 
 Maintainers can exercise the app server and both installed managers with an isolated loopback
-model. The manager test expects the pinned Orca CLI and a `node_modules` directory containing
+model. The manager test expects a supported Orca CLI and a `node_modules` directory containing
 `@getpaseo/client@0.15.3` and `@getpaseo/server@0.15.3`. Both test commands require `zstd`.
+`tests/verify-orca-version.sh` builds an Orca CLI from an orcad bundle and runs the Orca tests.
 
 ```bash
 RH_TEST_CODEX_CLI=/absolute/path/to/codex python3 tests/test_native_codex.py -v

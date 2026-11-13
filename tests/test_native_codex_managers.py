@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Opt-in tests of the native manager RPCs with the pinned Codex and a loopback model."""
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 import hashlib
+import importlib.util
 from http.server import ThreadingHTTPServer
 import json
 import os
@@ -23,8 +24,11 @@ from fixtures.codex_native_model import Model
 from test_native_codex import CODEX
 from test_paseo import ROOT, SCRIPTS
 
+_spec = importlib.util.spec_from_file_location("orca_native", SCRIPTS / "orca_native.py")
+orca_native = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(orca_native)
+
 ORCA = os.environ.get("RH_TEST_ORCA_CLI")
-ORCA_VERSIONS = ("1.4.251", "1.4.254")
 PASEO = os.environ.get("RH_TEST_PASEO_NODE_MODULES")
 PASEO_DRIVER = ROOT / "tests" / "fixtures" / "codex_native_paseo.mjs"
 PROMPT = "RH_START_CHILD Start the fixture subagent."
@@ -212,20 +216,20 @@ supports_websockets = false
         self.assertEqual(len(self.server.requests), model_requests, "Late approval reached Codex")
         self.verify_effects(approved=False)
 
-    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251 or 1.4.254")
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to a supported Orca CLI")
     def test_orca_approves_child_command_and_applies_child_edit(self):
         self.exercise_orca(approve=True)
 
-    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251 or 1.4.254")
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to a supported Orca CLI")
     def test_orca_revokes_lease_with_child_approval_pending(self):
         self.exercise_orca(approve=False)
 
-    def exercise_orca(self, approve):
-        self.assertIn(subprocess.check_output([ORCA, "--version"], text=True, timeout=10).strip(),
-                      ORCA_VERSIONS)
+    def prepare_orca(self, *clis):
+        for cli in clis:
+            version = subprocess.check_output([cli, "--version"], text=True, timeout=10).strip()
+            self.assertIsNotNone(orca_native.version_support(version, orca_native.ORCA_VERSIONS), version)
         profile = self.home / "profile"
         profile.mkdir(mode=0o700)
-        orca = Orca(profile)
         self.env.update(ORCA_USER_DATA_PATH=str(profile), ORCA_SERVE_RUNTIME="electron",
                         TMPDIR=str(self.home), LANG="en_US.UTF-8")
         (self.rh / ".orca-mounts").mkdir(mode=0o700)
@@ -236,10 +240,92 @@ supports_websockets = false
         config.chmod(0o600)
         with socket.socket() as temporary_port:
             temporary_port.bind(("127.0.0.1", 0))
-            port = temporary_port.getsockname()[1]
-        log = self.home / "orca.log"
-        with process([ORCA, "serve", "--no-pairing", "--port", str(port)], self.env, self.home, log):
-            wait_for(orca.ready, detail=log.read_text)
+            return Orca(profile), temporary_port.getsockname()[1]
+
+    def serve_orca(self, servers, cli, orca, port, name):
+        log = self.home / f"orca-{name}.log"
+        servers.enter_context(process([cli, "serve", "--no-pairing", "--port", str(port)],
+                                      self.env, self.home, log))
+        wait_for(orca.ready, 90, detail=log.read_text)
+        return orca.call("status.get")
+
+    def orca_chat(self, orca, session_id):
+        """The page, envelope and send helpers the native chat RPCs need."""
+        def page():
+            return orca.call("agentSession.history", {
+                "sessionId": session_id, "direction": "tail", "limit": 80,
+            })["page"]
+
+        def envelope(method, fields):
+            data = {"method": method, "sessionId": session_id, "fields": fields}
+            return {"sessionId": session_id,
+                    "clientOperationId": f"{int(time.time()*1000)}-{uuid.uuid4().hex}",
+                    "expectedRuntimeFence": page()["fence"],
+                    "payloadFingerprint": hashlib.sha256(json.dumps(
+                        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                    ).encode()).hexdigest()}
+
+        def send(text):
+            body = {"kind": "message", "role": "user", "blocks": [{"type": "text", "text": text}]}
+            sent = orca.call("agentSession.send", {
+                "envelope": envelope("agentSession.send", {"body": body}), "body": body,
+            })
+            self.assertTrue(sent["ok"], sent)
+
+        def pending():
+            return next((item for item in page()["items"]
+                         if item["body"].get("kind") == "approval"
+                         and item["body"]["resolution"]["state"] == "pending"), None)
+
+        def respond(approval):
+            fields = {"itemId": approval["itemId"], "expectedRevision": approval["revision"],
+                      "optionId": next(o["id"] for o in approval["body"]["options"]
+                                       if o["label"] == "Allow")}
+            return orca.call("agentSession.respondToApproval", {
+                "envelope": envelope("agentSession.respondTo:approval", fields), **fields,
+            })
+        return page, send, pending, respond
+
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to a supported Orca CLI")
+    def test_orca_codex_chat_survives_server_restart(self):
+        # RH_TEST_ORCA_AFTER switches builds across the restart, as an automatic update does.
+        after = os.environ.get("RH_TEST_ORCA_AFTER") or ORCA
+        orca, port = self.prepare_orca(ORCA, after)
+        with ExitStack() as servers:
+            first = self.serve_orca(servers, ORCA, orca, port, "before")
+            orca.call("settings.mutateAgentLaunch", {
+                "type": "command", "agent": "codex", "value": str(self.scripts / "native-codex.py"),
+            })
+            with self.bridge("orca") as (bridge, session_id):
+                page, send, pending, respond = self.orca_chat(orca, session_id)
+                # One ordinary turn, so the private app server and the Codex thread exist.
+                send("hello before the restart")
+                wait_for(self.backend_pid, 40, detail=lambda: json.dumps(page())[-3000:])
+                wait_for(lambda: not page()["working"], 40)
+                thread = self.root_thread()
+                servers.close()
+                wait_for(lambda: self.backend_pid() is None, 20)
+                second = self.serve_orca(servers, after, orca, port, "after")
+                self.assertNotEqual(first["runtimeId"], second["runtimeId"])
+                send(PROMPT)
+                approval = wait_for(pending, 40, detail=lambda: json.dumps(page())[-4000:])
+                self.verify_approval(approval["agentId"], approval["body"]["title"])
+                self.assertEqual(self.root_thread(), thread, "The chat must resume its Codex thread")
+                responded = respond(approval)
+                self.assertTrue(responded["ok"], responded)
+                self.verify_effects(True)
+                wait_for(lambda: not page()["working"])
+                # A restarted runtime may not list the chat tab again, so end like Ctrl-C.
+                time.sleep(5)
+                self.assertIsNone(bridge.poll(), (self.home / "bridge.log").read_text())
+                bridge.terminate()
+            self.verify_effects(True)
+            self.assertNotIn("Lost contact", (self.home / "bridge.log").read_text())
+
+    def exercise_orca(self, approve):
+        orca, port = self.prepare_orca(ORCA)
+        with ExitStack() as servers:
+            self.serve_orca(servers, ORCA, orca, port, "server")
             orca.call("settings.mutateAgentLaunch", {
                 "type": "command", "agent": "codex", "value": str(self.scripts / "native-codex.py"),
             })
@@ -249,44 +335,12 @@ supports_websockets = false
                 visible = [row for row in catalog["worktrees"] if row["path"] == str(self.mount)]
                 self.assertEqual(len(visible), 1, "The desktop client must discover the Harness workspace")
                 self.assertEqual(visible[0]["workspaceKind"], "folder-workspace")
-
-                def page():
-                    return orca.call("agentSession.history", {
-                        "sessionId": session_id, "direction": "tail", "limit": 80,
-                    })["page"]
-
-                def envelope(method, fields):
-                    data = {"method": method, "sessionId": session_id, "fields": fields}
-                    return {"sessionId": session_id,
-                            "clientOperationId": f"{int(time.time()*1000)}-{uuid.uuid4().hex}",
-                            "expectedRuntimeFence": page()["fence"],
-                            "payloadFingerprint": hashlib.sha256(json.dumps(
-                                data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                            ).encode()).hexdigest()}
-
-                def pending():
-                    return next((item for item in page()["items"]
-                                 if item["body"].get("kind") == "approval"
-                                 and item["body"]["resolution"]["state"] == "pending"), None)
-
-                body = {"kind": "message", "role": "user", "blocks": [{"type": "text", "text": PROMPT}]}
-                sent = orca.call("agentSession.send", {
-                    "envelope": envelope("agentSession.send", {"body": body}), "body": body,
-                })
-                self.assertTrue(sent["ok"], sent)
+                page, send, pending, respond = self.orca_chat(orca, session_id)
+                send(PROMPT)
                 approval = wait_for(pending, detail=lambda: json.dumps(page())[-5000:])
                 self.verify_approval(approval["agentId"], approval["body"]["title"])
-                fields = {"itemId": approval["itemId"], "expectedRevision": approval["revision"],
-                          "optionId": next(o["id"] for o in approval["body"]["options"]
-                                           if o["label"] == "Allow")}
-
-                def respond():
-                    return orca.call("agentSession.respondToApproval", {
-                        "envelope": envelope("agentSession.respondTo:approval", fields), **fields,
-                    })
-
                 if approve:
-                    responded = respond()
+                    responded = respond(approval)
                     self.assertTrue(responded["ok"], responded)
                     self.verify_effects(approve)
                     wait_for(lambda: not page()["working"])
@@ -294,7 +348,7 @@ supports_websockets = false
                 else:
                     def late_approval():
                         with suppress(RuntimeError):
-                            respond()
+                            respond(approval)
 
                     self.revoke_pending(bridge, late_approval)
             self.verify_effects(approve)

@@ -102,7 +102,7 @@ class NativeCodexTests(PaseoFixture):
                 self.assertIn("original Harness launch command on the project host", result.stderr)
                 self.assertFalse((self.home / "codex-started").exists())
         # A registered chat resumed by an unverified Orca build is refused before Codex starts.
-        for version in (None, "1.4.255"):
+        for version in (None, "1.5.0"):
             with self.subTest(version=version):
                 env = {key: value for key, value in self.env.items() if key != "ORCA_APP_VERSION"}
                 env.update(ORCA_AGENT_SESSION_ID=registered, ORCA_AGENT_SESSION_SPAWN_TOKEN="spawn")
@@ -112,7 +112,8 @@ class NativeCodexTests(PaseoFixture):
                                         capture_output=True, text=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
-                self.assertIn("requires Orca Server 1.4.251 or 1.4.254", result.stderr)
+                self.assertIn("requires Orca Server 1.4.251 or 1.4.254, or a newer 1.4 patch",
+                              result.stderr)
                 self.assertFalse((self.home / "codex-started").exists())
         # The same normal Orca identity still launches outside a Harness workspace.
         env = {**self.env, "ORCA_AGENT_SESSION_ID": extra,
@@ -121,6 +122,32 @@ class NativeCodexTests(PaseoFixture):
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.home / "codex-started").exists())
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "requires Python 3.11+")
+    def test_codex_cli_patch_policy(self):
+        scripts = self.rh / "scripts"
+        scripts.mkdir(parents=True)
+        for name in ("native-codex.py", "orca_native.py", "native_workspace.py"):
+            shutil.copy2(SCRIPTS / name, scripts / name)
+        config = self.rh / "codex.json"
+        cli = self.home / "codex-version"
+        config.write_text(json.dumps({"codex": str(cli)}))
+        config.chmod(0o600)
+        check = [sys.executable, "-EsB", str(scripts / "native-codex.py"), "check-harness-version"]
+        for reported, accepted, warned in (("codex-cli 0.167.0", True, False),
+                                           ("codex-cli 0.167.4", True, True),
+                                           ("codex-cli 0.168.0", False, False),
+                                           ("codex-cli 0.166.9", False, False),
+                                           ("codex 0.167.0", False, False)):
+            with self.subTest(reported=reported):
+                cli.write_text(f"#!/bin/sh\necho '{reported}'\n")
+                cli.chmod(0o755)
+                result = subprocess.run(check, env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual("has not been verified" in result.stderr, warned, result.stderr)
+                if not accepted:
+                    self.assertIn("requires codex-cli 0.167.0, or a newer 0.167 patch release",
+                                  result.stderr)
 
     def test_reverse_injector_prepares_both_native_codex_bridges(self):
         self.script("ssh", "exit 1\n")
