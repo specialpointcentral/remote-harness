@@ -69,6 +69,14 @@ Claude 和 Codex 的 hook 以及 opencode 插件把路由调用改写成 `rh-run
 Claude 的 hook 不返回审批决定：hook 返回 `allow` 会跳过 Claude 的审批提示和 auto 模式的自动审核；
 不返回决定时，Claude 按会话的审批模式判断改写后的调用。
 
+没有上下文时，自动审核可能把 rh-run 形式当成绕过它的 shell 间接调用，把普通只读命令按 Auto-Mode
+Bypass 拒绝。因此会话设置加了一条 `autoMode.environment`。这一条写明本会话 runner 的路径，说明这种
+改写是用户通往项目主机的通道。它要求自动审核像直接执行一样，按所有规则判断引号里的命令，不把包装本身
+当作绕过。它不添加任何放行规则。Claude 会把这一条追加在用户和托管设置的 environment 之后。只有某个
+列表含有 `"$defaults"` 时，内置 environment 才继续生效。只有在会话启动时，用户设置（`$CLAUDE_CONFIG_DIR`
+或 `~/.claude`）和托管设置都没有定义 environment，会话才加上 `"$defaults"`。所以用户自己的
+environment 既不会被替换，也不会被重复。
+
 Claude 要求 2.1.295 或更新版本。路由 `PreToolUse` hook 设置 `onFailure: "block"`：hook 无法启动、
 超时、崩溃或返回无效 JSON 时，Claude 会阻止调用，避免 Bash 在 Agent 主机上执行未经改写的原命令。
 默认的 hook 失败行为会在没有路由改写的情况下继续普通审批流程；Python 的异常捕获无法覆盖被 Claude

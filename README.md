@@ -359,7 +359,8 @@ remote-harness/
   只写进**本次会话**的配置，2.x 改用本次启动的 `--auto` 参数，退出即失效。
 - Claude、终端 Codex 和 opencode 的 Bash 调用被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
   自动审核看到的是原命令。Claude 仍按你选的审批模式处理：普通模式询问，auto 模式由自动审核判断，YOLO
-  不询问。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
+  不询问。会话设置会告诉自动审核这种改写是 Harness 的通道，让它判断引号里的命令，而不是把包装当成绕过
+  尝试拒绝。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
   deny 规则命中命令中任一段（含 `$(...)`、`sudo` 包装）即拒绝，ask 规则强制询问；allow 规则只在普通、
   acceptEdits、dontAsk 模式下放行不含管道、重定向、变量、通配符的单条命令，其余仍询问。auto 模式交给
   自动审核。Claude 自己按命令文本做的内置检查看不到原命令：只读命令（`ls`、`git status`）在普通模式下也会
@@ -799,7 +800,9 @@ remote-harness/
   and both are gone on exit.
 - Claude, terminal Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
   approval prompts and automatic review show the original command. Claude still applies your approval
-  mode: normal asks, auto lets the classifier decide, YOLO does not ask. Claude can match permission
+  mode: normal asks, auto lets the classifier decide, YOLO does not ask. The session settings tell the
+  classifier that the rewrite is the harness transport, so it judges the quoted command rather than
+  denying the wrapper as a bypass attempt. Claude can match permission
   rules only against the rewritten text, so the hook checks the original command against your
   `Bash(...)` rules: a deny rule matching any part of it (`$(...)` and `sudo` wrappers included) denies,
   an ask rule asks, and an allow rule approves a single command without pipes, redirections,

@@ -60,6 +60,8 @@
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成
   可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 和 opencode
   插件写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。
+  会话设置加一条 `autoMode.environment`，写明 runner，要求自动审核判断引号里的命令，而不是包装本身。
+  它绝不添加放行规则；只有会话启动时用户和托管设置都没有 environment，才带上 `"$defaults"`。
 - Claude 只能看到 rh-run，所以它的 hook 用原始命令对照用户自己的规则：`Bash(...)` deny/ask 对共享词法器
   找到的任意一条简单命令生效，allow 只在 default/acceptEdits/dontAsk 模式（绝不包括 auto）下对单条普通命令
   生效。规则文件只在标识变化时重读。Codex 和 opencode 自己检查原命令：改写后在 `exit` 之后另起一行附上

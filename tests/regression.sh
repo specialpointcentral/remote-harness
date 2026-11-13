@@ -1009,7 +1009,7 @@ PY
     "$ROOT/scripts/inject-rule.sh" off claude "$tool_mount" "claude.$claude_variant" >/dev/null
 done
 
-RH_HOME="$rh_home" HOME="$home_dir" \
+env -u CLAUDE_CONFIG_DIR RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude" 0 "$basic_ssh_cfg" > "$tmp/inject-claude.out"
 assert_grep "$tmp/inject-claude.out" "--settings '" "inject claude session settings"
 assert_grep "$tmp/inject-claude.out" "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0" "inject claude disables experimental agent teams"
@@ -1023,6 +1023,8 @@ claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-
 claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
 python3 - "$claude_settings" "$rh_home/.sessions" <<'PY'
 import json
+import os
+import shlex
 import sys
 
 settings = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -1035,6 +1037,16 @@ assert hook["hooks"][0]["timeout"] > 10  # the shell policy subprocess has a 10-
 # Session files (gateway key, SSH config, runner, private logs) stay out of Claude's file tools.
 assert settings["permissions"]["deny"] == ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
                                            f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)"], settings
+# Auto mode's classifier learns what the rewritten runner form is. The user has no environment of
+# their own here, so the shipped one stays in effect (a host's managed settings may hold one).
+words = shlex.split(hook["hooks"][0]["command"])
+runner = words[words.index("--runner") + 1]
+environment = settings["autoMode"]["environment"]
+assert environment[-1].startswith("**Remote-harness routing**: "), environment
+assert f"`{runner} [--background] --cwd <dir> -- '<command>'`" in environment[-1], environment
+assert "Auto-Mode Bypass" in environment[-1], environment
+managed = "/Library/Application Support/ClaudeCode" if sys.platform == "darwin" else "/etc/claude-code"
+assert environment[:-1] == ["$defaults"] or (environment[:-1] == [] and os.path.isdir(managed)), environment
 worktree_hook = settings["hooks"]["WorktreeCreate"][0]["hooks"][0]
 assert worktree_hook["type"] == "command"
 assert "deny-worktree" in worktree_hook["command"]
@@ -1049,6 +1061,21 @@ assert_grep_e "$tmp/inject-claude.out" "^RH_PROCESS_LIST_SHARED=[01]$" "inject r
 cp "$rh_home/.sessions/$claude_session_key/bin/rh-session" "$tmp/claude-rh-session"
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude" >/dev/null
+# A user environment of their own replaces the shipped one (or keeps it with "$defaults"); the
+# session adds only its entry, so it neither brings back nor duplicates the shipped environment.
+mkdir -p "$tmp/claude-config-am"
+printf '%s\n' '{"autoMode":{"environment":["**Organization**: Example"]}}' > "$tmp/claude-config-am/settings.json"
+CLAUDE_CONFIG_DIR="$tmp/claude-config-am" RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude-am" 0 "$basic_ssh_cfg" >/dev/null
+python3 - "$rh_home/.sessions/$(printf '%s' "$tmp/mount-claude-am" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')/claude-settings.json" <<'PY'
+import json
+import sys
+
+environment = json.load(open(sys.argv[1], encoding="utf-8"))["autoMode"]["environment"]
+assert len(environment) == 1 and environment[0].startswith("**Remote-harness routing**: "), environment
+PY
+RH_HOME="$rh_home" HOME="$home_dir" \
+  "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude-am" >/dev/null
 # Without its session directory the launcher starts no watcher; it only prepares the agent's environment.
 assert_eq "the agent sees no laptop address in SSH_CONNECTION/SSH_CLIENT" \
   "$(SSH_CONNECTION='192.0.2.7 51234 10.0.0.5 22' SSH_CLIENT='192.0.2.7 51234 22' \

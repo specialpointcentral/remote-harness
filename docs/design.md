@@ -83,6 +83,17 @@ Claude's hook returns no permission decision: a hook `allow` would skip Claude's
 its auto-mode classifier; without one, Claude judges the rewritten call under the session's approval
 mode.
 
+Without context, the classifier can take the rh-run form for shell indirection around itself and
+deny an ordinary read-only command as Auto-Mode Bypass. The session settings therefore add an
+`autoMode.environment` entry. It names the session's runner path and states that the rewrite is the
+user's transport to the project host. It asks the classifier to judge the quoted command under every
+rule, as if it ran directly, and not to treat the wrapper itself as a bypass. It adds no allow rule.
+Claude appends this entry to the user's and managed environment entries. The shipped environment
+stays in effect only while some list contains `"$defaults"`. The session adds `"$defaults"` only
+when neither the user's settings (`$CLAUDE_CONFIG_DIR` or `~/.claude`) nor managed settings define an
+environment when the session starts. A user's own environment is therefore neither replaced nor
+duplicated.
+
 Claude requires version 2.1.295 or newer. Its routing `PreToolUse` hook sets `onFailure: "block"`:
 if the hook cannot start, times out, crashes or returns invalid JSON, Claude blocks the call before
 Bash can execute the original command on the agent host. The default hook failure behavior would

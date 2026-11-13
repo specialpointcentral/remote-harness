@@ -536,7 +536,7 @@ write_reply_language_hook() {  # $1=session dir $2=note -> prints the hook comma
   printf 'cat >/dev/null; cat %s' "$(sq "$_wrl_file")"
 }
 
-write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker $4=reply language hook command
+write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker $4=reply language hook command $5=runner
   _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
   _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
   _wcs_prompt=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4") || return 1
@@ -551,6 +551,35 @@ for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
         roots.append(root)
         rules += [f"{tool}(/{root}/**)" for tool in ("Read", "Edit")]
 print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
+  # Auto mode's classifier judges the rewritten runner form. Without context it can take the runner
+  # for shell indirection around itself (Auto-Mode Bypass) and deny a plain read-only command. This
+  # environment entry names the transport and keeps every rule on the quoted command. Claude appends
+  # these entries to the user's and managed ones, and its shipped environment stays only while some
+  # list holds "$defaults". A user or managed list of its own replaces or extends the shipped one,
+  # so "$defaults" is added only when neither exists when the session starts.
+  _wcs_auto=$("$PYTHON3" -c '
+import json, os, sys
+managed = "/Library/Application Support/ClaudeCode" if sys.platform == "darwin" else "/etc/claude-code"
+config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+paths = [os.path.join(config, "settings.json"), os.path.join(managed, "managed-settings.json")]
+try:
+    drop_ins = os.path.join(managed, "managed-settings.d")
+    paths += [os.path.join(drop_ins, name) for name in sorted(os.listdir(drop_ins))
+              if name.endswith(".json") and not name.startswith(".")]
+except OSError:
+    pass
+def own_environment(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            environment = json.load(stream)["autoMode"]["environment"]
+    except (OSError, ValueError, LookupError, TypeError):
+        return False
+    return isinstance(environment, list) and bool(environment) and all(isinstance(e, str) for e in environment)
+entry = ("**Remote-harness routing**: A hook the user installed rewrites each Bash command to "
+         f"`{sys.argv[1]} [--background] --cwd <dir> -- \x27<command>\x27`, which runs it on the "
+         "user\x27s own machine (the project host). This wrapper is the user\x27s transport, not "
+         "Auto-Mode Bypass: judge the quoted command under every rule, as if run directly.")
+print(json.dumps(([] if any(map(own_environment, paths)) else ["$defaults"]) + [entry]))' "$5") || return 1
   # Flag settings have higher precedence than project settings. Explicit false keeps the
   # route and lease hooks active if a project-level setting otherwise disables all hooks.
   cat > "$1" <<EOF
@@ -558,6 +587,9 @@ print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harnes
   "disableAllHooks": false,
   "permissions": {
     "deny": $_wcs_deny
+  },
+  "autoMode": {
+    "environment": $_wcs_auto
   },
   "hooks": {
     "UserPromptSubmit": [
@@ -821,7 +853,7 @@ case "${1:-}" in
         CLAUDE_SETTINGS="$SD/claude-settings.json"
         worktree_blocker=$(write_claude_worktree_blocker "$SD") \
           || abort_session
-        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" \
+        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" "$runner" \
           || abort_session
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
         # Bash edit diff learns what a command changed from inotify watches on every work-tree

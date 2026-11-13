@@ -71,6 +71,9 @@ it provides files over SSHFS and executes project commands through a forced gate
   prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so
   the user's approval mode judges the original command. The terminal Codex hook and the opencode plugin write
   the same form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
+  The session settings add an `autoMode.environment` entry that names the runner and asks the
+  classifier to judge the quoted command, not the wrapper. It never adds an allow rule. It brings
+  `"$defaults"` only when no user or managed environment exists at session start.
 - Since Claude sees only rh-run, its hook applies the user's own rules to the original command:
   `Bash(...)` deny/ask on any simple command the shared lexer finds, allow only for a plain single
   command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their
