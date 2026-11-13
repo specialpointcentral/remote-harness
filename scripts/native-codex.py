@@ -16,7 +16,7 @@ import threading
 
 from native_workspace import CHAT_REQUIRED, protected
 from orca_native import (CODEX_CHATS, LEASE, MOUNTS, SESSION_NAME, OrcaError, active_lease,
-                         private_dir, private_json, write_once)
+                         private_dir, private_json, require_orca_version, write_once)
 
 CODEX_VERSION = "0.167.0"
 PASEO_LEASE = "paseo-lease.json"
@@ -104,6 +104,8 @@ def orca_binding(home, cwd, env):
         return None
     if not env.get("ORCA_AGENT_SESSION_SPAWN_TOKEN") or record["cwd"] != str(cwd):
         raise OrcaError(ORCA_CHAT_REQUIRED)
+    # A restarted Orca Server can resume this chat before the bridge has checked the new build.
+    require_orca_version(env.get("ORCA_APP_VERSION"))
     if not SESSION_NAME.fullmatch(record["session"]):
         raise OrcaError("Invalid Orca Harness session registration.")
     return home / ".sessions" / record["session"], LEASE, record["token"]

@@ -9,7 +9,9 @@ edit tools use the SSHFS mount. Claude's routed Git and ripgrep scans also run o
 ## Agent host setup
 
 Install the current Remote Harness scripts under `$RH_HOME` (default `~/.remote-harness`). This
-bridge requires Orca Server **1.4.251**, Python **3.8+**, and Claude Code **2.1.295+**. Start Orca
+bridge requires Orca Server **1.4.251** or **1.4.254**, Python **3.8+**, and Claude Code
+**2.1.295+**. Other Orca Server versions, including ones installed by Orca's automatic updates, are
+refused before any workspace or chat is created; the message names the running version. Start Orca
 Server and pair the phone or desktop with that server. Orca Server, Claude, and the Harness SSH
 login must run under the same Unix account. Claude must be able to authenticate in the server's
 environment. See [Orca Server setup and pairing](https://www.onorca.dev/docs/remote-servers).
@@ -44,6 +46,9 @@ must have a folder path: Orca omits its native folder workspaces from the remote
 otherwise. Earlier groups without a folder path remain intact; new launches use the folder-backed
 group. To select another local folder-backed group, set `"projectGroupId"` to its ID.
 
+Running Harness chats keep working when Claude Code updates itself behind the configured path.
+Pointing `"claude"` at a different executable requires a new Harness launch.
+
 ## Start and stop
 
 On the project host, launch as follows for a local Harness installation. For a remote
@@ -67,6 +72,12 @@ When the launcher stops, Harness attempts to close the chat and archive its fold
 Old chat history may be visible, but using its tools requires a fresh launch. Keep the private
 `.orca-identities` records and `.orca-mounts` reservations under `$RH_HOME` so old chat identities
 and mount paths remain reserved.
+
+If Orca Server restarts while the launcher runs, for example for an automatic update, the bridge
+waits up to two minutes for the restarted server and repeats the startup checks on it. A verified
+version keeps the chat and its lease; an unverified version ends the session. Until the restarted
+server lists the chat tab again, which normally happens when a paired device reconnects, closing
+the tab does not end the session; archive the workspace or press Ctrl-C instead.
 
 Orca mode creates a new chat every time. Continue in that same chat while its launcher is live.
 Claude subagents inherit the session hooks. The chat blocks direct Orca management commands

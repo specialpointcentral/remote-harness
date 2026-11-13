@@ -48,6 +48,8 @@ it provides files over SSHFS and executes project commands through a forced gate
 - With `--ui orca`, the bridge owns one reserved mount and creates a native chat on the
   same-host Orca Server. The configured wrapper binds the chat identity and mount to a lease.
   Keep the identity and mount reservations across cleanup so old chats cannot acquire a new route.
+  The bridge adopts a restarted Orca Server only after it passes the startup checks again, and both
+  wrappers refuse a bound chat launched by an unverified Orca build (`ORCA_APP_VERSION`).
 - With Codex and either native UI, the configured wrapper starts a private stdio app server with
   built-in shell and code execution disabled. The app server enforces native approval on the
   private MCP command tool. The command tool checks the lease, gateway policy and Codex rules

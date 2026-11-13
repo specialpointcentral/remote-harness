@@ -9,7 +9,8 @@ import sys
 
 from native_workspace import CHAT_REQUIRED, protected
 from orca_native import (IDENTITIES, LEASE, MOUNTS, SESSION_NAME, UUID, OrcaError, active_lease,
-                         check_version, claude_command, config, private_dir, private_json)
+                         check_version, claude_command, config, private_dir, private_json,
+                         require_orca_version)
 
 # These conflict with the Harness route or change the transcript identity. Orca's stream-json
 # flags and account environment pass through. Only the selected Harness chat is subject to this.
@@ -60,7 +61,7 @@ def protected_args(args, approval):
             if not value or value.startswith("-"):
                 raise OrcaError("Invalid Orca permission mode argument.")
         elif flag == "--settings":
-            # Orca 1.4.251 emits a native per-chat fastMode setting even when it is false.
+            # Orca 1.4.251 and 1.4.254 emit a native per-chat fastMode setting even when it is false.
             value = value if sep else next(arguments, "")
             try:
                 extra = json.loads(value)
@@ -99,6 +100,8 @@ def main():
         os.execv(command, [str(command), *args])
     if record is None or ids != [identity] or record["cwd"] != str(cwd) or cwd.parent != mount_parent:
         raise OrcaError(CHAT_REQUIRED)
+    # A restarted Orca Server can resume this chat before the bridge has checked the new build.
+    require_orca_version(os.environ.get("ORCA_APP_VERSION"))
     private_dir(mount_parent)
     session_name = record["session"]
     if not SESSION_NAME.fullmatch(session_name):
@@ -107,7 +110,9 @@ def main():
     lease_path = session / LEASE
     token = record["token"]
     lease = active_lease(lease_path, token)
-    if Path(lease["claude"]).resolve() != command.resolve():
+    # A self-update repoints the configured path, which stays valid; check_version still applies.
+    # Bridges before this change recorded the resolved target instead.
+    if Path(lease["claude"]) not in (command, command.resolve()):
         raise OrcaError("The configured Claude command changed. Start a new Harness session.")
     check_version(command)
 

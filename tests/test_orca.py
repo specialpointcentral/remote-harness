@@ -70,7 +70,7 @@ class OrcaSocket(socketserver.StreamRequestHandler):
         fixture = self.server.fixture
         result = fixture.respond(method, params)
         frame = {"id": request["id"], "ok": True, "result": result,
-                 "_meta": {"runtimeId": "fixture-runtime"}}
+                 "_meta": {"runtimeId": self.server.runtime_id}}
         self.wfile.write((json.dumps(frame) + "\n").encode())
 
 
@@ -103,17 +103,8 @@ fi
             "claude": str(cli), "profile": str(self.profile), "projectGroupId": "group",
         }))
         (bridge_config / "claude.json").chmod(0o600)
-        self.server = socketserver.UnixStreamServer(str(self.home / "orca.sock"), OrcaSocket)
-        self.server.fixture = self
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        metadata = self.profile / "orca-runtime.json"
-        metadata.write_text(json.dumps({
-            "runtimeId": "fixture-runtime", "authToken": "local-fixture-token",
-            "transports": [{"kind": "unix", "endpoint": str(self.home / "orca.sock")}],
-        }))
-        metadata.chmod(0o600)
+        self.hide_tabs = self.forget_chats = False
+        self.start_runtime("fixture-runtime")
         self.mounts = self.rh.resolve() / ".orca-mounts"
         self.mounts.mkdir(mode=0o700)
         self.groups = [{"id": "group", "name": "Remote Harness", "connectionId": None,
@@ -125,7 +116,7 @@ fi
         self.closed = set()
         self.command = str(self.wrapper)
         self.version = "1.4.251"
-        self.env.update(RH_WARM_MAX="0", RH_HEARTBEAT_TIMEOUT="0",
+        self.env.update(RH_WARM_MAX="0", RH_HEARTBEAT_TIMEOUT="0", ORCA_APP_VERSION="1.4.251",
                         ORCA_PAIRING_CODE="do-not-use", ORCA_ENVIRONMENT="do-not-use",
                         CLAUDE_CODE_BASH_EDIT_DIFF="1",
                         SSH_CONNECTION="192.0.2.12 12000 192.0.2.2 22")
@@ -134,7 +125,7 @@ fi
         self.requests.append((method, params))
         if method == "status.get":
             return {"appVersion": self.version, "graphStatus": "ready",
-                    "runtimeId": "fixture-runtime"}
+                    "runtimeId": self.server.runtime_id}
         if method == "settings.get":
             return {"settings": {"agentCmdOverrides": {"claude": self.command}}}
         if method == "projectGroup.list":
@@ -171,13 +162,46 @@ fi
                                            "page": {"items": []}}}
         if method == "session.tabs.list":
             identity = self.sessions[params["worktree"]]
-            tabs = [] if identity in self.closed else [
+            tabs = [] if identity in self.closed or self.hide_tabs else [
                 {"type": "agent-session", "sessionId": identity, "status": "idle"}]
             return {"tabs": tabs}
         if method == "agentSession.close":
             self.closed.add(params["sessionId"])
             return {"ok": True}
+        if method == "agentSession.history":
+            # Orca keeps a closed chat's history, so only a forgotten chat lacks a page.
+            known = params["sessionId"] in self.sessions.values() and not self.forget_chats
+            return {"ok": True, "page": {"sessionId": params["sessionId"]} if known else {}}
         return {}
+
+    def start_runtime(self, runtime_id):
+        """Serve a runtime on its own socket and publish it in the profile, as Orca's launch does."""
+        server = socketserver.UnixStreamServer(str(self.home / (runtime_id + ".sock")), OrcaSocket)
+        server.fixture = self
+        server.runtime_id = runtime_id
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.server = server
+        metadata = self.profile / "orca-runtime.json"
+        metadata.write_text(json.dumps({
+            "runtimeId": runtime_id, "authToken": "local-fixture-token",
+            "transports": [{"kind": "unix", "endpoint": server.server_address}],
+        }))
+        metadata.chmod(0o600)
+
+    def stop_runtime(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def wait_for_request(self, method, start, bridge, log, seconds=10):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if any(name == method for name, _ in self.requests[start:]):
+                return
+            self.assertIsNone(bridge.poll(), log.read_text())
+            time.sleep(0.05)
+        self.fail(f"No {method} reached the restarted runtime. {log.read_text()}")
 
     def start_bridge(self, label, approval="normal"):
         reserved = subprocess.run(
@@ -220,8 +244,8 @@ fi
             time.sleep(0.025)
         self.fail(log.read_text())
 
-    def wrapper_call(self, cwd, *args):
-        return subprocess.run([str(self.wrapper), *args], cwd=cwd, env=self.env,
+    def wrapper_call(self, cwd, *args, env=None):
+        return subprocess.run([str(self.wrapper), *args], cwd=cwd, env=env or self.env,
                               text=True, capture_output=True, timeout=5)
 
     def test_native_chat_close_revokes_settings_and_resume(self):
@@ -284,6 +308,9 @@ fi
         self.assertEqual(unknown.stdout, "")
         self.assertIn("Open the existing Harness chat", unknown.stderr)
         self.assertNotEqual(self.wrapper_call(first_project, "--continue").returncode, 0)
+        # Orca 1.4.254 can fork a chat; a fork of the registered identity must not inherit its lease.
+        self.assertNotEqual(self.wrapper_call(first_project, "--resume", provider_id(first_id),
+                                              "--fork-session").returncode, 0)
         for settings in ("{}", '{"fastMode":false,"disableAllHooks":true}', "settings.json"):
             self.assertNotEqual(self.wrapper_call(first_project, "--session-id", provider_id(first_id),
                                                   "--settings", settings).returncode, 0)
@@ -308,6 +335,126 @@ fi
         self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
         self.assertFalse((session / "orca-lease.json").exists())
         self.assertIn(("agentSession.close", {"sessionId": identity}), self.requests)
+
+    def test_claude_self_update_keeps_the_session_but_a_new_command_does_not(self):
+        # Claude's installer repoints a stable symlink at each new version.
+        versions = self.home / "claude-versions"
+        versions.mkdir()
+        current = Path(json.loads((self.rh / "orca" / "claude.json").read_text())["claude"])
+        for version in ("2.1.400", "2.1.401"):
+            shutil.copy2(current, versions / version)
+        link = self.home / "claude-link"
+        link.symlink_to(versions / "2.1.400")
+        configuration = self.rh / "orca" / "claude.json"
+        data = json.loads(configuration.read_text())
+        configuration.write_text(json.dumps({**data, "claude": str(link)}))
+        bridge, log, session, project = self.start_bridge("self-update")
+        identity = provider_id(self.ready(bridge, log))
+        lease = session / "orca-lease.json"
+        self.assertEqual(json.loads(lease.read_text())["claude"], str(link))
+        replacement = self.home / "claude-link.new"
+        replacement.symlink_to(versions / "2.1.401")
+        os.replace(replacement, link)
+        updated = self.wrapper_call(project, "--resume", identity)
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        self.assertIn("--append-system-prompt", json.loads(updated.stdout)["args"])
+        # A lease from a bridge that recorded the resolved target still works until an update.
+        recorded = json.loads(lease.read_text())
+        lease.write_text(json.dumps({**recorded, "claude": str(versions / "2.1.401")}))
+        self.assertEqual(self.wrapper_call(project, "--resume", identity).returncode, 0)
+        lease.write_text(json.dumps(recorded))
+        # Pointing the configuration at another executable is a different command.
+        configuration.write_text(json.dumps({**data, "claude": str(versions / "2.1.401")}))
+        changed = self.wrapper_call(project, "--resume", identity)
+        self.assertNotEqual(changed.returncode, 0)
+        self.assertIn("configured Claude command changed", changed.stderr)
+
+    def test_restarted_runtime_keeps_the_chat_and_its_lease(self):
+        # An automatic update stops Orca Server, starts the new build on another socket with a new
+        # runtime ID, and restores its chats a little later. The Harness session survives all of it.
+        bridge, log, session, project = self.start_bridge("restarted-runtime")
+        identity = self.ready(bridge, log)
+        lease = session / "orca-lease.json"
+        self.stop_runtime()
+        time.sleep(3)
+        self.assertIsNone(bridge.poll(), log.read_text())
+        self.assertTrue(lease.exists())
+        self.version, self.hide_tabs = "1.4.254", True
+        self.start_runtime("updated-runtime")
+        self.wait_for_request("session.tabs.list", len(self.requests), bridge, log)
+        # A restarted runtime that has not restored the chat yet has not closed it.
+        time.sleep(2.5)
+        self.assertIsNone(bridge.poll(), log.read_text())
+        self.hide_tabs = False
+        start = len(self.requests)
+        self.wait_for_request("session.tabs.list", start, bridge, log)
+        self.wait_for_request("settings.get", start, bridge, log)
+        env = {**self.env, "ORCA_APP_VERSION": "1.4.254"}
+        resumed = self.wrapper_call(project, "--resume", provider_id(identity), env=env)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("--append-system-prompt", json.loads(resumed.stdout)["args"])
+        # The adopted runtime now owns the chat: closing its tab ends the session promptly.
+        self.closed.add(identity)
+        self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+        self.assertFalse(lease.exists())
+        self.assertNotIn("Lost contact", log.read_text())
+        self.assertNotIn(("agentSession.close", {"sessionId": identity}), self.requests)
+
+    def test_restarted_runtime_that_never_relists_the_chat_keeps_the_session(self):
+        # Without a reconciling client, a restarted headless runtime may never list the chat tab
+        # again although the chat itself still works. Archiving its workspace still ends it.
+        bridge, log, session, _ = self.start_bridge("unlisted-after-restart")
+        identity = self.ready(bridge, log)
+        self.stop_runtime()
+        self.hide_tabs = True
+        start = len(self.requests)
+        self.start_runtime("unlisting-runtime")
+        self.wait_for_request("agentSession.history", start, bridge, log)
+        time.sleep(4.5)
+        self.assertIsNone(bridge.poll(), log.read_text())
+        self.assertTrue((session / "orca-lease.json").exists())
+        next(iter(self.workspaces.values()))["isArchived"] = True
+        self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+        self.assertFalse((session / "orca-lease.json").exists())
+        self.assertIn(("agentSession.close", {"sessionId": identity}), self.requests)
+
+    def test_restarted_runtime_without_the_chat_ends_the_session(self):
+        bridge, log, session, _ = self.start_bridge("forgotten-after-restart")
+        self.ready(bridge, log)
+        self.stop_runtime()
+        self.hide_tabs = self.forget_chats = True
+        self.start_runtime("forgetting-runtime")
+        self.assertEqual(bridge.wait(timeout=10), 0, log.read_text())
+        self.assertFalse((session / "orca-lease.json").exists())
+
+    def test_restart_into_an_unverified_build_releases_the_session(self):
+        bridge, log, session, _ = self.start_bridge("unverified-update")
+        self.ready(bridge, log)
+        self.stop_runtime()
+        self.version = "1.4.255"
+        start = len(self.requests)
+        self.start_runtime("unverified-runtime")
+        self.assertNotEqual(bridge.wait(timeout=10), 0, log.read_text())
+        self.assertIn("(this server runs 1.4.255).", log.read_text())
+        self.assertFalse((session / "orca-lease.json").exists())
+        # The bridge only inspects the unverified build; it never drives its chats or workspaces.
+        self.assertLessEqual({method for method, _ in self.requests[start:]}, {"status.get", "settings.get"})
+
+    def test_registered_chat_refuses_a_launch_from_an_unverified_orca_build(self):
+        bridge, log, _, project = self.start_bridge("launch-version")
+        identity = provider_id(self.ready(bridge, log))
+        for version in (None, "1.4.255"):
+            with self.subTest(version=version):
+                env = {key: value for key, value in self.env.items() if key != "ORCA_APP_VERSION"}
+                if version:
+                    env["ORCA_APP_VERSION"] = version
+                result = self.wrapper_call(project, "--resume", identity, env=env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("requires Orca Server 1.4.251 or 1.4.254", result.stderr)
+        # Ordinary chats elsewhere do not depend on the Orca build.
+        normal = self.wrapper_call(self.home, "--session-id", str(uuid.uuid4()), env=env)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
 
     def test_orca_management_bash_is_blocked_before_routing_to_project_host(self):
         bridge, log, session, project = self.start_bridge("manager")
@@ -415,12 +562,26 @@ fi
         self.assertFalse(self.sessions)
 
     def test_unverified_runtime_version_refuses_before_workspace_or_chat(self):
-        self.version = "1.4.252"
-        bridge, log, _, _ = self.start_bridge("wrong-version")
-        self.assertNotEqual(bridge.wait(timeout=8), 0, log.read_text())
-        self.assertIn("1.4.251", log.read_text())
-        self.assertFalse(self.workspaces)
-        self.assertFalse(self.sessions)
+        for label, version, running in (("newer-version", "1.4.252", "1.4.252"),
+                                        ("odd-version", "1.4.254\nforged", "an unknown version"),
+                                        ("missing-version", None, "an unknown version")):
+            with self.subTest(version=version):
+                self.version = version
+                bridge, log, _, _ = self.start_bridge(label)
+                self.assertNotEqual(bridge.wait(timeout=8), 0, log.read_text())
+                self.assertIn("requires Orca Server 1.4.251 or 1.4.254 "
+                              f"(this server runs {running}).", log.read_text())
+                self.assertFalse(self.workspaces)
+                self.assertFalse(self.sessions)
+
+    def test_each_verified_runtime_version_starts_a_chat(self):
+        for version in ("1.4.251", "1.4.254"):
+            with self.subTest(version=version):
+                self.version = version
+                bridge, log, _, _ = self.start_bridge("verified-" + version.replace(".", "-"))
+                self.ready(bridge, log)
+                bridge.terminate()
+                self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
 
 
 if __name__ == "__main__":

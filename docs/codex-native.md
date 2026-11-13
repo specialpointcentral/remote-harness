@@ -8,7 +8,8 @@ Project files remain on the project host.
 
 Install the current Harness scripts. Native Codex requires **codex-cli 0.167.0** and **Python
 3.11+** in the Harness SSH login environment. Use Paseo daemon **0.15.3** with Node.js 22+, or
-Orca Server **1.4.251**. The manager and the Harness login must run as the same Unix user.
+Orca Server **1.4.251** or **1.4.254**. The manager and the Harness login must run as the same
+Unix user.
 For client installation and pairing, see the [Paseo guide](paseo.md) or [Orca guide](orca.md).
 
 On the agent host, set the actual Codex executable in a private file. Substitute its absolute path.
@@ -82,9 +83,9 @@ workspaces require separate launches.
 In an Orca Harness workspace, use the chat created by the launcher. Clicking **+** to open
 another Codex chat does not register a new Harness connection: the configured wrapper refuses
 that chat before starting Codex and tells you to return to the existing chat or rerun your
-original Harness launch command on the project host. Orca Server 1.4.251 has no per-workspace
-setting to disable **+**, so an unusable chat tab may still appear. Close only that extra tab.
-Keep the configured wrapper selected for this protection to apply.
+original Harness launch command on the project host. Orca Server 1.4.251 and 1.4.254 have no
+per-workspace setting to disable **+**, so an unusable chat tab may still appear. Close only that
+extra tab. Keep the configured wrapper selected for this protection to apply.
 Paseo also reserves each Harness workspace under `$RH_HOME/.paseo-workspaces`; its Codex wrapper
 refuses ordinary chats in those directories while allowing ordinary chats elsewhere. Preserve
 these reservations after cleanup. If Claude is also enabled, configure its wrapper as described
@@ -99,6 +100,7 @@ Orca, or press Ctrl-C in the project-host terminal to end it. When the bridge's 
 the private Codex app server stops and the routed tools refuse further calls. A later launch
 creates a new chat. Existing app history may remain visible. Keep the Orca mount and identity
 reservations. Manager terminals, workspace scripts, and Git UI still run on the agent host.
+An Orca Server restart keeps the chat as described in the [Orca guide](orca.md#start-and-stop).
 
 For a smoke test, use a disposable project. In the chat, read and edit a file, then approve a
 routed command that prints `pwd` and `hostname`. Verify the file and command output on the

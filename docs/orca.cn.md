@@ -9,9 +9,10 @@ SSH 网关执行。Agent 主机运行 Orca Server 和 Claude Code。Claude 通�
 ## 配置 Agent 主机
 
 将当前版本的 Remote Harness 脚本安装到 `$RH_HOME`（默认 `~/.remote-harness`）。此适配要求
-Orca Server **1.4.251**、Python **3.8+** 和 Claude Code **2.1.295+**。启动 Orca Server，
-将手机或桌面客户端与该服务器配对。Orca Server、Claude 和 Harness 的 SSH 登录必须使用同一个
-Unix 账号。Claude 必须能在 Orca Server 的运行环境中认证。参见
+Orca Server **1.4.251** 或 **1.4.254**、Python **3.8+** 和 Claude Code **2.1.295+**。其他版本的
+Orca Server（包括 Orca 自动更新安装的版本）会在创建工作区或聊天之前被拒绝，提示中会写明当前运行的
+版本。启动 Orca Server，将手机或桌面客户端与该服务器配对。Orca Server、Claude 和 Harness 的
+SSH 登录必须使用同一个 Unix 账号。Claude 必须能在 Orca Server 的运行环境中认证。参见
 [Orca Server 安装与配对](https://www.onorca.dev/docs/remote-servers)。
 
 在 Agent 主机创建包装器配置，将示例中的路径替换为实际的 Claude Code 可执行文件。
@@ -41,6 +42,9 @@ Arguments 覆盖会话 ID、hooks、系统提示词或执行模式，启动可�
 工作区列入远程工作区列表。旧版本创建的无目录分组会保留，新会话使用带目录的分组。
 如需选择其他本机目录分组，请在 `"projectGroupId"` 填入对应分组 ID。
 
+Claude Code 在所配置路径下自动更新时，正在运行的 Harness 聊天不受影响。若将 `"claude"` 改为
+其他可执行文件，需要重新启动 Harness。
+
 ## 启动与退出
 
 如果项目主机已安装 Harness，可执行以下命令。如果只在远端安装，在
@@ -61,6 +65,11 @@ Orca 原生卡片审批。Auto 使用 Claude 的自动审核，缺失时退回 N
 启动器退出时会尝试关闭 Orca 聊天并归档工作区。旧对话记录可能仍可查看，如需继续使用工具，请重新启动。
 保留 `$RH_HOME` 下私有的 `.orca-identities` 记录和 `.orca-mounts` 保留目录，防止旧会话
 身份和挂载路径被再次使用。
+
+启动器运行期间如果 Orca Server 重启（例如自动更新），桥接进程最多等待两分钟，并对重启后的
+服务器重新执行启动时的检查。版本已验证时，聊天和 lease 保持不变；未验证的版本会结束会话。
+在重启后的服务器重新列出聊天标签页之前（通常在已配对设备重新连接后），关闭标签页不会结束
+会话，请改为归档工作区或按 Ctrl-C。
 
 每次启动都会创建一个新聊天。在启动器运行期间，可继续使用同一聊天。Claude 普通子 Agent 继承会话 hooks。
 聊天会阻止直接运行 Orca 管理命令及调用 Orca 管理 MCP 工具。清空上下文、分叉或回退等会改变 Claude 会话 ID 的动作超出该已登记会话的范围。Orca 自己的工作区终端、

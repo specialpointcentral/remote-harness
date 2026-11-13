@@ -15,15 +15,16 @@ import uuid
 
 from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, OrcaError, check_version, claude_command,
                          config, private_dir, private_json, probe_claude, process_identity,
-                         write_once)
+                         require_orca_version, write_once)
 
-ORCA_VERSION = "1.4.251"
+# How long Orca Server may stay unreachable, for example while an automatic update restarts it.
+RESTART_GRACE = 120
 PERMISSION_MODES = {"normal": "ask", "auto": "auto", "yolo": "full-access"}
 MAX_FRAME = 8 * 1024 * 1024
 
 
 class OrcaClient:
-    """Orca 1.4.251's same-user, local JSON-lines runtime transport."""
+    """Orca Server's same-user, local JSON-lines runtime transport."""
 
     def __init__(self, configuration):
         default = (Path.home() / "Library" / "Application Support" if sys.platform == "darwin"
@@ -155,12 +156,35 @@ def visible_chat(client, selector, session_id):
                for tab in tabs)
 
 
+def known_chat(client, session_id):
+    """Whether the runtime holds the chat. Orca keeps closed chats' history, so open is not implied."""
+    result = client.call("agentSession.history", {"sessionId": session_id, "direction": "tail",
+                                                  "limit": 1})
+    page = result.get("page") if isinstance(result, dict) else None
+    return isinstance(page, dict) and page.get("sessionId") == session_id
+
+
 def published_workspace(client, workspace, cwd):
     catalog = client.call("worktree.ps", {"limit": 10000,
                                           "supportsWorktreeVisibilitySourceDefaults": True})
     return any(row.get("worktreeId") == f"folder:{workspace}"
                and row.get("path") == str(cwd) and not row.get("isArchived")
                for row in catalog["worktrees"])
+
+
+def reconnect(configuration, wrapper, agent):
+    """Return a client for the runtime the profile now names, once it passes the launch checks."""
+    # A restarted server publishes a new socket and runtime ID in its profile.
+    try:
+        client = OrcaClient(configuration)
+        status = client.call("status.get")
+        settings = client.call("settings.get")["settings"]
+    except (OrcaError, OSError, ValueError, KeyError, TypeError):
+        return None
+    # An unverified update or a changed command ends the session instead of waiting.
+    require_orca_version(status.get("appVersion"))
+    check_wrapper(settings, wrapper, agent)
+    return client if status.get("graphStatus") == "ready" else None
 
 
 def lease_environment(session, agent):
@@ -194,8 +218,7 @@ def main():
         raise OrcaError("Install the Orca Harness command wrapper on the agent host.")
     client = OrcaClient(configuration)
     status = client.call("status.get")
-    if status.get("appVersion") != ORCA_VERSION:
-        raise OrcaError(f"Orca Harness requires Orca Server {ORCA_VERSION}.")
+    require_orca_version(status.get("appVersion"))
     if status.get("graphStatus") != "ready":
         raise OrcaError("Start Orca Server and wait for its workspace graph to become ready.")
     check_wrapper(client.call("settings.get")["settings"], wrapper, agent)
@@ -207,7 +230,8 @@ def main():
         if approval == "auto" and '"auto"' not in probe_claude(command, "--help"):
             print("remote-harness: Claude does not advertise auto. Using normal approvals.", file=sys.stderr)
             approval = "normal"
-        launch_settings["claude"] = str(command.resolve())
+        # Record the configured path, not its target: Claude's self-update repoints the symlink.
+        launch_settings["claude"] = str(command)
         provider_id = str(uuid.UUID(bytes=hashlib.sha256(
             f"orca-claude:{session_id}".encode()).digest()[:16], version=4))
     else:
@@ -285,24 +309,34 @@ def main():
             raise OrcaError("Orca Server did not publish the Harness workspace in its remote workspace list.")
         print(f"remote-harness: Orca {label} chat {session_id} is ready. Open it in Orca.", flush=True)
         unavailable = None
+        confirmed = client.runtime_id  # the runtime that last listed this chat
         while not stopped:
             time.sleep(2)
             if stopped:
                 break
             try:
-                if not live_workspace(client, workspace, cwd):
-                    break
-                if not visible_chat(client, selector, session_id):
-                    closed = True
-                    break
+                live = live_workspace(client, workspace, cwd)
+                visible = live and visible_chat(client, selector, session_id)
+                # A restarted runtime publishes chat tabs again only as clients reconcile, so until it
+                # lists this chat, a live workspace that still holds the chat keeps the session.
+                restoring = (live and not visible and client.runtime_id != confirmed
+                             and known_chat(client, session_id))
                 settings = client.call("settings.get")["settings"]
             except OrcaError:
-                unavailable = time.monotonic() if unavailable is None else unavailable
-                if time.monotonic() - unavailable >= 20:
-                    raise OrcaError("Lost contact with Orca Server. Releasing the Harness session.")
+                client = reconnect(configuration, wrapper, agent) or client
             else:
-                unavailable = None
                 check_wrapper(settings, wrapper, agent)
+                if visible:
+                    confirmed = client.runtime_id
+                if visible or restoring:
+                    unavailable = None
+                    continue
+                # The chat tab was closed, or the workspace was archived.
+                closed = live
+                break
+            unavailable = time.monotonic() if unavailable is None else unavailable
+            if time.monotonic() - unavailable >= RESTART_GRACE:
+                raise OrcaError("Lost contact with Orca Server. Releasing the Harness session.")
     finally:
         revoke()
         if create_attempted and not closed:

@@ -14,10 +14,21 @@ LEASE = "orca-lease.json"
 CODEX_CHATS = ".orca-codex-chats"
 UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 SESSION_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+# Orca Server builds whose runtime RPCs and agent launches Harness has been verified against.
+ORCA_VERSIONS = ("1.4.251", "1.4.254")
 
 
 class OrcaError(Exception):
     pass
+
+
+def require_orca_version(version):
+    """Refuse an Orca Server build Harness has not verified, naming the build that is running."""
+    if version not in ORCA_VERSIONS:
+        running = (version if isinstance(version, str) and re.fullmatch(r"\d+(?:\.\d+){1,3}", version)
+                   else "an unknown version")
+        raise OrcaError(f"Orca Harness requires Orca Server {' or '.join(ORCA_VERSIONS)} "
+                        f"(this server runs {running}).")
 
 
 def private_dir(path, create=False):

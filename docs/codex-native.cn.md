@@ -6,8 +6,8 @@
 ## Agent 主机设置
 
 安装当前版本的 Harness 脚本。原生 Codex 要求 **codex-cli 0.167.0**，且 Harness 的 SSH 登录环境
-需要 **Python 3.11+**。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+，或 Orca Server **1.4.251**。
-管理器和 Harness 登录必须使用同一个 Unix 账号。安装客户端和配对的步骤见
+需要 **Python 3.11+**。使用 Paseo 守护进程 **0.15.3** 和 Node.js 22+，或 Orca Server
+（**1.4.251** 或 **1.4.254**）。管理器和 Harness 登录必须使用同一个 Unix 账号。安装客户端和配对的步骤见
 [Paseo 指南](paseo.cn.md)或 [Orca 指南](orca.cn.md)。
 
 在 Agent 主机的私有文件中配置 Codex 可执行文件。请替换示例中的绝对路径。
@@ -68,8 +68,9 @@ MCP 审批。该会话排除项目 Codex 配置、外部 MCP server、插件和�
 
 在 Orca 的 Harness 工作区中，请使用启动器创建的聊天。点击 **＋** 新建 Codex 聊天不会登记新的
 Harness 连接：已配置的包装器会在启动 Codex 前拒绝该聊天，并提示返回已有聊天，或在项目主机重新
-运行原来的 Harness 启动命令。Orca Server 1.4.251 没有按工作区禁用 **＋** 的设置，因此界面仍可能
-出现一个无法使用的聊天标签页，只需关闭这个额外标签页。保持已配置的包装器设置，此保护才会生效。
+运行原来的 Harness 启动命令。Orca Server 1.4.251 和 1.4.254 都没有按工作区禁用 **＋** 的设置，
+因此界面仍可能出现一个无法使用的聊天标签页，只需关闭这个额外标签页。保持已配置的包装器设置，
+此保护才会生效。
 Paseo 也会在 `$RH_HOME/.paseo-workspaces` 预留各个 Harness 工作区，Codex 包装器会拒绝在这些
 目录中创建普通聊天，其他目录不受影响。清理后仍需保留这些记录。如果同时启用 Claude，按
 [Paseo 指南](paseo.cn.md)或 [Orca 指南](orca.cn.md)配置其包装器，防止切换 provider 后绕过
@@ -81,6 +82,7 @@ Paseo 也会在 `$RH_HOME/.paseo-workspaces` 预留各个 Harness 工作区，Co
 在 Orca 关闭聊天或归档文件夹，或在项目主机终端按 Ctrl-C，均可结束会话。桥接 lease 失效后，
 私有 Codex app server 停止，路由工具拒绝继续调用。再次启动会创建新聊天。应用可能保留旧聊天
 历史。请保留 Orca 的挂载和身份预留记录。管理器终端、工作区脚本和 Git 界面仍运行在 Agent 主机。
+Orca Server 重启时的处理见 [Orca 指南](orca.cn.md#启动与退出)。
 
 可用临时项目做冒烟测试。在聊天中读取并修改一个文件，再审批一个打印 `pwd` 和 `hostname` 的路由
 命令。确认文件和命令结果都来自项目主机。启动器仍运行时关闭并重开应用，然后发送后续消息。

@@ -45,7 +45,8 @@
   工具调用。
 - 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
   创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
-  预留记录，避免旧聊天获得新路由。
+  预留记录，避免旧聊天获得新路由。桥接进程仅在重启后的 Orca Server 再次通过启动检查后才接管它；
+  两个包装器都会拒绝由未验证 Orca 版本（`ORCA_APP_VERSION`）启动的已绑定聊天。
 - 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。

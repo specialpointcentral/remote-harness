@@ -101,6 +101,19 @@ class NativeCodexTests(PaseoFixture):
                 self.assertIn("Open the existing Harness chat", result.stderr)
                 self.assertIn("original Harness launch command on the project host", result.stderr)
                 self.assertFalse((self.home / "codex-started").exists())
+        # A registered chat resumed by an unverified Orca build is refused before Codex starts.
+        for version in (None, "1.4.255"):
+            with self.subTest(version=version):
+                env = {key: value for key, value in self.env.items() if key != "ORCA_APP_VERSION"}
+                env.update(ORCA_AGENT_SESSION_ID=registered, ORCA_AGENT_SESSION_SPAWN_TOKEN="spawn")
+                if version:
+                    env["ORCA_APP_VERSION"] = version
+                result = subprocess.run(launch, cwd=mount, env=env, input="",
+                                        capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("requires Orca Server 1.4.251 or 1.4.254", result.stderr)
+                self.assertFalse((self.home / "codex-started").exists())
         # The same normal Orca identity still launches outside a Harness workspace.
         env = {**self.env, "ORCA_AGENT_SESSION_ID": extra,
                "ORCA_AGENT_SESSION_SPAWN_TOKEN": "spawn"}

@@ -24,6 +24,7 @@ from test_native_codex import CODEX
 from test_paseo import ROOT, SCRIPTS
 
 ORCA = os.environ.get("RH_TEST_ORCA_CLI")
+ORCA_VERSIONS = ("1.4.251", "1.4.254")
 PASEO = os.environ.get("RH_TEST_PASEO_NODE_MODULES")
 PASEO_DRIVER = ROOT / "tests" / "fixtures" / "codex_native_paseo.mjs"
 PROMPT = "RH_START_CHILD Start the fixture subagent."
@@ -211,17 +212,17 @@ supports_websockets = false
         self.assertEqual(len(self.server.requests), model_requests, "Late approval reached Codex")
         self.verify_effects(approved=False)
 
-    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251")
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251 or 1.4.254")
     def test_orca_approves_child_command_and_applies_child_edit(self):
         self.exercise_orca(approve=True)
 
-    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251")
+    @unittest.skipUnless(ORCA, "set RH_TEST_ORCA_CLI to Orca 1.4.251 or 1.4.254")
     def test_orca_revokes_lease_with_child_approval_pending(self):
         self.exercise_orca(approve=False)
 
     def exercise_orca(self, approve):
-        self.assertEqual(subprocess.check_output([ORCA, "--version"], text=True, timeout=10).strip(),
-                         "1.4.251")
+        self.assertIn(subprocess.check_output([ORCA, "--version"], text=True, timeout=10).strip(),
+                      ORCA_VERSIONS)
         profile = self.home / "profile"
         profile.mkdir(mode=0o700)
         orca = Orca(profile)
