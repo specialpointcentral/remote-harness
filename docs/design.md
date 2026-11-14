@@ -4,8 +4,8 @@
 
 ## Roles
 
-- **Agent host**: remote server. Every Claude, Codex, opencode, subagent, and independent agent
-  process runs here.
+- **Agent host**: remote server. Every Claude, Codex, subagent, and independent agent process runs
+  here.
 - **Project host**: user's local machine. It stores the project and executes project commands.
 
 Forward/local-agent mode is disabled. Compatibility entrypoints fail before doing work.
@@ -18,10 +18,10 @@ local bootstrap
   -> per-session remote SSH key
   -> local forced-command authorization
   -> SSHFS mount of local project on remote server
-  -> remote Claude/Codex/opencode launch
+  -> remote Claude/Codex launch
 
 remote file tools -> SSHFS -> local project files
-remote Bash       -> Claude/Codex hook or opencode plugin -> rh-run -> forced gateway -> local command
+remote Bash       -> Claude/Codex hook -> rh-run -> forced gateway -> local command
 remote git/rg     -> session PATH shim -> (scan / read-only discovery) forced gateway tool verb -> local git/rg
                                       -> (writes / outside mount) remote git/rg
 remote Agent tool -> remote subagent process (never routed locally)
@@ -47,16 +47,10 @@ configuration error rather than a reusable credential.
 
 ## Command Policy
 
-`route-command.py` handles Claude/Codex. A generated opencode plugin performs the equivalent Bash and
-cwd rewrite for opencode: `tool.execute.before` on 1.x, and on 2.x an `execute.before` hook for the
-shell tool that also takes its `bash` alias and stringified input, which opencode's own input repair
-hook normally resolves first. `inject-rule.sh` reads `opencode --version` and refuses other majors.
-2.x always starts with `--standalone`: a client without it attaches to the user's shared background
-server, whose configuration and plugins come from whichever opencode started it, so Bash would run
-there unrouted or through another session's runner. `run-on-project-host.sh` validates the physical
-local cwd, rejects direct Agent CLI launches, removes common AI credential variables, shadows the
-agent binaries in `PATH`, and executes with the environment of the project host's login shell. For
-bash and zsh that environment comes from a per-session snapshot instead of a new login shell per
+`route-command.py` handles Claude/Codex. opencode is no longer supported, and every entry refuses
+`--launch opencode`. `run-on-project-host.sh` validates the physical local cwd, rejects direct Agent
+CLI launches, removes common AI credential variables, shadows the agent binaries in `PATH`, and
+executes with the environment of the project host's login shell. For bash and zsh that environment comes from a per-session snapshot instead of a new login shell per
 command: the first command captures what the profile leaves behind (exported variables except the AI
 credentials and per-connection values, functions, shell options, umask, soft limits), the snapshot
 is used only once it loads silently and completely, and it is recaptured after 10 minutes or when a
@@ -73,7 +67,7 @@ process group and process tree. Processes that deliberately detach (`nohup ... &
 daemons) are not followed. Without python3, or with an older client that omits `watch`, execution is
 unchanged. The `git`/`rg` tool verb always uses the same watchdog.
 
-The Claude and Codex hooks and the opencode plugin rewrite a routed call to
+The Claude and Codex hooks rewrite a routed call to
 `rh-run --cwd <dir> -- '<command>'`, so approval prompts and automatic reviews read the original
 command. `channel-guard.py` base64-encodes the readable request in-process (its plain values arrive
 in the environment), so the readable form costs no extra process; the encoded positional form
@@ -138,14 +132,6 @@ full-access behavior, where only those checks ask (or, under approval `never`, r
 to stop reading past `exit`, routed commands would go unchecked again; the form never widens an
 approval.
 
-opencode also checks permissions on the rewritten text, after its plugins have run, so its plugin
-repeats the original after `exit` in the same way and sets the working directory to the original's
-own. opencode parses the whole text (tree-sitter on 1.x, its own scanner on 2.x), so the user's bash
-rules and its external-directory check, which resolves relative paths from the working directory,
-judge the original. The rh-run and `exit` commands are checked as well, so an allowlist-style config
-whose catch-all rule asks or denies does so for every routed call. 2.x refuses a command its scanner
-cannot analyze (here-documents, compound commands, dynamic execution), routed or not.
-
 Privacy on the agent host: unless `/proc` is mounted with `hidepid`, every user there can read every
 process's arguments, the agent's own `bash -c '<command>'` included, as with any agent on a shared
 host; `inject-rule.sh` reports when other users have accounts or processes there and the launcher
@@ -164,7 +150,7 @@ Agent installation.
 ## Internal Git And Search
 
 PreToolUse hooks only see tool calls. Git status snapshots, file suggestions, Grep/Glob (through
-`USE_BUILTIN_RIPGREP=0`), opencode search, status lines, and other internal `git`/`rg` processes go
+`USE_BUILTIN_RIPGREP=0`), status lines, and other internal `git`/`rg` processes go
 through PATH shims generated per session (`project-host-tool.py`). Over SSHFS, these scans pay a
 tunnel round trip for every lstat, directory read, and file read, so the shims run them on the
 project host:
@@ -206,14 +192,6 @@ ignored-directory lookup and snapshot use a private `GIT_DIR`, which keeps them 
 out over SSHFS, so ignored build caches are watched as well. Claude sessions therefore start with
 `CLAUDE_CODE_BASH_EDIT_DIFF=${CLAUDE_CODE_BASH_EDIT_DIFF:-0}`, expanded after the remote login shell's
 startup files; a value exported there turns the feature back on.
-
-opencode snapshots, which back `/undo` and revert, are the same kind of scan: every model step lists
-the work tree with `git diff-files` and `git ls-files --others` under a private `GIT_DIR`, which keeps
-them remote, so every tracked file costs SSHFS round trips. Unlike Claude's diff they do see routed
-changes, since they read the mounted files. Sessions turn them off (`snapshot: false` on 1.x,
-`snapshots: false` on 2.x) unless the remote login shell exports `RH_OPENCODE_SNAPSHOT=on`; a project
-opencode config still wins. opencode's formatters and language servers are not Bash calls: like the
-user's own `!` commands and terminals, they run on the remote host against the mount.
 
 ## Connections
 

@@ -2,8 +2,8 @@
 
 # AGENTS.md - remote-harness 维护指南
 
-本仓库是 remote-only remote-harness skill。Claude、Codex、opencode、subagent 和独立 Agent
-会话全部运行在远端服务器。本机只作为项目主机：通过 SSHFS 提供文件，并通过 forced gateway
+本仓库是 remote-only remote-harness skill。Claude、Codex、subagent 和独立 Agent 会话全部运行在
+远端服务器。本机只作为项目主机：通过 SSHFS 提供文件，并通过 forced gateway
 执行项目命令。
 
 ## 仓库结构
@@ -16,7 +16,7 @@
 - `scripts/project-host-gateway.sh`：只接受 SFTP、health、exec，以及白名单 `git`/`rg` 工具动词的
   forced SSH command。
 - `scripts/route-command.py`：Claude/Codex hook 策略和 cwd 映射。
-- `scripts/inject-rule.sh`：同时生成会话级 opencode plugin（1.x 或 2.x 格式）。
+- `scripts/inject-rule.sh`：生成每个会话的设置、hook、runner 和垫片。
 - `scripts/run-on-project-host.sh`：校验后的本机项目命令和工具 dispatcher。
 - `scripts/project-host-tool.py`：远端会话的 `git`/`rg` PATH 垫片，负责工作区扫描。
 - `scripts/session-reaper.sh`：本地清理没有执行时，负责远端会话的 watcher 和 GC。
@@ -39,10 +39,10 @@
   向导会询问，默认沿用上次的选择，否则为 auto；auto 使用远端 CLI 的自动审核（`claude --permission-mode
   auto`、`codex --approve-for-me`），CLI 不支持时退回普通审批。
 - `laptop-setup.sh` 必须可与下载到同目录的 sibling helper 独立运行。
-- 终端模式通过 `ssh -tt <远端> ... <claude|codex|opencode>` 启动主 Agent。Claude 选择
-  `--ui paseo` 时，同一 SSH 会话监管 Harness 桥接进程，由同一主机的 Paseo 守护进程带注入设置
-  启动主 Agent。桥接进程在归档和退出前撤销 lease；通道清理后，全工具 hook 拒绝旧 Paseo 会话的
-  工具调用。
+- 终端模式通过 `ssh -tt <远端> ... <claude|codex>` 启动主 Agent。已不再支持 opencode：所有入口都
+  拒绝 `--launch opencode`。Claude 选择 `--ui paseo` 时，同一 SSH 会话监管 Harness 桥接进程，
+  由同一主机的 Paseo 守护进程带注入设置启动主 Agent。桥接进程在归档和退出前撤销 lease；通道清理后，
+  全工具 hook 拒绝旧 Paseo 会话的工具调用。
 - 选择 `--ui orca` 时，桥接进程为该会话保留专用挂载点，并在同一 Agent 主机的 Orca Server
   创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
   预留记录，已结束的聊天不会自行获得路由。只有在本地终端认领它的同一 Agent 启动
@@ -62,26 +62,21 @@
 - 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。
-- Claude/Codex/opencode Bash 导向本机；Agent/Spawn 工具仍在远端执行。
+- Claude/Codex Bash 导向本机；Agent/Spawn 工具仍在远端执行。
 - 生成的 Claude 会话设置会保持 hooks 启用，即使项目设置了 `disableAllHooks`。
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成
-  可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 和 opencode
-  插件写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。
+  可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。
   会话设置加一条 `autoMode.environment`，写明 runner，要求自动审核判断引号里的命令，而不是包装本身。
   它绝不添加放行规则；只有会话启动时用户和托管设置都没有 environment，才带上 `"$defaults"`。
   不在项目默认挂载点时，会话设置还会把 `autoMemoryDirectory` 指向默认挂载点的记忆目录，除非用户或
   托管设置已有该项。
 - Claude 只能看到 rh-run，所以它的 hook 用原始命令对照用户自己的规则：`Bash(...)` deny/ask 对共享词法器
   找到的任意一条简单命令生效，allow 只在 default/acceptEdits/dontAsk 模式（绝不包括 auto）下对单条普通命令
-  生效。规则文件只在标识变化时重读。Codex 和 opencode 自己检查原命令：改写后在 `exit` 之后另起一行附上
-  原命令，shell 不会解析这一行，Codex 的执行策略（`.rules` 规则、带 `-f` 的 `rm`）和 opencode 的 bash 规则
-  都会读它；opencode 插件还把工作目录设为原命令自己的目录。
+  生效。规则文件只在标识变化时重读。Codex 自己检查原命令：改写后在 `exit` 之后另起一行附上原命令，
+  shell 不会解析这一行，Codex 的执行策略（`.rules` 规则、带 `-f` 的 `rm`）会读它。
 - Claude 会话禁止 Read/Edit 访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`。`rh-session` 清除
   `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Linux 上的 sshfs 挂载使用 `fsname=remote-harness`，
   挂载来源保存在挂载记录里；`mounts` 目录仅本人可访问。垫片的 stderr 把项目根路径映射回挂载点。
-- opencode 1.x 和 2.x 各用自己的插件和配置键，其它版本一律拒绝。2.x 的启动和就绪检查都必须加
-  `--standalone`：不加时客户端会连到用户共用的后台服务，Bash 在那里不经路由执行。2.x 和本机一样，会拒绝
-  它的解析器分析不了的路由命令（heredoc、循环等）。
 
 ## Gateway 安全
 
@@ -121,8 +116,6 @@
 - 挂载点之外、或指定了其它仓库/index 的调用，原样执行真实工具。
 - Claude 会话默认把 `CLAUDE_CODE_BASH_EDIT_DIFF` 设为 `0`（远端登录 shell 导出的值优先）：它按目录
   建立的 inotify 监听看不到路由命令造成的修改，还会在 SSHFS 上卡住。
-- opencode 会话默认关闭快照，除非远端登录 shell 导出 `RH_OPENCODE_SNAPSHOT=on`：每一步模型调用都会
-  用私有 `GIT_DIR` 列出整个工作区。
 - 无法连到项目主机的路由调用必须以非零退出；绝不报告 clean 或无匹配，也不回退为扫描 SSHFS。
   只有可达的项目主机明确答复"未安装该工具"时，本会话此后才改用远端的该工具。
 - 路由调用共享每会话并发上限，以及只通过命令行传入的短期 OpenSSH 复用 master；生成的

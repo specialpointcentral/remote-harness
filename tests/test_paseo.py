@@ -72,7 +72,8 @@ class PaseoOptionTests(PaseoFixture):
                     ['bash', str(SCRIPTS / name), *args, '--launch', 'opencode', '--ui', 'paseo'],
                     env=self.env, text=True, input='', capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('--ui paseo requires --launch claude or codex', result.stderr)
+                # Either check refuses it first: opencode is no longer supported at all.
+                self.assertRegex(result.stderr, r'no longer supports opencode|--ui paseo requires --launch claude or codex')
                 self.assertFalse((self.home / 'ssh-ran').exists())
 
 

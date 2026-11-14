@@ -53,21 +53,14 @@
   detached file no longer appears under the old mountpoint. Without a fusectl answer a lazily detached
   daemon is kept. A daemon still flushing writes is left running once `RH_SSHFS_SYNC_MAX_SECONDS`
   (default 120) passes. Without `/proc` nothing is stopped.
-- `inject-rule.sh`: installs session instructions, Claude/Codex hooks or the opencode plugin, and the
-  remote runner. opencode emits a readiness marker path that must be observed before launch. It reads
-  `opencode --version` and writes the 1.x or 2.x plugin and config, refusing other versions; 2.x
-  launch flags start with `--standalone`, and `RH_OPENCODE_MAJOR` selects the launcher's readiness
-  probe (`debug config`, or `debug agents --standalone` for 2.x).
-  `RH_PROCESS_LIST_SHARED=1` tells the launcher that other users on the agent host can read process
+- `inject-rule.sh`: installs session instructions, Claude/Codex hooks, and the remote runner; it
+  refuses any other agent. `RH_PROCESS_LIST_SHARED=1` tells the launcher that other users on the agent host can read process
   arguments (no `hidepid` on `/proc`).
-  The opencode plugin writes the hooks' readable form, repeating the original after `exit` as the
-  Codex hook does, and gives opencode's own checks the original's working directory.
   Its session directory is keyed by mountpoint plus the launch's session id, so relaunching the same
   project or cleaning up a dead launch never removes another live session's hook or runner.
   The rule tells the agent to reply in the language of the user's latest message, not that of the
-  instructions, tool output, or project files, and every user turn repeats that as a one-line note: a
-  `UserPromptSubmit` hook for Claude and Codex, and an `experimental.chat.messages.transform` plugin
-  hook for opencode that adds it to the latest user message in memory only. The rule alone sits at
+  instructions, tool output, or project files, and every user turn repeats that as a one-line note
+  from a `UserPromptSubmit` hook. The rule alone sits at
   the start of the context, so long English tool output used to pull replies into English.
 - `route-command.py`: validates Agent/Bash calls, denies direct local agent launches, and maps cwd.
   Routing hooks have a 15-second budget around the 10-second command-policy check. Claude sessions

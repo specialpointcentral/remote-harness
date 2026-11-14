@@ -85,7 +85,11 @@ while [ $# -gt 0 ]; do
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
 done
-case "$LAUNCH" in claude|codex|opencode) ;; *) printf 'unsupported --launch %s\n' "$LAUNCH" >&2; exit 2;; esac
+case "$LAUNCH" in
+  claude|codex) ;;
+  opencode) printf 'remote-harness no longer supports opencode; use --launch claude or --launch codex\n' >&2; exit 2;;
+  *) printf 'unsupported --launch %s\n' "$LAUNCH" >&2; exit 2;;
+esac
 
 case "$UI" in
   terminal) ;;

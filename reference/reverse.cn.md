@@ -86,8 +86,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    `setup-tunnel.sh --config <remote-session-config> --alias rlocal --namespace rlocal --gen-key`。
 5. 它用 `--box-ssh-config <remote-session-config>` 调用 `laptop-setup.sh`。
 6. `laptop-setup.sh` 创建携带 RemoteForward 的笔记本侧会话 config，通过内部 ssh wrapper 连接，
-   在远端挂载笔记本项目，为 Claude/Codex 安装严格 hook，或为 opencode 安装路由 plugin，
-   然后在远端启动选定 Agent。
+   在远端挂载笔记本项目，为 Claude/Codex 安装严格 hook，然后在远端启动选定 Agent。
 7. 退出时自动卸载 sshfs、删除会话规则、在没有其它挂载需要时断开反向隧道、删除临时 ssh config，
    并清理默认空挂载目录。
 8. 如果连接被强制关闭、本机没来得及执行上述清理，远端会话 watcher 会发现 Agent 已退出（或终端
@@ -122,7 +121,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 - 远端盒子已安装 remote-harness，默认在 `~/.remote-harness`，或设置了 `RH_HOME`。
 - 笔记本可以运行 SSH server；向导会在可行时检测并提示开启。没有 root，或该 sshd 不读取
   `~/.ssh/authorized_keys` 时，改用用户态 sshd。
-- 远端盒子已安装 `sshfs` 和选定 Agent CLI（`codex`、`claude` 或 `opencode`）。
+- 远端盒子已安装 `sshfs` 和选定 Agent CLI（`codex` 或 `claude`）。
 - 多用户共享远端盒子或存在大量长期 SSHFS 挂载时，建议按
   `docs/ssh-sshfs-long-lived-connections.cn.md` 优化服务端 sshd 容量和 keepalive。
 

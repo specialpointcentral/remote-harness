@@ -32,14 +32,13 @@
 #                            default: <remote $RH_HOME>/mounts/<project-name>)
 #   --project-dir <d>     laptop project dir to mount (validated; prompts again if invalid)
 #   --launch <cmd>        coding-agent CLI to start on the remote (default: claude;
-#                         Codex passes 'codex', opencode passes 'opencode')
+#                         Codex passes 'codex')
 #   --ui terminal|paseo|orca  terminal (default), or a native chat for Claude or Codex
 #   --approval <mode>     approvals on the launched agent: 'auto' (default; claude
 #                         --permission-mode auto, codex --approve-for-me, normal where the CLI
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
 #   --yolo                bypass approvals on the launched agent — claude/codex get their
-#                         bypass flag; opencode allows every permission in this session only
-#                         (1.x: permission=allow in the session config, 2.x: --auto)
+#                         bypass flag
 #   --local-sshd <mode>   SSH server the tunnel reaches on this laptop: 'system' (default; the
 #                         sshd on :22 reading ~/.ssh/authorized_keys) or 'user' (a per-session sshd
 #                         run as you on a free loopback port, for sshds that ignore authorized_keys
@@ -71,7 +70,7 @@ while [ $# -gt 0 ]; do
     --port)          need_arg "$1" "${2-}"; PORT="$2";           shift 2;;
     --pubkey)        need_arg "$1" "${2-}"; PUBKEY="$2";         shift 2;;
     --via)           need_arg "$1" "${2-}"; VIA="$2";            shift 2;;
-    --launch)        need_arg "$1" "${2-}"; LAUNCH="$2";         shift 2;;   # CLI to start on the remote (claude/codex/opencode)
+    --launch)        need_arg "$1" "${2-}"; LAUNCH="$2";         shift 2;;   # CLI to start on the remote (claude/codex)
     --ui)            need_arg "$1" "${2-}"; UI="$2";            shift 2;;
     --approval)      need_arg "$1" "${2-}"; APPROVAL="$2";       shift 2;;   # normal|auto|yolo
     --yolo)          APPROVAL=yolo;       shift;;     # bypass approvals on the launched agent
@@ -906,8 +905,9 @@ printf "\n${_B}remote-harness${_0} laptop setup  ${_C}port=%s${_0}  platform=%s\
 
 # Resolve YOLO into the effective launch command per agent.
 case "$LAUNCH" in
-  claude|codex|opencode) ;;
-  *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
+  claude|codex) ;;
+  opencode) printf 'remote-harness no longer supports opencode; use --launch claude or --launch codex\n' >&2; exit 2;;
+  *) printf 'unsupported --launch %s (expected claude|codex)\n' "$LAUNCH" >&2; exit 2;;
 esac
 EFF_LAUNCH="$LAUNCH"
 LAUNCH_BASE="$LAUNCH"
@@ -917,7 +917,6 @@ if [ "$APPROVAL" = yolo ]; then
     codex:paseo|codex:orca) warn "YOLO: $ui_label Codex full access";;
     claude:terminal) EFF_LAUNCH="$LAUNCH --dangerously-skip-permissions";              warn "YOLO: claude --dangerously-skip-permissions";;
     codex:terminal) EFF_LAUNCH="$LAUNCH --dangerously-bypass-approvals-and-sandbox";  warn "YOLO: codex --dangerously-bypass-approvals-and-sandbox";;
-    opencode:terminal) warn "YOLO: opencode allows every permission (this session only — nothing global)";;
   esac
 fi
 
@@ -1641,8 +1640,8 @@ if [ "$(printf '%s\n' "$MOUNT_OUT" | kv_value KILL_USER_PROCESSES)" = 1 ]; then
   say  "    KillUserProcesses=no (see docs/ssh-sshfs-long-lived-connections.md)."
 fi
 
-# AGENTS.md-only project: only matters for Claude Code (reads CLAUDE.md, not AGENTS.md); codex and
-# opencode read AGENTS.md natively. remote-harness does not create repo guidance files implicitly.
+# AGENTS.md-only project: only matters for Claude Code (reads CLAUDE.md, not AGENTS.md); Codex reads
+# AGENTS.md natively. remote-harness does not create repo guidance files implicitly.
 AGENTS_ONLY=$(printf '%s\n' "$MOUNT_OUT" | kv_value AGENTS_MD_ONLY)
 if [ "$AGENTS_ONLY" = 1 ] && [ "$LAUNCH_BASE" = claude ]; then
   say ""
@@ -1660,9 +1659,8 @@ LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%
 
 # Inject the run-on-laptop rule SCOPED TO THIS SESSION: inject-rule builds box-side, per-session
 # artifacts (nothing global, nothing in the mounted repo, so other projects on this box are
-# unaffected) and prints how to launch so ONLY this agent reads it — a session flag for claude, or
-# an env/config prefix (Codex developer_instructions / OPENCODE_CONFIG) for codex/opencode. For opencode 1.x,
-# YOLO's permission=allow is folded into that per-session config too; 2.x gets --auto.
+# unaffected) and prints how to launch so ONLY this agent reads it — session flags for claude, and
+# session config flags (developer_instructions, hooks) for codex.
 # The box-side session dir is keyed by mountpoint AND this launch's RULE_SESSION_ID, so a
 # relaunch or a dead session's cleanup for the same project cannot delete a live session's runner.
 step_begin "$(tr2 "Installing session routing (hooks, runner, git/rg shims)" "注入会话路由（hook、runner、git/rg 垫片）")"
@@ -1693,13 +1691,12 @@ if [ "$rh_status" = INJECTED ]; then
                   "远端 ${LAUNCH_BASE} 不支持 auto 审批模式，将照常逐项请求审批。")"
     fi
   fi
-  rh_ready=$(printf '%s\n' "$rh_out" | kv_value RH_READY_FILE)
   if [ "$(printf '%s\n' "$rh_out" | kv_value RH_PROCESS_LIST_SHARED)" = 1 ]; then
     warn "$(tr2 "Other users on the remote server can read every process's arguments, including the agent's Bash commands; an administrator can mount /proc with hidepid=2 to stop that." \
                 "远端服务器上的其他用户能读取所有进程的参数，包括 Agent 执行的 Bash 命令；管理员可以给 /proc 加上 hidepid=2 挂载选项来阻止。")"
   fi
   # The session launcher records the agent pid for the box-side watcher that cleans up after a
-  # dropped connection; it wraps only this final launch, never the opencode readiness probe below.
+  # dropped connection; it wraps only this final launch.
   rh_prefix=$(printf '%s\n' "$rh_out" | kv_value RH_LAUNCH_PREFIX)
   REMOTE_SESSION_DIR=$(printf '%s\n' "$rh_out" | kv_value RH_SESSION_DIR)
   if [ -z "$REMOTE_SESSION_DIR" ]; then
@@ -1771,49 +1768,6 @@ else
     printf '%s\n' "$inject_tail" | sed 's/^/    /'
   fi
   exit 1
-fi
-
-if [ "$LAUNCH_BASE" = opencode ]; then
-  case "$rh_ready" in
-    /*) ;;
-    *) err "opencode routing plugin did not provide a readiness marker; refusing to launch"; exit 1;;
-  esac
-  case "$rh_ready" in *'
-'*) err "opencode routing plugin returned an invalid readiness marker; refusing to launch"; exit 1;; esac
-  # 1.x loads plugins while it reads the configuration. 2.x loads them only when its server opens the
-  # directory, which listing agents does; --standalone keeps the probe off the user's shared server,
-  # as the launch flags keep the agent.
-  case "$(printf '%s\n' "$rh_out" | kv_value RH_OPENCODE_MAJOR)" in
-    2) rh_probe="debug agents --standalone";;
-    *) rh_probe="debug config";;
-  esac
-  if ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
-    ready=$(sq "$rh_ready")
-    mount_root=$(sq "$REMOTE_MOUNTPOINT")
-    rm -f \"\$ready\" 2>/dev/null || true
-    cd \"\$mount_root\" || exit 1
-    (${rh_env:+$rh_env }opencode $rh_probe </dev/null >/dev/null 2>&1) &
-    pid=\$!
-    i=0
-    while [ \"\$i\" -lt 60 ]; do
-      if [ -s \"\$ready\" ]; then
-        kill \"\$pid\" 2>/dev/null || true
-        wait \"\$pid\" 2>/dev/null || true
-        exit 0
-      fi
-      kill -0 \"\$pid\" 2>/dev/null || break
-      sleep 1
-      i=\$((i + 1))
-    done
-    kill \"\$pid\" 2>/dev/null || true
-    wait \"\$pid\" 2>/dev/null || true
-    exit 1
-  "; then
-    ok "opencode routing plugin loaded"
-  else
-    err "opencode routing plugin failed to load; refusing to launch the agent"
-    exit 1
-  fi
 fi
 
 step_begin "$(tr2 "Launching ${LAUNCH} on the remote" "在远端启动 ${LAUNCH}")"

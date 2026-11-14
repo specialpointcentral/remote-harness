@@ -1,7 +1,7 @@
 # AGENTS.md - remote-harness maintainer guide
 
-This repository is the remote-only remote-harness skill. Claude, Codex, opencode, subagents, and
-independent agent sessions run on a remote server. The user's local machine is only the project host:
+This repository is the remote-only remote-harness skill. Claude, Codex, subagents, and independent
+agent sessions run on a remote server. The user's local machine is only the project host:
 it provides files over SSHFS and executes project commands through a forced gateway.
 
 ## Repository Layout
@@ -14,7 +14,7 @@ it provides files over SSHFS and executes project commands through a forced gate
 - `scripts/project-host-gateway.sh`: forced SSH command accepting only SFTP, health, exec, and the
   allowlisted `git`/`rg` tool verb.
 - `scripts/route-command.py`: Claude/Codex hook policy and cwd mapping.
-- `scripts/inject-rule.sh`: also generates the session opencode plugin (1.x or 2.x format).
+- `scripts/inject-rule.sh`: generates each session's settings, hooks, runner and shims.
 - `scripts/run-on-project-host.sh`: validated local project command and tool dispatcher.
 - `scripts/project-host-tool.py`: remote session `git`/`rg` PATH shim for work-tree scans.
 - `scripts/session-reaper.sh`: remote watcher/GC for sessions whose local cleanup never ran.
@@ -41,7 +41,8 @@ it provides files over SSHFS and executes project commands through a forced gate
   remote CLI's automatic review (`claude --permission-mode auto`, `codex --approve-for-me`) and falls
   back to normal approvals where the CLI lacks it.
 - `laptop-setup.sh` remains standalone with its sibling helpers fetched beside it.
-- The terminal path starts the main agent through `ssh -tt <remote> ... <claude|codex|opencode>`.
+- The terminal path starts the main agent through `ssh -tt <remote> ... <claude|codex>`.
+  opencode is no longer supported: every entry refuses `--launch opencode`.
   With Claude and `--ui paseo`, the same SSH session owns the Harness bridge while the same-host
   Paseo daemon starts the main agent with the injected settings. The bridge revokes its lease
   before archive and exit. An all-tool hook blocks a stale Paseo agent after transport cleanup.
@@ -72,15 +73,15 @@ it provides files over SSHFS and executes project commands through a forced gate
   private MCP command tool. The command tool checks the lease, gateway policy and Codex rules
   before running the project-host runner. Native file edits use the mount. The app server stops
   when the bridge lease ends, and old sessions cannot resume with a different mount or account.
-- Claude/Codex/opencode shell commands route locally. Agent/Spawn tools stay on the remote host.
+- Claude/Codex shell commands route locally. Agent/Spawn tools stay on the remote host.
 - Claude requires 2.1.295+ and its routing hook must set `onFailure: "block"`; a cancelled or broken
   hook must never let the original Bash command run on the agent host. Generated session settings
   keep hooks enabled even when project settings set `disableAllHooks`. Routing hook budgets exceed
   the inner command-policy timeout. New settings require a new harness session.
 - The Claude hook never returns a permission decision for a routed call: `allow` skips Claude's
   prompt and auto-mode classifier. It rewrites to the readable `rh-run --cwd <dir> -- <command>` so
-  the user's approval mode judges the original command. The terminal Codex hook and the opencode plugin write
-  the same form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
+  the user's approval mode judges the original command. The terminal Codex hook writes the same
+  form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
   The session settings add an `autoMode.environment` entry that names the runner and asks the
   classifier to judge the quoted command, not the wrapper. It never adds an allow rule. It brings
   `"$defaults"` only when no user or managed environment exists at session start. Away from the
@@ -89,17 +90,12 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Since Claude sees only rh-run, its hook applies the user's own rules to the original command:
   `Bash(...)` deny/ask on any simple command the shared lexer finds, allow only for a plain single
   command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their
-  identity changes. Terminal Codex and opencode check the original themselves: their rewrite repeats it on a
-  new line after `exit`, which the shell never parses, and Codex's exec policy (`.rules`, forced `rm`)
-  and opencode's bash rules read it; the opencode plugin also sets the original's own workdir.
+  identity changes. Terminal Codex checks the original itself: its rewrite repeats it on a new line
+  after `exit`, which the shell never parses, and Codex's exec policy (`.rules`, forced `rm`) reads it.
 - Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc`. `rh-session` blanks the
   laptop's address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Linux sshfs mounts use
   `fsname=remote-harness` and keep their source in the mount record; `mounts` is owner-only. Shim
   stderr maps the project root back to the mount.
-- opencode 1.x and 2.x each get their own plugin and config keys; other versions are refused. 2.x
-  always starts with `--standalone`, for the launch and the readiness probe alike: without it the
-  client attaches to the user's shared background server, where Bash runs unrouted. Like a local
-  2.x, it refuses a routed command its scanner cannot analyze (here-documents, loops).
 
 ## Gateway Security
 
@@ -147,8 +143,6 @@ it provides files over SSHFS and executes project commands through a forced gate
 - Calls outside the mount, or naming another repository/index, run the real tool unchanged.
 - Claude sessions default `CLAUDE_CODE_BASH_EDIT_DIFF` to `0` (a value exported by the remote login
   shell wins): its per-directory inotify watcher cannot see routed changes and stalls on SSHFS.
-- opencode sessions turn snapshots off unless the remote login shell exports
-  `RH_OPENCODE_SNAPSHOT=on`: each model step lists the whole work tree under a private `GIT_DIR`.
 - A routed call that cannot reach the project host fails non-zero; it never reports clean or
   no-match and never falls back to scanning SSHFS. Only an explicit "tool not installed" answer
   from a reachable project host switches that tool to the remote host for the rest of the session.

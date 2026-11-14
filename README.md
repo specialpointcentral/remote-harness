@@ -7,7 +7,7 @@
 
 <p align="center">
   <img alt="platforms" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20WSL-blue">
-  <img alt="agents" src="https://img.shields.io/badge/agents-Claude%20Code%20%7C%20Codex%20%7C%20opencode-8A2BE2">
+  <img alt="agents" src="https://img.shields.io/badge/agents-Claude%20Code%20%7C%20Codex-8A2BE2">
   <img alt="topology" src="https://img.shields.io/badge/topology-remote--only-success">
   <img alt="transport" src="https://img.shields.io/badge/transport-SSH%20%2B%20sshfs-orange">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-FUSE--T%20(no%20kext)-brightgreen">
@@ -43,18 +43,15 @@
 
 ### 这是什么
 
-你的**编码 Agent**（Claude Code / Codex / opencode）全部运行在远端服务器，代码库和真实命令环境
+你的**编码 Agent**（Claude Code / Codex）全部运行在远端服务器，代码库和真实命令环境
 保留在本机。`remote-harness` 用 sshfs 把代码挂到远端空目录，并通过 forced-command gateway 将
-**编译/测试导向本机**，然后只在远端挂载目录里启动 Agent。Claude Code/opencode 通过
+**编译/测试导向本机**，然后只在远端挂载目录里启动 Agent。Claude Code 通过
 `/remote-harness` 触发；Codex 用 `$remote-harness` 直接调用技能。默认 simple reverse 模式下，Agent
 只给你一条命令；具体 SSH、路径、命名空间和挂载点都在你的本地终端里输入，不进入 Agent 聊天。
 
-本 fork 对 Claude Code、Codex 和 opencode 都启用严格命令路由：Claude/Codex 使用会话级
-`PreToolUse` hook，opencode 使用会话级插件（1.x 和 2.x 各有一种格式）。它们会把每个 Bash 调用自动改写到
-代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook/plugin、runner 或 SSH
-config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。
-opencode 还必须在预加载时写出会话 plugin readiness marker，否则交互式 Agent 不会启动。opencode 2.x
-总是以 `--standalone` 启动私有服务端：用户共用的后台服务不会加载本会话的插件，命令会在那里不经路由执行。
+本 fork 对 Claude Code 和 Codex 都启用严格命令路由：两者都使用会话级 `PreToolUse` hook，把每个 Bash
+调用自动改写到代码所在主机执行，并把 SSHFS 挂载下的当前目录映射到项目主机对应子目录。hook、runner 或
+SSH config 创建失败时，启动器会拒绝启动 Agent，不会退回到 Agent 主机执行。已不再支持 opencode。
 
 记号：**A** = 运行 Agent 的机器；**P** = 存放代码的机器（用一个 ssh `<别名>` 指代）。
 
@@ -72,15 +69,16 @@ git clone https://github.com/specialpointcentral/remote-harness.git
 cd remote-harness
 ./manage.sh            # 复制安装到 ~/.remote-harness + 各 Agent 的入口
 ./manage.sh --dev      # 开发模式：软链到本仓库，改动即时生效
-./manage.sh --uninstall [claude|codex|opencode]   # 卸载（不动你的 ssh 配置/挂载）
+./manage.sh --uninstall [claude|codex]   # 卸载（不动你的 ssh 配置/挂载）
+./manage.sh --uninstall opencode         # 删除旧版本安装的 opencode 命令
 ```
 
 **方式二：一句 Prompt 让 Agent 自动安装**
 
-在目标机器上的 Codex / Claude Code / opencode 里粘贴：
+在目标机器上的 Codex / Claude Code 里粘贴：
 
 ```text
-请在当前机器上安装 remote-harness skill。GitHub 仓库是 https://github.com/specialpointcentral/remote-harness，请克隆或更新这个仓库，运行 ./manage.sh 安装到当前用户的 Claude Code / Codex / opencode 入口；不要修改 ~/.ssh；完成后告诉我可用的调用方式。
+请在当前机器上安装 remote-harness skill。GitHub 仓库是 https://github.com/specialpointcentral/remote-harness，请克隆或更新这个仓库，运行 ./manage.sh 安装到当前用户的 Claude Code / Codex 入口；不要修改 ~/.ssh；完成后告诉我可用的调用方式。
 ```
 
 | Agent | 入口位置 | 调用 |
@@ -88,11 +86,10 @@ cd remote-harness
 | 共享核心 | `~/.remote-harness/{SKILL.md, SKILL.cn.md, scripts/, reference/, docs/}` | （各方共用） |
 | Claude Code | `~/.claude/skills/remote-harness/SKILL.md` | `/remote-harness` |
 | Codex | `~/.codex/skills/remote-harness/SKILL.md` | `$remote-harness` |
-| opencode | `~/.config/opencode/command/remote-harness.md` | `/remote-harness` |
 
 **脚本**是唯一的单一事实来源——各 Agent 都调用 `~/.remote-harness/scripts/*`。每个 Agent 的入口
 形态不同：Claude Code 与 Codex 都是原生 *skill*（共用同一份 `SKILL.md`；Codex 无自定义斜杠命令，推荐用
-`$remote-harness` 直接调用技能），opencode 是让 Agent 去读共享 `SKILL.md` 的自定义命令。
+`$remote-harness` 直接调用技能）。
 
 ### Quick start
 
@@ -106,8 +103,8 @@ cd remote-harness
 $remote-harness 中文，远程开发本地，yolo
 ```
 
-Claude Code / opencode 使用 `/remote-harness 中文，远程开发本地，yolo`。请求里没说清楚的项，Agent 会先用
-选项问你：远端用哪个 Agent（Claude Code / Codex / opencode）、审批模式（auto / 普通 / YOLO）、本机 SSH 服务用系统 sshd 还是
+Claude Code 使用 `/remote-harness 中文，远程开发本地，yolo`。请求里没说清楚的项，Agent 会先用
+选项问你：远端用哪个 Agent（Claude Code / Codex）、审批模式（auto / 普通 / YOLO）、本机 SSH 服务用系统 sshd 还是
 [用户态 sshd](#用户态-sshdfreeipa-等主机)（FreeIPA 等主机）。然后返回一段已填好选择、在**本地终端**运行的
 命令，并说明每项怎么改。SSH 目标、项目路径和挂载点只在本地终端里填写，不经过聊天。
 
@@ -253,7 +250,7 @@ Agent 主机上的 Orca Server 为聊天建立专用挂载和命令路由。保�
 - **会话恢复**：对话记录保存在远端（Claude `~/.claude/projects/`、Codex `~/.codex/sessions/`），按工作
   目录区分；默认挂载点按项目名固定，所以同一项目重连后能找到上次对话。若上次会话因断线结束，下次启动
   同一项目、同一 Agent 时会询问"继续该会话？[Y/n]"（回车即继续，只问一次），分别以
-  `claude --continue`、`codex resume --last`、`opencode --continue` 启动。`RH_RESUME=1` 总是继续上次
+  `claude --continue`、`codex resume --last` 启动。`RH_RESUME=1` 总是继续上次
   对话，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。Agent 收到 SIGHUP 后往往
   立刻自行退出，远端 watcher 来不及看到它"终端已挂断但仍在运行"：此时若项目主机经隧道不可达，watcher
   同样留下标记；本机的交互 `ssh -tt` 因断线返回 255 时，也会在本机
@@ -299,8 +296,7 @@ remote-harness 的单次会话会自动做这些事：使用会话级 SSH config
     再触发远端构建。（无内核扩展的兜底：`rclone nfsmount`——但写是异步的，故本场景优先 FUSE-T。）
 - Claude/Codex 严格路由要求远端 Agent 主机有 `python3`。Claude Code 须为 **2.1.295 或更新版本**，
   以支持路由 hook 失败时阻止命令执行；更新 harness 后需重新创建会话，可恢复原 Claude 对话。
-  opencode 须为 1.x 或 2.x（按
-  `opencode --version` 判断，其它版本拒绝启动）。项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
+  项目主机只需 POSIX `sh`、base64 解码器和正常登录 shell。
 - 多用户共享远程开发服务器建议按
   [`docs/ssh-sshfs-long-lived-connections.cn.md`](docs/ssh-sshfs-long-lived-connections.cn.md)
   调整 sshd 容量、keepalive、`nofile` 和 TCP 队列。该优化不是 remote-harness 的硬性前置条件，
@@ -329,7 +325,7 @@ remote-harness/
 │   ├── project-host-gateway.sh            # forced-command SSH gateway
 │   ├── laptop-setup.sh       # 反向编排（在笔记本上跑）
 │   └── local-setup.sh        # 永久拒绝本机 Agent 的兼容 stub
-├── adapters/{codex,opencode}.md   # 各 Agent 的入口（只设置 --launch）
+├── adapters/codex.md   # Codex 入口（只设置 --launch）
 ├── manage.sh                 # 安装 / --dev / --uninstall
 ├── docs/                     # 设计与完整流程文档（安装时一并复制/软链）
 │   └── ssh-sshfs-long-lived-connections*.md  # 共享服务器 SSH/SSHFS 长连接优化
@@ -360,10 +356,9 @@ remote-harness/
   远端会话目录中；不会覆盖共享账号的 `~/.ssh/config`。同一台笔记本的多项目会话仍可复用活动隧道，
   最后一个会话退出时清理。
 - 审批模式默认 **auto**：Claude Code 以 `--permission-mode auto`、Codex 以 `--approve-for-me` 启动，由
-  Agent 自动审核审批请求；远端 CLI 不支持时（以及 opencode）退回普通审批并给出提示。`--approval normal`
-  恢复逐项询问。`--yolo` 会绕过审批，**仅在你明确要求时**才启用；opencode 1.x 的 `permission:allow`
-  只写进**本次会话**的配置，2.x 改用本次启动的 `--auto` 参数，退出即失效。
-- Claude、终端 Codex 和 opencode 的 Bash 调用被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
+  Agent 自动审核审批请求；远端 CLI 不支持时退回普通审批并给出提示。`--approval normal` 恢复逐项询问。
+  `--yolo` 会绕过审批，**仅在你明确要求时**才启用，只作用于本次启动。
+- Claude 和终端 Codex 的 Bash 调用被改写成 `rh-run --cwd <目录> -- '<原命令>'`，审批提示和
   自动审核看到的是原命令。Claude 仍按你选的审批模式处理：普通模式询问，auto 模式由自动审核判断，YOLO
   不询问。会话设置会告诉自动审核这种改写是 Harness 的通道，让它判断引号里的命令，而不是把包装当成绕过
   尝试拒绝。Claude 只能拿改写后的文本匹配权限规则，所以 hook 用原命令对照你 settings 里的 `Bash(...)` 规则：
@@ -377,11 +372,7 @@ remote-harness/
   `prompt`、`forbidden` 规则会询问或拒绝，auto 模式下询问交给自动审核；YOLO 下这两类命令直接拒绝，与本机
   Codex 相同。这些检查由 Codex 自己完成：改写后的命令在 `exit` 之后另起一行附上原命令，shell 既不执行也不
   解析这一行，Codex 按它检查。
-- opencode 在插件改写之后才检查权限，所以插件同样在 `exit` 之后另起一行附上原命令，并把工作目录设为原命令
-  自己的目录：opencode 解析整段文本，你的 bash 权限规则和项目外目录检查都按原命令判断。`rh-run` 和 `exit`
-  本身也算两条命令，`"*"` 设为 ask 或 deny 的白名单式配置会因此询问或拒绝。opencode 2.x 和本机一样，
-  会直接拒绝它的解析器分析不了的命令（heredoc、`for`/`while` 等复合命令）。
-- Claude/Codex hook、opencode plugin、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
+- Claude/Codex hook、runner 和规则都是**会话级**的（不写全局文件、不碰挂载的仓库）；
   退出删除会话目录。路由器加载后，handler 错误会返回拒绝，SSH 失败也不会回退执行原命令。
 - 严格命令路由限制的是正常 Agent Bash 调用，不会把 SSHFS 变成安全沙箱。反向会话中的远端主机持有
   一把能访问本机 SSH/SFTP 的临时密钥；请只在你信任的 Agent 主机上使用，不要把敏感目录作为项目挂载。
@@ -393,10 +384,6 @@ remote-harness/
   监听挂载点内的每个目录，而路由命令在项目主机上修改文件，SSHFS 不会产生对应事件，所以差异始终为空，
   建立监听却会拖慢界面。需要时在远端 shell 启动文件中 `export CLAUDE_CODE_BASH_EDIT_DIFF=1`；
   查看改动请用路由后的 `git diff`。
-- opencode 会话默认关闭快照（`/undo` 和回滚依赖它）：每一步模型调用都要经 SSHFS 列出整个工作区，
-  大仓库会明显变慢。需要时在远端 shell 启动文件中 `export RH_OPENCODE_SNAPSHOT=on`，或在项目的
-  opencode 配置里打开。opencode 的格式化器和语言服务器不经过 Bash，和你自己输入的 `!` 命令及终端一样，
-  在远端主机上对挂载目录执行。
 - 隐私：Bash 在笔记本上执行，输出（`pwd`、报错、堆栈等）里会出现笔记本上的项目路径和用户名，并进入模型
   上下文。git/rg 垫片会把报错里的项目路径映射回挂载点，项目命令自己的输出不做改写。
 - 远端 `/proc` 没有 `hidepid` 挂载选项时，服务器上的其他用户能看到所有进程的参数，包括 Agent 执行的 Bash
@@ -447,19 +434,16 @@ remote-harness/
 Your coding agents run only on the remote server while the repository and real command environment
 remain on the local project host. `remote-harness` SSHFS-mounts the local code on the server,
 routes builds/tests through a forced-command gateway, and launches the
-agent in the mount. Claude Code/opencode trigger it with `/remote-harness`; Codex users invoke the
+agent in the mount. Claude Code triggers it with `/remote-harness`; Codex users invoke the
 skill with `$remote-harness`. In the default simple reverse mode, the agent returns one command;
 concrete SSH targets, paths, namespaces, and mountpoints are entered in the user's local terminal,
 not in chat. Generically: **A** = the machine the agent runs on; **P** = the
 machine the code lives on (an ssh `<alias>`).
 
-This fork adds strict routing for Claude Code, Codex, and opencode. Claude/Codex use a session
-`PreToolUse` hook; opencode uses a session plugin (1.x or 2.x format). Each rewrites Bash calls to
-the project host and maps the SSHFS-relative cwd to the corresponding project-host directory.
-Hook/plugin, runner, or SSH-config failures abort launch instead of falling back to the agent host.
-opencode must also produce a session-plugin readiness marker during preloading before its interactive
-Agent is allowed to start. opencode 2.x always starts with `--standalone`, a private server: the
-user's shared background server does not load the session plugin and would run commands unrouted.
+This fork adds strict routing for Claude Code and Codex. Both use a session `PreToolUse` hook that
+rewrites Bash calls to the project host and maps the SSHFS-relative cwd to the corresponding
+project-host directory. Hook, runner, or SSH-config failures abort launch instead of falling back to
+the agent host. opencode is no longer supported.
 
 ### Install the Skill
 
@@ -476,15 +460,16 @@ git clone https://github.com/specialpointcentral/remote-harness.git
 cd remote-harness
 ./manage.sh            # copy-install to ~/.remote-harness + each agent's entry point
 ./manage.sh --dev      # dev mode: symlink to this repo (edits go live)
-./manage.sh --uninstall [claude|codex|opencode]   # uninstall (leaves your ssh config/mounts alone)
+./manage.sh --uninstall [claude|codex]   # uninstall (leaves your ssh config/mounts alone)
+./manage.sh --uninstall opencode         # remove the opencode command earlier versions installed
 ```
 
 **Option 2: one-prompt agent install**
 
-Paste this into Codex / Claude Code / opencode on the target machine:
+Paste this into Codex / Claude Code on the target machine:
 
 ```text
-Install the remote-harness skill on this machine. GitHub repository: https://github.com/specialpointcentral/remote-harness; clone or update that repository, run ./manage.sh to install it for the current user's Claude Code / Codex / opencode entries, do not modify ~/.ssh, and tell me the available invocation commands when done.
+Install the remote-harness skill on this machine. GitHub repository: https://github.com/specialpointcentral/remote-harness; clone or update that repository, run ./manage.sh to install it for the current user's Claude Code / Codex entries, do not modify ~/.ssh, and tell me the available invocation commands when done.
 ```
 
 | Agent | Location | Invoke |
@@ -492,12 +477,10 @@ Install the remote-harness skill on this machine. GitHub repository: https://git
 | shared core | `~/.remote-harness/{SKILL.md, SKILL.cn.md, scripts/, reference/, docs/}` | (used by all) |
 | Claude Code | `~/.claude/skills/remote-harness/SKILL.md` | `/remote-harness` |
 | Codex | `~/.codex/skills/remote-harness/SKILL.md` | `$remote-harness` |
-| opencode | `~/.config/opencode/command/remote-harness.md` | `/remote-harness` |
 
 The **scripts** are the single source of truth — every agent calls `~/.remote-harness/scripts/*`.
 Each agent's entry differs by what it supports: Claude Code and Codex both use a native *skill* (the
-shared `SKILL.md`; Codex has no custom slash commands, so use `$remote-harness`); opencode is a
-custom command that reads the shared `SKILL.md`.
+shared `SKILL.md`; Codex has no custom slash commands, so use `$remote-harness`).
 
 ### Quick start
 
@@ -512,9 +495,9 @@ In the agent running on the remote box:
 $remote-harness English, remote dev local project, yolo
 ```
 
-Claude Code / opencode use `/remote-harness English, remote dev local project, yolo`. For anything
-the request leaves open, the agent first asks with options: which remote agent (Claude Code / Codex /
-opencode), the approval mode (auto / normal / YOLO), and whether the laptop uses its system sshd or the
+Claude Code uses `/remote-harness English, remote dev local project, yolo`. For anything the
+request leaves open, the agent first asks with options: which remote agent (Claude Code / Codex),
+the approval mode (auto / normal / YOLO), and whether the laptop uses its system sshd or the
 [user-mode sshd](#user-mode-sshd-freeipa-style-hosts) (FreeIPA-style hosts). It then returns a command
 for your **local terminal** with those choices filled in and a note on how to change each one. SSH
 targets, project paths, and mountpoints are entered only in the local terminal, never in chat.
@@ -688,8 +671,8 @@ project's Claude auto memory with terminal launches.
   `~/.codex/sessions/`) keyed by working directory, and the default mountpoint is fixed by project name,
   so reconnecting the same project finds the last conversation. When the last session ended on a lost
   connection, the next launch of the same project and agent asks "Continue that conversation? [Y/n]"
-  (Enter continues; asked once) and starts `claude --continue`, `codex resume --last`, or
-  `opencode --continue`. `RH_RESUME=1` always continues the last conversation, `RH_RESUME=0` never does.
+  (Enter continues; asked once) and starts `claude --continue` or `codex resume --last`.
+  `RH_RESUME=1` always continues the last conversation, `RH_RESUME=0` never does.
   The tool call running at the moment of the drop is not resumed. Agents usually exit on their own
   when SIGHUP arrives, before the remote watcher can see a hung-up agent linger; the watcher still
   leaves the marker when the project host is unreachable through the tunnel at that moment, and an
@@ -743,9 +726,8 @@ See the full template, verification commands, and rollback notes in
     Avoid macFUSE (it requires lowering security). FUSE-T keeps sshfs's synchronous writes, so edits
     land on the host before remote builds. (Kext-less fallback: `rclone nfsmount`, but its writes are
     async — prefer FUSE-T for this edit-here/build-on-host workflow.)
-- Strict Claude/Codex routing requires `python3` on the remote Agent host. opencode must be 1.x or
-  2.x (read from `opencode --version`; other versions are refused). The project host needs POSIX `sh`,
-  a base64 decoder, and its normal login shell.
+- Strict Claude/Codex routing requires `python3` on the remote Agent host. The project host needs
+  POSIX `sh`, a base64 decoder, and its normal login shell.
 - Shared remote development servers should use
   [`docs/ssh-sshfs-long-lived-connections.md`](docs/ssh-sshfs-long-lived-connections.md) to tune sshd
   capacity, keepalive, `nofile`, and TCP queues. This is not a hard prerequisite for remote-harness,
@@ -771,7 +753,7 @@ remote-harness/
 │   ├── project-host-gateway.sh                 # forced-command SSH gateway
 │   ├── laptop-setup.sh                        # reverse orchestrator
 │   └── local-setup.sh                         # permanent local-agent rejection stub
-├── adapters/{codex,opencode}.md
+├── adapters/codex.md
 ├── manage.sh
 ├── docs/                            # design and complete-flow docs (installed with the skill)
 │   └── ssh-sshfs-long-lived-connections*.md  # shared-server SSH/SSHFS tuning
@@ -808,12 +790,10 @@ remote-harness/
   shared account's `~/.ssh/config`. Multiple projects from the same laptop can reuse a live tunnel;
   the last session out cleans it up.
 - The approval mode defaults to **auto**: Claude Code starts with `--permission-mode auto` and Codex
-  with `--approve-for-me`, so the agent reviews approval requests itself; a remote CLI without it (and
-  opencode) falls back to normal approvals with a notice. `--approval normal` restores per-action
-  prompts. `--yolo` bypasses approvals and is applied **only when you ask**; opencode 1.x's
-  `permission:allow` goes into the **per-session** config only, 2.x gets this launch's `--auto` flag,
-  and both are gone on exit.
-- Claude, terminal Codex, and opencode rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
+  with `--approve-for-me`, so the agent reviews approval requests itself; a remote CLI without it
+  falls back to normal approvals with a notice. `--approval normal` restores per-action prompts.
+  `--yolo` bypasses approvals and is applied **only when you ask**, for this launch only.
+- Claude and terminal Codex rewrite each Bash call to `rh-run --cwd <dir> -- '<command>'`, so
   approval prompts and automatic review show the original command. Claude still applies your approval
   mode: normal asks, auto lets the classifier decide, YOLO does not ask. The session settings tell the
   classifier that the rewrite is the harness transport, so it judges the quoted command rather than
@@ -832,13 +812,7 @@ remote-harness/
   rules in your `.rules` ask or deny, auto mode putting the question to its automatic review; YOLO
   denies both, as a local Codex does. Codex runs these checks itself: the rewritten command repeats
   the original on a new line after `exit`, which the shell neither runs nor parses, and Codex checks it.
-- opencode checks permissions after its plugins rewrite the call, so its plugin also repeats the
-  original on a new line after `exit` and sets the working directory to the original's own: opencode
-  parses the whole text, so your bash permission rules and its external-directory check judge the
-  original. `rh-run` and `exit` count as commands too, so an allowlist-style config (`"*"` set to ask
-  or deny) asks or denies because of them. Like a local opencode 2.x, 2.x refuses commands its parser
-  cannot analyze (here-documents, compound commands such as `for` or `while`).
-- Claude/Codex hooks, the opencode plugin, runners, and instructions are **session-scoped**. Once
+- Claude/Codex hooks, runners, and instructions are **session-scoped**. Once
   routing is loaded, handler errors deny the call and SSH failures do not fall back to the original
   command.
 - Strict command routing is not a filesystem sandbox. In reverse mode the trusted agent host holds
@@ -854,11 +828,6 @@ remote-harness/
   files on the project host, and SSHFS reports no events for those changes, so the diff stays empty
   while setting up the watches slows the UI. To turn it back on, `export CLAUDE_CODE_BASH_EDIT_DIFF=1`
   in a remote shell startup file; routed `git diff` shows changes.
-- opencode sessions turn snapshots off (they back `/undo` and revert): every model step lists the whole
-  work tree over SSHFS, which slows large repositories noticeably. To turn them back on,
-  `export RH_OPENCODE_SNAPSHOT=on` in a remote shell startup file, or enable them in the project's
-  opencode config. opencode's formatters and language servers do not go through Bash: like your own
-  `!` commands and terminals, they run on the remote host against the mount.
 - Privacy: Bash runs on the laptop, so its output (`pwd`, errors, stack traces) shows the laptop's
   project path and user name and reaches the model. The git/rg shims map the project path in their
   errors back to the mount; a project command's own output is not rewritten.

@@ -234,7 +234,7 @@ resume_marker() {  # $1=session dir
   case "$(kv_b64 "$1/session.env" UI)" in paseo|orca) return 1;; esac
   _rm_mp=$(kv "$1/session.env" MOUNTPOINT)
   _rm_agent=$(kv_b64 "$1/session.env" AGENT)
-  case "$_rm_agent" in claude|codex|opencode) ;; *) return 1 ;; esac
+  case "$_rm_agent" in claude|codex) ;; *) return 1 ;; esac
   [ -n "$_rm_mp" ] || return 1
   printf '%s/.resume/%s.%s' "$SESSIONS" "$(printf '%s' "$_rm_mp" | tr '/+=' '_.-')" "$_rm_agent"
 }

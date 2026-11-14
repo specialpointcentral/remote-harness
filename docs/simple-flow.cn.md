@@ -6,7 +6,7 @@
 
 维护 fork 只支持一种拓扑：
 
-- Claude、Codex、opencode、subagent、嵌套 Agent 和独立 Agent 会话全部运行在远端服务器。
+- Claude、Codex、subagent、嵌套 Agent 和独立 Agent 会话全部运行在远端服务器。
 - 本机项目通过 SSHFS 挂载到远端服务器。
 - Bash 命令通过 forced SSH gateway 回到本机，并且只能在已登记的本机项目根内执行。
 
@@ -49,16 +49,13 @@ SSH 传输从暂存目录打包的八个 helper、bootstrap 副本和 SHA-256 �
 7. 本机 SSH 连接向远端服务器建立 `RemoteForward <port> 127.0.0.1:22`（使用用户态 sshd 时，`22`
    换成它的空闲回环端口）。
 8. 远端服务器使用会话 key/config，通过 SSHFS 挂载选定的本机项目。
-9. opencode 会先在远端预加载会话 plugin（2.x 在私有的 `--standalone` 服务端上），并且必须写出
-   readiness marker；失败时在交互式 Agent 启动前中止。
-10. 选定 Agent 只在远端服务器、SSHFS 挂载目录内启动。
-11. Claude/Codex `PreToolUse` hook 或 opencode plugin 的工具钩子把 Bash 改写到会话
-    runner。runner 只通过 forced gateway 发送
+9. 选定 Agent 只在远端服务器、SSHFS 挂载目录内启动。
+10. Claude/Codex `PreToolUse` hook 把 Bash 改写到会话 runner。runner 只通过 forced gateway 发送
     `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`。
-12. 本机 dispatcher 验证项目根和物理 cwd，清除常见 AI 凭据环境变量，在 `PATH` 中屏蔽
+11. 本机 dispatcher 验证项目根和物理 cwd，清除常见 AI 凭据环境变量，在 `PATH` 中屏蔽
     `claude`、`codex`、`opencode`，再用本机登录 shell 的环境执行项目命令（bash 和 zsh 使用经过校验的
     会话级快照；其它 shell 或快照不可用时使用登录 shell）。
-13. 退出清理释放本会话 lease。其他会话仍引用的资源一起保留；最后释放挂载、实现、密钥、
+12. 退出清理释放本会话 lease。其他会话仍引用的资源一起保留；最后释放挂载、实现、密钥、
     config/runtime、gateway 和授权。本地释放无法验证时保存记录，供后续重试。
 
 ## 进度显示
@@ -119,7 +116,6 @@ chroot 到选定项目。若需要绝对的“本机不能运行 Agent”以及�
 - 远端服务器安装 SSHFS 和 FUSE。
 - Claude/Codex 严格路由要求远端 Agent 主机安装 Python 3；Claude 须为 2.1.295+，旧版或无法识别的
   版本会在 Agent 启动前被拒绝，因为无法保证路由 hook 失败时阻止命令执行。
-  opencode 须为 1.x 或 2.x，其它版本会被拒绝。
 - 本机项目主机需要 POSIX `sh`、base64 解码器和项目工具链。
 - 远端服务器 sshd 允许 reverse TCP forwarding。
 

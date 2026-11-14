@@ -40,8 +40,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$LAUNCH" in
-  claude|codex|opencode) ;;
-  *) printf 'unsupported --launch %s (expected claude|codex|opencode)\n' "$LAUNCH" >&2; exit 2;;
+  claude|codex) ;;
+  opencode) printf 'remote-harness no longer supports opencode; use --launch claude or --launch codex\n' >&2; exit 2;;
+  *) printf 'unsupported --launch %s (expected claude|codex)\n' "$LAUNCH" >&2; exit 2;;
 esac
 
 validate_launch_ui "$UI" "$LAUNCH" || exit 2

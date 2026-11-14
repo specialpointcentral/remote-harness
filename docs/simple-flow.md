@@ -6,8 +6,7 @@
 
 The maintained fork supports one topology:
 
-- Claude, Codex, opencode, subagents, nested agents, and independent agent sessions run on the
-  remote server.
+- Claude, Codex, subagents, nested agents, and independent agent sessions run on the remote server.
 - The local project is mounted on that server through SSHFS.
 - Bash commands are returned through a forced SSH gateway and run inside the registered local
   project root.
@@ -61,17 +60,14 @@ not migrated while running. See [design.md](design.md) for lifecycle details.
    user-mode sshd's free loopback port instead of `22` when it is used).
 8. The remote server uses the session key and config to mount the selected local project with
    SSHFS.
-9. For opencode, the remote CLI preloads the session plugin (2.x on a private `--standalone` server)
-   and must create its readiness marker. Failure aborts before the interactive Agent starts.
-10. The selected agent is launched only on the remote server, inside the SSHFS mount.
-11. Claude/Codex `PreToolUse` hooks or the opencode plugin's tool hook rewrite Bash to the
-    session runner. The runner sends only `remote-harness-exec <root-b64> <cwd-b64> <command-b64>`
-    through the forced gateway.
-12. The local dispatcher verifies the project root and physical cwd, removes common AI credential
+9. The selected agent is launched only on the remote server, inside the SSHFS mount.
+10. Claude/Codex `PreToolUse` hooks rewrite Bash to the session runner. The runner sends only
+    `remote-harness-exec <root-b64> <cwd-b64> <command-b64>` through the forced gateway.
+11. The local dispatcher verifies the project root and physical cwd, removes common AI credential
     variables, shadows `claude`, `codex`, and `opencode` in `PATH`, then executes the project command
     with the environment of the local login shell (for bash and zsh, a validated per-session snapshot
     of it; otherwise, or when the snapshot is unavailable, a login shell).
-13. Exit cleanup releases this session's lease. Resources still referenced by another session are
+12. Exit cleanup releases this session's lease. Resources still referenced by another session are
     retained together; final release removes the mount, implementation, key/config/runtime, gateway
     and authorization. Unverifiable local release is recorded for a later retry.
 
@@ -143,8 +139,7 @@ has no AI credentials.
   selected Agent CLI installed.
 - The local machine runs an SSH server.
 - The remote server has SSHFS and FUSE.
-- Strict Claude/Codex routing requires Python 3 on the remote Agent host. opencode must be 1.x or
-  2.x; other versions are refused. Claude requires 2.1.295+; older or unrecognized versions are
+- Strict Claude/Codex routing requires Python 3 on the remote Agent host. Claude requires 2.1.295+; older or unrecognized versions are
   refused before agent launch because they cannot guarantee blocking when the routing hook fails.
 - The local project host needs POSIX `sh`, a base64 decoder, and its project toolchain.
 - The remote server's sshd permits reverse TCP forwarding.

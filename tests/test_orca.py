@@ -49,7 +49,7 @@ class OrcaOptionTests(PaseoFixture):
              "--launch", "opencode", "--ui", "orca"],
             env=self.env, text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("--ui orca requires --launch claude or codex", result.stderr)
+        self.assertIn("no longer supports opencode", result.stderr)
 
     def test_explicit_mount_is_refused_before_ssh(self):
         self.script("ssh", 'touch "$HOME/ssh-ran"\nexit 1\n')

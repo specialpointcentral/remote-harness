@@ -92,7 +92,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 5. It calls `laptop-setup.sh` with `--box-ssh-config <remote-session-config>`.
 6. `laptop-setup.sh` creates the laptop-side session config carrying `RemoteForward`, connects
    through its internal ssh wrapper, mounts the laptop project on the box, installs strict
-   strict Claude/Codex hooks or the opencode routing plugin, and launches the selected agent.
+   Claude/Codex hooks, and launches the selected agent.
 7. On exit, cleanup unmounts sshfs, removes the session rule, drops the reverse tunnel when no
    remaining mount needs it, removes temp ssh configs, and removes default empty mountpoint dirs.
 8. If the connection is force-closed and the laptop never runs that cleanup, the remote session
@@ -131,7 +131,7 @@ its folder workspace ends the Harness session. [Claude setup](../docs/orca.md) Â
 - remote-harness is installed on the remote box at `~/.remote-harness`, or `RH_HOME` points to it.
 - The laptop can run an SSH server; the wizard detects and guides enabling it when possible. Without
   root, or when that sshd ignores `~/.ssh/authorized_keys`, use the user-mode sshd.
-- The remote box has `sshfs` and the selected agent CLI (`codex`, `claude`, or `opencode`).
+- The remote box has `sshfs` and the selected agent CLI (`codex` or `claude`).
 - For shared remote boxes with many users or long-lived SSHFS mounts, tune server-side sshd capacity
   and keepalive as described in `docs/ssh-sshfs-long-lived-connections.md`.
 

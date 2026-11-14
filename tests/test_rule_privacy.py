@@ -39,9 +39,6 @@ print('project-host-routed')
 sys.exit(23)
 ''')
             ssh.chmod(0o700)
-            # inject-rule reads the opencode version to pick its plugin format.
-            (fake_bin / 'opencode').write_text('#!/bin/sh\necho 1.19.5\n')
-            (fake_bin / 'opencode').chmod(0o700)
             (fake_bin / 'claude').write_text('#!/bin/sh\necho "2.1.295 (Claude Code)"\n')
             (fake_bin / 'claude').chmod(0o700)
             env = {name: value for name, value in os.environ.items()
@@ -49,7 +46,7 @@ sys.exit(23)
             env.update(HOME=str(home), RH_HOME=str(home / 'rh'), RH_WARM_MAX='0',
                        PATH=str(fake_bin) + ':' + env['PATH'], SSH_TEST_LOG=str(ssh_log))
 
-            for agent in ('codex', 'claude', 'opencode'):
+            for agent in ('codex', 'claude'):
                 with self.subTest(agent=agent):
                     result = subprocess.run(
                         [str(INJECT), 'on', agent, project_root, alias, str(mount), 'normal',
@@ -66,16 +63,10 @@ sys.exit(23)
                                          if flag.startswith('developer_instructions='))
                         instructions = json.loads(developer)
                         self.assertEqual(instructions, rule.rstrip('\n'))
-                    elif agent == 'claude':
+                    else:
                         path = Path(flags[flags.index('--append-system-prompt-file') + 1])
                         self.assertEqual(path, session / 'rule.md')
                         instructions = path.read_text()
-                    else:
-                        config_entry = next(entry for entry in shlex.split(output['RH_LAUNCH_ENV'])
-                                            if entry.startswith('OPENCODE_CONFIG='))
-                        agent_config = json.loads(Path(config_entry.split('=', 1)[1]).read_text())
-                        self.assertEqual(agent_config['instructions'], [str(session / 'rule.md')])
-                        instructions = Path(agent_config['instructions'][0]).read_text()
 
                     for private_value in (project_root, alias, str(mount)):
                         self.assertNotIn(private_value, instructions)
@@ -100,7 +91,7 @@ sys.exit(23)
 
                     # Execute the generated runner, including its SSH wrapper, without a network.
                     # Private host values must still reach the encoded gateway request unchanged.
-                    # The hooks and the opencode plugin write the readable form.
+                    # The hooks write the readable form.
                     routed_env = dict(env, PATH=str(session / 'bin') + ':' + env['PATH'])
                     command = "printf 'routing preserved'"
                     routed = subprocess.run([str(session / 'bin' / 'rh-run'), '--cwd', 'packages/api', '--',

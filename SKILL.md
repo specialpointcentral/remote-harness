@@ -1,7 +1,7 @@
 ---
 name: remote-harness
 description: >-
-  Use when Claude, Codex, or opencode must run on a remote server while editing and executing against
+  Use when Claude or Codex must run on a remote server while editing and executing against
   a project on the user's local machine. Return a reverse-only bootstrap command; never launch an
   agent on the local project host.
 ---
@@ -10,11 +10,11 @@ description: >-
 
 This fork is **remote-only**:
 
-- Claude, Codex, opencode, their subagents, and independent agent sessions run on the remote server.
+- Claude, Codex, their subagents, and independent agent sessions run on the remote server.
 - The project remains on the user's local machine.
 - File tools operate through an SSHFS mount on the remote server.
-- Bash commands are routed through Claude/Codex hooks or an opencode session plugin, then through a
-  forced project-host gateway to the local project environment.
+- Bash commands are routed through Claude/Codex hooks, then through a forced project-host gateway
+  to the local project environment.
 - Public and compatibility forward entries refuse to launch an agent locally.
 
 Use reverse mode for clear or ambiguous requests. If the user asks for a local agent, explain that
@@ -26,7 +26,8 @@ Select the remote agent CLI:
 
 - Codex: `--launch codex`
 - Claude Code: `--launch claude`
-- opencode: `--launch opencode`
+
+opencode is no longer supported; `--launch opencode` is refused.
 
 Use the terminal interface by default. For a native Paseo or Orca chat, preserve the user's
 selected `--launch claude` or `--launch codex` and append `--ui paseo` or `--ui orca` to the
@@ -57,11 +58,11 @@ agent CLI, an approval mode such as auto or "yolo"/no approvals, FreeIPA or user
 Ask about the rest in a single round, using the host's multiple-choice question tool when it has one
 (for example Claude Code's AskUserQuestion); otherwise list numbered options and wait for the reply.
 
-1. Remote agent CLI: Claude Code (`--launch claude`), Codex (`--launch codex`), or opencode
-   (`--launch opencode`). Recommend the agent handling this request.
+1. Remote agent CLI: Claude Code (`--launch claude`) or Codex (`--launch codex`). Recommend the
+   agent handling this request.
 2. Approval mode: auto (recommended, `--approval auto`: the remote CLI reviews approvals itself via
-   `claude --permission-mode auto` or `codex --approve-for-me`; opencode and CLIs without it fall back
-   to normal), normal (`--approval normal`: the agent asks), or YOLO (`--yolo`, only on an explicit
+   `claude --permission-mode auto` or `codex --approve-for-me`; CLIs without it fall back to
+   normal), normal (`--approval normal`: the agent asks), or YOLO (`--yolo`, only on an explicit
    choice).
 3. Local SSH server: system sshd on `:22` (recommended); user-mode sshd (`RH_LOCAL_SSHD=user`) for
    FreeIPA/sssd or other hosts whose sshd ignores `~/.ssh/authorized_keys`, or when there is no SSH
@@ -138,8 +139,8 @@ New sessions use per-session `impl` snapshots for remote hooks, runners, shims a
 the local gateway implementation is snapshotted per reverse key. Existing sessions without snapshots are not
 migrated while running. Never unmount a shared live mount or close a tunnel based only on its alias.
 
-The command router or opencode plugin rewrites Bash before execution. The local dispatcher rejects
-direct `claude`, `codex`, and `opencode` launches, scrubs common AI credential variables, and shadows
+The command router rewrites Bash before execution. The local dispatcher rejects direct `claude`,
+`codex`, and `opencode` launches, scrubs common AI credential variables, and shadows
 those binaries in `PATH`. These are defense-in-depth controls; arbitrary project shell code is still
 Turing-complete, and SFTP is not a project chroot. An absolute guarantee requires running the
 project-host gateway under a dedicated OS account that has no AI credentials or agent installation
@@ -181,8 +182,8 @@ Read `docs/claude-multi-agent.md` for the full boundary.
 
 - remote-harness and the selected agent CLI are installed on the remote server;
 - the local machine can SSH to the remote server;
-- the remote server has SSHFS; Claude/Codex also require Python 3, while opencode must be 1.x or
-  2.x (other versions are refused). Claude requires 2.1.295+ so a failed routing hook blocks Bash;
+- the remote server has SSHFS and Python 3. Claude requires 2.1.295+ so a failed routing hook
+  blocks Bash;
 - the local machine runs an SSH server and has POSIX `sh` plus base64;
 - the remote server is trusted with the mounted project content;
 - no unrestricted authorization for the generated session key already exists locally.

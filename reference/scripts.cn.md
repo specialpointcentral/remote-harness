@@ -44,18 +44,12 @@
   不再扫描其他进程的 `/proc` 链接：sshd 等 non-dumpable 进程的链接读不到，lazy 卸载后的文件也不再显示在原挂载点之下。
   拿不到 fusectl 的结论时，lazy 卸载后的 sshfs 会保留。仍在刷写数据的 sshfs 不会被打断（等待上限由
   `RH_SSHFS_SYNC_MAX_SECONDS` 控制，默认 120）。没有 `/proc` 的系统上不会结束任何进程。
-- `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 或 opencode plugin，以及远端 runner；
-  opencode 还会返回启动前必须出现的 readiness marker 路径。它读取 `opencode --version`，按 1.x 或
-  2.x 生成插件和配置，其它版本一律拒绝；2.x 的启动参数以 `--standalone` 开头，`RH_OPENCODE_MAJOR`
-  决定启动器的就绪检查命令（`debug config`，2.x 为 `debug agents --standalone`）。
+- `inject-rule.sh`：安装会话 instruction、Claude/Codex hook 以及远端 runner；其它 Agent 一律拒绝。
   `RH_PROCESS_LIST_SHARED=1` 告诉启动器 Agent 主机上的其他用户能读取进程参数（`/proc` 没有 `hidepid`）。
-  opencode 插件写与 hook 相同的可读格式，像 Codex 的 hook 一样在 `exit` 之后附上原命令，并为 opencode
-  自己的检查把工作目录设为原命令自己的目录。
   会话目录按挂载点加本次启动的 session id 区分，因此重复启动同一项目或清理已断开的会话时，
   不会删除其它仍在运行的会话的 hook 或 runner。
   规则要求 Agent 按用户最近一条消息的语言回复，而不是按指令、工具输出或项目文件的语言回复，
-  并在每一轮用户消息上重复一行提醒：Claude 和 Codex 用 `UserPromptSubmit` hook，opencode 用
-  `experimental.chat.messages.transform` 插件钩子，只在内存中附加到最新一条用户消息上。只靠规则时，
+  并由 `UserPromptSubmit` hook 在每一轮用户消息上重复一行提醒。只靠规则时，
   它位于上下文开头，大量英文工具输出会让回复逐渐变成英文。
 - `route-command.py`：校验 Agent/Bash、拒绝直接本机 Agent 启动、映射 cwd。带 `--agent claude` 时改写成
   可读的 `rh-run --cwd <目录> -- <命令>` 且不返回审批决定，由 Claude 自己的审批模式判断；Codex 得到

@@ -1,7 +1,7 @@
 ---
 name: remote-harness
 description: >-
-  当 Claude、Codex 或 opencode 必须运行在远端服务器，同时编辑并执行用户本机项目时使用。只返回
+  当 Claude 或 Codex 必须运行在远端服务器，同时编辑并执行用户本机项目时使用。只返回
   reverse bootstrap 命令；绝不在本机项目主机启动 Agent。
 ---
 
@@ -11,11 +11,10 @@ description: >-
 
 本 fork 是 **remote-only**：
 
-- Claude、Codex、opencode、它们的 subagent 和独立 Agent 会话都运行在远端服务器；
+- Claude、Codex、它们的 subagent 和独立 Agent 会话都运行在远端服务器；
 - 项目保留在用户本机；
 - 文件工具通过远端服务器上的 SSHFS 挂载操作项目；
-- Bash 命令先经 Claude/Codex hook 或 opencode 会话 plugin，再通过 forced project-host gateway
-  导向本机项目环境；
+- Bash 命令先经 Claude/Codex hook，再通过 forced project-host gateway 导向本机项目环境；
 - 所有公开和兼容 forward 入口都拒绝在本机启动 Agent。
 
 明确或模糊请求都使用 reverse。若用户要求本机 Agent，应说明本 fork 有意不支持该拓扑。
@@ -24,7 +23,8 @@ description: >-
 
 - Codex：`--launch codex`
 - Claude Code：`--launch claude`
-- opencode：`--launch opencode`
+
+已不再支持 opencode；`--launch opencode` 会被拒绝。
 
 默认使用终端界面。用户要求 Paseo 或 Orca 原生聊天时，保留已选的 `--launch claude` 或
 `--launch codex`，在最终 bootstrap 命令追加 `--ui paseo` 或 `--ui orca`，并提供对应的
@@ -50,10 +50,10 @@ bash "${RH_HOME:-$HOME/.remote-harness}/scripts/suggest-via.sh"
 视为最终决定，不再重复询问。其余项一次性询问：宿主有选择题工具时使用它（例如 Claude Code 的
 AskUserQuestion）；否则列出编号选项并等待回复。
 
-1. 远端 Agent CLI：Claude Code（`--launch claude`）、Codex（`--launch codex`）或 opencode
-   （`--launch opencode`）。推荐当前处理请求的 Agent。
+1. 远端 Agent CLI：Claude Code（`--launch claude`）或 Codex（`--launch codex`）。推荐当前处理请求的
+   Agent。
 2. 审批模式：auto（推荐，`--approval auto`：由远端 CLI 自动审核，即 `claude --permission-mode auto`
-   或 `codex --approve-for-me`；opencode 和不支持的 CLI 退回普通审批）、普通（`--approval normal`：
+   或 `codex --approve-for-me`；不支持的 CLI 退回普通审批）、普通（`--approval normal`：
    Agent 逐项询问）或 YOLO（`--yolo`，仅在用户明确选择时）。
 3. 本机 SSH 服务：系统 sshd（`:22`，推荐）；用户态 sshd（`RH_LOCAL_SSHD=user`），适用于 FreeIPA/sssd
    等 sshd 不读取 `~/.ssh/authorized_keys` 的主机，或没有 SSH 服务也没有 root 的情况；或不确定（按系统
@@ -125,8 +125,7 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
 新会话的远端 hook、runner、垫片和 watcher 使用每会话 `impl` 快照，本机 gateway 按反向密钥保存
 实现副本。旧会话不在运行中迁移。不得卸载共享的活跃挂载，也不得仅凭 alias 关闭隧道。
 
-命令路由器或 opencode plugin 会在执行前改写 Bash。本机 dispatcher 拒绝直接启动 `claude`、`codex`
-和 `opencode`，清除常见 AI 凭据环境变量，并在 `PATH` 中屏蔽这些二进制。这些是纵深防护；任意项目
+命令路由器会在执行前改写 Bash。本机 dispatcher 拒绝直接启动 `claude`、`codex` 和 `opencode`，清除常见 AI 凭据环境变量，并在 `PATH` 中屏蔽这些二进制。这些是纵深防护；任意项目
 shell 代码仍是图灵完备的，SFTP 也不是项目 chroot。若要绝对保证，需要让 project-host gateway 使用
 没有 AI 凭据和 Agent 安装、且只能访问目标项目的独立 OS 账号。
 
@@ -162,8 +161,7 @@ shell 代码仍是图灵完备的，SFTP 也不是项目 chroot。若要绝对�
 
 - remote-harness 和所选 Agent CLI 安装在远端服务器；
 - 本机可以 SSH 到远端服务器；
-- 远端服务器有 SSHFS；Claude/Codex 还需要 Python 3，Claude 须为 2.1.295+，保证路由 hook 失败时阻止
-  Bash 执行。opencode 须为 1.x 或 2.x（其它版本会被拒绝）；
+- 远端服务器有 SSHFS 和 Python 3。Claude 须为 2.1.295+，保证路由 hook 失败时阻止 Bash 执行；
 - 本机运行 SSH server，并有 POSIX `sh` 和 base64；
 - 远端服务器被信任，可访问所挂载的项目内容；
 - 本机不存在对本次生成会话 key 的无限制授权。

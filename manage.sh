@@ -7,18 +7,19 @@
 #   ./manage.sh --uninstall [agents...]  remove installed files/links
 #   ./manage.sh --help
 #
-#   agents: claude codex opencode   (default: all)
+#   agents: claude codex   (default: all)
 #
-# Uninstall never touches SSH config/authorization files or any sshfs mounts.
+# opencode is no longer supported; --uninstall still removes the opencode command earlier versions
+# installed. Uninstall never touches SSH config/authorization files or any sshfs mounts.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RH_HOME="${RH_HOME:-$HOME/.remote-harness}"
 CLAUDE_DIR="$HOME/.claude/skills/remote-harness"          # Claude Code: native Agent Skill
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}/skills/remote-harness"     # Codex: native skill (type: remote-harness)
-OPENCODE_FILE="$HOME/.config/opencode/command/remote-harness.md"  # opencode: custom command
+OPENCODE_FILE="$HOME/.config/opencode/command/remote-harness.md"  # installed by earlier versions
 
-usage() { sed -n '4,12p' "${BASH_SOURCE[0]}" | cut -c3-; }
+usage() { sed -n '4,13p' "${BASH_SOURCE[0]}" | cut -c3-; }
 die() { echo "error: $*" >&2; exit 2; }
 clean_path() { printf '%s' "${1%/}"; }
 guard_remove_target() {
@@ -57,6 +58,9 @@ for a in "$@"; do
   esac
 done
 [ -n "$targets" ] || targets="all"
+case "$ACTION:$targets " in
+  install:*" opencode "*) die "opencode is no longer supported; './manage.sh --uninstall opencode' removes its command" ;;
+esac
 want() { case " $targets " in *" all "*) return 0;; *" $1 "*) return 0;; *) return 1;; esac; }
 
 place_file() {  # src dest — symlink (dev) or copy (production)
@@ -93,7 +97,7 @@ if [ "$ACTION" = uninstall ]; then
   want codex    && rm_path "$CODEX_DIR"     || true
   want opencode && rm_path "$OPENCODE_FILE" || true
   # Drop the shared core only when removing everything (other launchers still reference it).
-  if want claude && want codex && want opencode; then rm_path "$RH_HOME"; fi
+  if want claude && want codex; then rm_path "$RH_HOME"; fi
   echo "done. (SSH config/authorization files and any sshfs mounts were left untouched.)"
   exit 0
 fi
@@ -136,12 +140,11 @@ if want codex; then
     echo "  ✓ Codex skill (copy)       → $CODEX_DIR/SKILL.md  (invoke: '\$remote-harness')"
   fi
 fi
-if want opencode; then
-  place_file "$SRC/adapters/opencode.md" "$OPENCODE_FILE"
-  echo "  ✓ opencode command ($MODE)  → $OPENCODE_FILE"
+if [ -e "$OPENCODE_FILE" ] || [ -L "$OPENCODE_FILE" ]; then
+  echo "  ! opencode is no longer supported; './manage.sh --uninstall opencode' removes $OPENCODE_FILE"
 fi
 
 echo
 [ "$MODE" = dev ] && echo "DEV install: edits in $SRC are live immediately." || true
-echo "Done. Start it in your agent:  /remote-harness  (Claude Code / opencode)  ·  '\$remote-harness' in Codex"
+echo "Done. Start it in your agent:  /remote-harness  in Claude Code  ·  '\$remote-harness' in Codex"
 echo "  remote-only: agent on the remote server; project files and commands on the local machine"
