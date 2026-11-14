@@ -68,6 +68,9 @@ automatic review when available and falls back to normal. YOLO requires explicit
 Keep the project host awake and the launcher running. Closing the phone app or finishing a Claude
 turn leaves the transport active. Close the chat tab, archive the folder workspace, or press
 Ctrl-C in the project-host terminal to end the session. Harness revokes the lease before cleanup.
+If the project host's connection to the agent host drops, the session ends as well; the launcher
+says so, and the next launch offers to continue the chat. The project host's
+`~/.remote-harness/launches.log` records why each launch ended.
 When the launcher stops, Harness attempts to close the chat and archive its folder in Orca.
 An ended chat has no tools until a later launch continues it, as described below. Keep the private
 `.orca-identities` records and `.orca-mounts` reservations under `$RH_HOME`. They bind each chat
@@ -120,6 +123,35 @@ Claude chats created by earlier Harness versions have no project record. They ap
 project and are marked "project not recorded", so continue them only in their own project.
 Continuing one records its project. Codex chats created by earlier versions cannot continue:
 cleanup removed their conversation.
+
+## Switch between Orca and the terminal
+
+A Claude conversation can move between an Orca chat and a terminal launch of the same project
+(without `--ui`), in either direction:
+
+- A terminal launch offers the project's ended Orca Claude chats in the same menu. The chosen
+  chat's conversation continues in the terminal at the chat's mount path (`claude --resume <id>`),
+  so the paths in its history stay valid. Until that launch ends, no launch offers the chat and Orca
+  cannot run it. A later Orca launch reopens the chat, and Claude continues with the terminal turns
+  as well, although Orca's own chat view may not show the terminal turns.
+- An Orca launch's menu also lists up to five ended conversations of the project's terminal
+  launches, marked "Terminal conversation". The chosen one continues in a new Orca chat, which
+  shows its earlier history. Orca resumes only a conversation recorded in the chat's own folder,
+  so Harness gives the chat a copy under a new session ID, with the terminal mount's paths in its
+  working directories moved to the chat's mount; the terminal conversation stays as it was. The
+  copy is an Orca chat of the project, offered as such by later Orca and terminal launches. The
+  terminal conversation is offered again only after it changes in the terminal. Terminal
+  conversations are listed only while no launch uses the project's terminal mount, because a
+  running launch may still write one.
+
+In an Orca launch, `RH_RESUME_CHAT` also accepts a terminal conversation's ID. Terminal launches
+mount a project at `<RH_HOME>/mounts/<folder name>`, so projects with the same folder name share
+these conversations. Codex conversations do not switch.
+
+Orca chats also share Claude's auto memory with the project's terminal launches: Harness points
+`autoMemoryDirectory` at the terminal mount's memory directory,
+`~/.claude/projects/<terminal mount path>/memory/`. An `autoMemoryDirectory` in your own or the
+managed Claude settings takes precedence.
 
 ## Smoke test
 

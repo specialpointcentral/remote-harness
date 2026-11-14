@@ -224,7 +224,8 @@ Paseo 客户端中打开会话。[Claude 设置](docs/paseo.cn.md) · [Codex 设
 
 在项目主机运行 bootstrap，选择 `--launch claude` 或 `--launch codex` 并追加 `--ui orca`。
 Agent 主机上的 Orca Server 为聊天建立专用挂载和命令路由。保持项目主机的启动器运行，在已配对的手机
-或桌面客户端打开会话。[Claude 设置](docs/orca.cn.md) · [Codex 设置](docs/codex-native.cn.md)
+或桌面客户端打开会话。用 Claude 时，同一段对话可以在 Orca 和终端之间来回切换，Orca 聊天也与终端启动
+共用该项目的 Claude 自动记忆。[Claude 设置](docs/orca.cn.md) · [Codex 设置](docs/codex-native.cn.md)
 
 ### 断线与会话恢复
 
@@ -257,6 +258,11 @@ Agent 主机上的 Orca Server 为聊天建立专用挂载和命令路由。保�
   立刻自行退出，远端 watcher 来不及看到它"终端已挂断但仍在运行"：此时若项目主机经隧道不可达，watcher
   同样留下标记；本机的交互 `ssh -tt` 因断线返回 255 时，也会在本机
   `~/.remote-harness/.sessions/.resume/` 记下一次，两者任一存在都会触发上面的询问。
+- **结束原因记录**：每次启动到 Agent 开始运行后，启动器会在本机 `~/.remote-harness/launches.log`
+  （仅本人可读，保留最近 500 行）记一行开始、一行结束及原因：Agent 正常退出、聊天在 Orca/Paseo 中
+  被关闭、按 Ctrl-C、交互式 SSH 连接断开（退出码 255）、桥接进程与 Orca Server 失去联系、本地终端
+  被关闭等，并附上隧道重连次数和笔记本休眠时长。若同一项目上一次不是 Agent 退出、聊天关闭或 Ctrl-C
+  结束的，下次启动时启动器会提示原因；启动器被强制终止或笔记本崩溃而没来得及记下结束的，也会提示。
 
 ### 服务器 SSH/SSHFS 长连接优化提醒
 
@@ -638,7 +644,9 @@ Keep the launcher running and open the chat on the paired client.
 
 Select `--launch claude` or `--launch codex` and add `--ui orca` to the project-host bootstrap.
 Orca Server runs on the agent host. The chat has a dedicated mount and command route. Keep the
-project-host launcher running while using the chat from a paired phone or desktop.
+project-host launcher running while using the chat from a paired phone or desktop. With Claude, a
+conversation can move between Orca and the terminal in either direction, and Orca chats share the
+project's Claude auto memory with terminal launches.
 [Claude setup](docs/orca.md) · [Codex setup](docs/codex-native.md)
 
 ### Disconnects and resuming
@@ -687,6 +695,13 @@ project-host launcher running while using the chat from a paired phone or deskto
   leaves the marker when the project host is unreachable through the tunnel at that moment, and an
   interactive `ssh -tt` that returns 255 on a lost connection records a local marker under
   `~/.remote-harness/.sessions/.resume/`. Either one triggers the question above.
+- **Why a session ended**: once a launch starts its agent, the launcher writes a start line and an
+  end line with the reason to `~/.remote-harness/launches.log` on the laptop (owner-only, the last
+  500 lines): the agent exited, the chat was closed in Orca or Paseo, Ctrl-C, the interactive SSH
+  connection dropped (exit 255), the bridge lost Orca Server, the terminal was closed, and so on, with
+  tunnel reconnects and how long the laptop slept. When the previous launch of the same project ended
+  any other way than the agent exiting, its chat closing, or Ctrl-C, the next launch says why,
+  including a launcher that was killed or a laptop that crashed before it could record the end.
 
 ### Server SSH/SSHFS Long-Lived Connection Tuning
 

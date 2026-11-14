@@ -537,6 +537,7 @@ write_reply_language_hook() {  # $1=session dir $2=note -> prints the hook comma
 }
 
 write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker $4=reply language hook command $5=runner
+  #                          $6=mountpoint $7=the project's default mountpoint
   _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
   _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
   _wcs_prompt=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4") || return 1
@@ -557,8 +558,15 @@ print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harnes
   # these entries to the user's and managed ones, and its shipped environment stays only while some
   # list holds "$defaults". A user or managed list of its own replaces or extends the shipped one,
   # so "$defaults" is added only when neither exists when the session starts.
-  _wcs_auto=$("$PYTHON3" -c '
-import json, os, sys
+  #
+  # Claude keeps auto memory per working directory, and every Orca launch (or --remote-mountpoint)
+  # mounts the project somewhere else, so each would start with no memory. A session away from the
+  # project's default mount uses the default mount's memory directory instead, the one terminal
+  # launches already use; a user or managed autoMemoryDirectory wins. Claude keys that default by the
+  # sanitized physical path, cut to 200 characters plus a hash suffix when longer.
+  _wcs_extra=$("$PYTHON3" -c '
+import glob, hashlib, json, os, re, sys
+runner, mount, default = sys.argv[1:4]
 managed = "/Library/Application Support/ClaudeCode" if sys.platform == "darwin" else "/etc/claude-code"
 config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 paths = [os.path.join(config, "settings.json"), os.path.join(managed, "managed-settings.json")]
@@ -568,18 +576,33 @@ try:
               if name.endswith(".json") and not name.startswith(".")]
 except OSError:
     pass
-def own_environment(path):
+def load(path):
     try:
         with open(path, encoding="utf-8") as stream:
-            environment = json.load(stream)["autoMode"]["environment"]
-    except (OSError, ValueError, LookupError, TypeError):
-        return False
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+sources = [load(path) for path in paths]
+def own_environment(settings):
+    auto = settings.get("autoMode")
+    environment = auto.get("environment") if isinstance(auto, dict) else None
     return isinstance(environment, list) and bool(environment) and all(isinstance(e, str) for e in environment)
 entry = ("**Remote-harness routing**: A hook the user installed rewrites each Bash command to "
-         f"`{sys.argv[1]} [--background] --cwd <dir> -- \x27<command>\x27`, which runs it on the "
+         f"`{runner} [--background] --cwd <dir> -- \x27<command>\x27`, which runs it on the "
          "user\x27s own machine (the project host). This wrapper is the user\x27s transport, not "
          "Auto-Mode Bypass: judge the quoted command under every rule, as if run directly.")
-print(json.dumps(([] if any(map(own_environment, paths)) else ["$defaults"]) + [entry]))' "$5") || return 1
+extra = {"autoMode": {"environment": ([] if any(map(own_environment, sources)) else ["$defaults"]) + [entry]}}
+if (default and os.path.realpath(mount) != os.path.realpath(default)
+        and not any(settings.get("autoMemoryDirectory") is not None for settings in sources)):
+    name = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(default))
+    projects = os.path.join(config, "projects")
+    if len(name) > 200:
+        found = glob.glob(os.path.join(glob.escape(projects), glob.escape(name[:200]) + "-*"))
+        name = (os.path.basename(found[0]) if len(found) == 1
+                else name[:200] + "-rh" + hashlib.sha256(default.encode()).hexdigest()[:8])
+    extra["autoMemoryDirectory"] = os.path.join(projects, name, "memory")
+print(json.dumps(extra)[1:-1])' "$5" "$6" "$7") || return 1
   # Flag settings have higher precedence than project settings. Explicit false keeps the
   # route and lease hooks active if a project-level setting otherwise disables all hooks.
   cat > "$1" <<EOF
@@ -588,9 +611,7 @@ print(json.dumps(([] if any(map(own_environment, paths)) else ["$defaults"]) + [
   "permissions": {
     "deny": $_wcs_deny
   },
-  "autoMode": {
-    "environment": $_wcs_auto
-  },
+  $_wcs_extra,
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -665,6 +686,8 @@ write_rule() {  # $1=outfile $2=mountpoint $3=agent $4=ui
     if [ "${3:-}" = claude ]; then
       printf '\nOrdinary and nested subagents work. Do not use Agent Teams or Agent `isolation: worktree`; use a\n'
       printf 'separate remote-harness session for isolated parallel work.\n'
+      printf '\nA conversation continued from another mount of this project may name paths under that mount; use\n'
+      printf 'the current working directory for them instead.\n'
     fi
   } > "$1"
 }
@@ -853,8 +876,12 @@ case "${1:-}" in
         CLAUDE_SETTINGS="$SD/claude-settings.json"
         worktree_blocker=$(write_claude_worktree_blocker "$SD") \
           || abort_session
+        # The launcher's default mountpoint for this project, as in laptop-setup.sh.
+        default_mp="${lp%"${lp##*[!/]}"}"
+        default_mp="${default_mp##*/}"
+        [ -z "$default_mp" ] || default_mp="${RH_HOME:-$HOME/.remote-harness}/mounts/$default_mp"
         write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" "$runner" \
-          || abort_session
+          "$mp" "$default_mp" || abort_session
         env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
         # Bash edit diff learns what a command changed from inotify watches on every work-tree
         # directory of the mount. Routed commands change files on the project host, which SSHFS never

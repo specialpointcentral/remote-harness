@@ -1021,13 +1021,19 @@ claude_launch_env=$(sed -n 's/^RH_LAUNCH_ENV=//p' "$tmp/inject-claude.out")
   || fail "inject claude overrode an explicit bash edit diff setting"
 claude_session_key="$(printf '%s' "$tmp/mount-claude" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 claude_settings="$rh_home/.sessions/$claude_session_key/claude-settings.json"
-python3 - "$claude_settings" "$rh_home/.sessions" <<'PY'
+python3 - "$claude_settings" "$rh_home/.sessions" "$home_dir" "$rh_home/mounts/code" <<'PY'
 import json
 import os
+import re
 import shlex
 import sys
 
 settings = json.load(open(sys.argv[1], encoding="utf-8"))
+# Away from the project's default mount, auto memory uses the default mount's directory, the one a
+# terminal launch keeps, so Orca and terminal launches of a project share it.
+assert settings["autoMemoryDirectory"] == os.path.join(
+    sys.argv[3], ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(sys.argv[4])),
+    "memory"), settings.get("autoMemoryDirectory")
 hook = settings["hooks"]["PreToolUse"][0]
 assert hook["matcher"] == "Bash|Agent"
 assert "route-command.py" in hook["hooks"][0]["command"]
@@ -1067,15 +1073,37 @@ mkdir -p "$tmp/claude-config-am"
 printf '%s\n' '{"autoMode":{"environment":["**Organization**: Example"]}}' > "$tmp/claude-config-am/settings.json"
 CLAUDE_CONFIG_DIR="$tmp/claude-config-am" RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$tmp/mount-claude-am" 0 "$basic_ssh_cfg" >/dev/null
-python3 - "$rh_home/.sessions/$(printf '%s' "$tmp/mount-claude-am" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')/claude-settings.json" <<'PY'
+python3 - "$rh_home/.sessions/$(printf '%s' "$tmp/mount-claude-am" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')/claude-settings.json" "$tmp/claude-config-am" <<'PY'
 import json
 import sys
 
-environment = json.load(open(sys.argv[1], encoding="utf-8"))["autoMode"]["environment"]
+settings = json.load(open(sys.argv[1], encoding="utf-8"))
+environment = settings["autoMode"]["environment"]
 assert len(environment) == 1 and environment[0].startswith("**Remote-harness routing**: "), environment
+assert settings["autoMemoryDirectory"].startswith(sys.argv[2] + "/projects/-"), settings["autoMemoryDirectory"]
 PY
 RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" off claude "$tmp/mount-claude-am" >/dev/null
+# At the default mount Claude's own default already is the project's memory directory, and the
+# user's own autoMemoryDirectory always wins.
+printf '%s\n' '{"autoMemoryDirectory":"~/notes/memory"}' > "$tmp/claude-config-am/settings.json"
+mkdir -p "$rh_home/mounts/code"
+for am_mount in "$rh_home/mounts/code" "$tmp/mount-claude-am"; do
+  am_config="$tmp/claude-config-am"
+  [ "$am_mount" = "$tmp/mount-claude-am" ] || am_config="$tmp/claude-config-none"
+  CLAUDE_CONFIG_DIR="$am_config" RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" on claude "$tmp/code" laptop "$am_mount" 0 "$basic_ssh_cfg" >/dev/null
+  python3 - "$rh_home/.sessions/$(printf '%s' "$am_mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')/claude-settings.json" <<'PY'
+import json
+import sys
+
+settings = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "autoMemoryDirectory" not in settings, settings["autoMemoryDirectory"]
+PY
+  RH_HOME="$rh_home" HOME="$home_dir" \
+    "$ROOT/scripts/inject-rule.sh" off claude "$am_mount" >/dev/null
+done
+rmdir "$rh_home/mounts/code" 2>/dev/null || true
 # Without its session directory the launcher starts no watcher; it only prepares the agent's environment.
 assert_eq "the agent sees no laptop address in SSH_CONNECTION/SSH_CLIENT" \
   "$(SSH_CONNECTION='192.0.2.7 51234 10.0.0.5 22' SSH_CLIENT='192.0.2.7 51234 22' \
@@ -1676,8 +1704,13 @@ PY
       printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'
       [ -z "${MOUNT_FOLLOW_SYMLINKS:-}" ] || printf 'FOLLOW_SYMLINKS=%s\n' "$MOUNT_FOLLOW_SYMLINKS"
       exit 0;;
+    *'orca-session.py'*' claim '*' terminal'*)
+      printf 'MOUNTPOINT=/tmp/rh-remote-orca\nRESUME=1b4e28ba-2fa1-41d2-883f-0016d3cca427\n'; exit 0;;
     *'orca-session.py'*' claim '*) printf 'MOUNTPOINT=/tmp/rh-remote-orca\n'; exit 0;;
+    *'orca-session.py'*' adopt '*) printf 'MOUNTPOINT=/tmp/rh-remote-adopt\n'; exit 0;;
     *'orca-session.py'*' chats '*) printf 'RH_ORCA_CHAT=rev.old\t1\t1\tfixture\n'; exit 0;;
+    *'inject-rule.sh'*"'orca'"*)
+      printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_LAUNCH_PREFIX=rh-session\nRH_ORCA_LAUNCH=orca-bridge\n'; exit 0;;
     *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\nRH_APPROVAL=auto\n'; exit 0;;
   esac
 done
@@ -1746,6 +1779,33 @@ assert_grep_e "$tmp/orca-codex.ssh.log" "orca-session\.py.* claim .* 'codex' 're
 SSH_LOG="$tmp/orca-new.ssh.log" orca_launch "$tmp/orca-new.out"
 refute_grep "$tmp/orca-new.ssh.log" "orca-session.py" "--yes never offers or claims an earlier Orca chat"
 assert_grep "$tmp/orca-new.ssh.log" "orca_native.py" "a new Orca chat reserves a new mount"
+# An Orca launch continues a terminal conversation (named by its Claude session ID) in a new chat:
+# the agent host reserves this launch's mount for that conversation instead of a plain new mount.
+conversation=1b4e28ba-2fa1-41d2-883f-0016d3cca427
+SSH_LOG="$tmp/orca-adopt.ssh.log" RH_RESUME_CHAT=$conversation orca_launch "$tmp/orca-adopt.out"
+assert_grep_e "$tmp/orca-adopt.ssh.log" "orca-session\.py.* adopt .* 'claude' '$conversation' 'rev\.[A-Za-z0-9]+' '$valid_project'" \
+  "an Orca launch adopts the terminal conversation the terminal chose"
+refute_grep "$tmp/orca-adopt.ssh.log" "orca_native.py" "an adopted conversation needs no separate reservation"
+assert_grep "$tmp/orca-adopt.ssh.log" "mp='/tmp/rh-remote-adopt'" "the launch mounts the project at the adopted mount"
+assert_grep "$tmp/orca-adopt.out" "Continuing terminal conversation 1b4e28ba in a new Orca chat" \
+  "the launcher reports the terminal conversation it continues"
+# A terminal launch of Claude continues an ended Orca chat at that chat's mount and resumes its
+# conversation by ID, never the last conversation of the mount.
+terminal_claude_launch() {  # output file, extra arguments; the caller's environment is passed through
+  laptop_setup "$proj_home" --host example.com --port 32025 --via "ssh user@example.com" \
+    --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+    --project-dir "$valid_project" --launch claude "${@:2}" > "$1" 2>&1 || true
+}
+SSH_LOG="$tmp/orca-terminal.ssh.log" RH_RESUME=1 RH_RESUME_CHAT=rev.old terminal_claude_launch "$tmp/orca-terminal.out"
+assert_grep_e "$tmp/orca-terminal.ssh.log" "orca-session\.py.* claim .* 'claude' 'rev\.old' 'rev\.[A-Za-z0-9]+' '$valid_project' terminal" \
+  "a terminal launch claims the Orca chat for the terminal"
+assert_grep "$tmp/orca-terminal.ssh.log" "mp='/tmp/rh-remote-orca'" "a terminal launch mounts the project at the chat's mount"
+assert_grep "$tmp/orca-terminal.ssh.log" "claude --resume $conversation" "a terminal launch resumes the chat's conversation"
+refute_grep "$tmp/orca-terminal.ssh.log" "claude --continue" "a terminal launch that continues a chat never resumes the last conversation"
+assert_grep "$tmp/orca-terminal.out" "Continuing Orca chat rev.old in the terminal" "the launcher reports the chat it continues"
+SSH_LOG="$tmp/terminal-adopt.ssh.log" RH_RESUME_CHAT=$conversation terminal_claude_launch "$tmp/terminal-adopt.out"
+assert_grep "$tmp/terminal-adopt.out" "which only an Orca launch continues" "a terminal launch refuses a terminal conversation ID"
+refute_grep "$tmp/terminal-adopt.ssh.log" "mount-project.sh" "a refused choice mounts nothing"
 assert_grep_e "$ssh_log" "inject-rule\.sh[^ ]* on [^ ]*codex[^ ]* .* [^ ]*auto[^ ]* " "setup passes the default auto approval to the injector"
 assert_grep "$tmp/project-valid.out" "Approvals: codex automatic review" "setup reports the auto approval mode"
 SSH_LOG="$tmp/approval-normal.ssh.log" project_launch "$tmp/approval-normal-launch.out" --approval normal
@@ -1761,11 +1821,42 @@ assert_grep "$launch_dir.out" "-lic codex --dangerously-bypass-approvals-and-san
 refute_grep "$tmp/project-valid.out" "ended on a lost connection" "a first launch offered resume"
 TT_EXIT=255 project_launch "$tmp/resume-lost.out"
 assert_grep "$tmp/resume-lost.out" "Lost the connection to the remote codex session" "a dropped interactive ssh is reported"
+# Each launch that started its agent records why it ended, owner-only.
+launch_history="$proj_home/.remote-harness/launches.log"
+assert_eq "the launch history is owner-only" \
+  "$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$launch_history")" 0o600
+assert_grep_e "$launch_history" "	END	rev\.[A-Za-z0-9]+	codex/terminal	$valid_project	[0-9]+:[^	]*	connection-lost	exit=255" \
+  "the launch history records a dropped connection"
 project_launch "$tmp/resume-next.out"
 assert_grep "$tmp/resume-next.out" "ended on a lost connection" "the launch after a dropped ssh offers resume"
+assert_grep "$tmp/resume-next.out" "ended: the interactive SSH connection to the remote dropped (exit code 255)." \
+  "the next launch of the project says why the previous one ended"
 assert_grep "$launch_dir.out" "-lic codex --continue" "an accepted resume continues the conversation"
 [ -z "$(find "$proj_home/.remote-harness/.sessions/.resume" -type f 2>/dev/null)" ] \
   || fail "a local resume marker was not consumed by the launch that offered it"
+project_launch "$tmp/history-ok.out"
+refute_grep "$tmp/history-ok.out" "The previous launch of this project" "an agent that exited normally is not reported"
+# A launcher that never recorded its end is reported, with how its session went otherwise.
+printf '2026-01-01 00:00:00\tSTART\trev.dead00\tcodex/terminal\t%s\t999999:Thu Jan  1 00:00:00 1970\tstarted\t\n' \
+  "$valid_project" >> "$launch_history"
+project_launch "$tmp/history-unrecorded.out"
+assert_grep "$tmp/history-unrecorded.out" "(rev.dead00, codex/terminal, 2026-01-01 00:00:00) ended: the launcher never recorded its end" \
+  "a launch without a recorded end is reported"
+printf '2026-01-01 00:00:00\tSTART\trev.slept0\tcodex/terminal\t%s\t999999:x\tstarted\t\n2026-01-01 01:00:00\tEND\trev.slept0\tcodex/terminal\t%s\t999999:x\tconnection-lost\texit=255 restarts=2 asleep=1500\n' \
+  "$valid_project" "$valid_project" >> "$launch_history"
+project_launch "$tmp/history-slept.out"
+assert_grep "$tmp/history-slept.out" "dropped (exit code 255); the tunnel reconnected 2 time(s); the laptop slept for about 25 min." \
+  "the report includes tunnel restarts and laptop sleep"
+# A native bridge's exit status says how its chat ended.
+SSH_LOG="$tmp/orca-lost.ssh.log" RH_RESUME_CHAT=rev.old TT_EXIT=3 orca_launch "$tmp/orca-lost.out"
+assert_grep "$tmp/orca-lost.out" "claude session ended: the bridge lost contact with Orca Server (exit code 3)." \
+  "an Orca bridge that lost Orca Server is reported"
+SSH_LOG="$tmp/orca-int.ssh.log" RH_RESUME_CHAT=rev.old TT_EXIT=130 orca_launch "$tmp/orca-int.out"
+assert_grep "$tmp/orca-int.out" "claude/orca, " "the next Orca launch says why the previous one ended"
+assert_grep "$tmp/orca-int.out" "Stopped with Ctrl-C; the session ended." "Ctrl-C in the launcher stops the bridge"
+SSH_LOG="$tmp/orca-closed.ssh.log" RH_RESUME_CHAT=rev.old orca_launch "$tmp/orca-closed.out"
+refute_grep "$tmp/orca-closed.out" "The previous launch of this project" "Ctrl-C is not reported to the next launch"
+assert_grep "$tmp/orca-closed.out" "The Orca chat was closed; the session ended." "a chat closed in Orca ends the session"
 ! sh "$ROOT/scripts/run-on-project-host.sh" --find-tool rh-no-such-tool >/dev/null 2>&1 || fail "--find-tool reported a missing tool"
 assert_grep "$tmp/project-valid.out" "Reusing existing reverse tunnel" "reuses live tunnel"
 assert_grep "$ssh_log" "-tt -o ClearAllForwardings=yes" "phase5 forces remote tty"

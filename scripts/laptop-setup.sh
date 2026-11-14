@@ -131,6 +131,9 @@ LOCAL_SESSION_DIR=""; LOCAL_SSH_CONFIG=""; RULE_SESSION_ID=""
 # The tunnel's laptop end: :22 for the system sshd, or the per-session user-mode sshd's port.
 LOCAL_SSHD_PORT=22; LOCAL_SSHD_DIR=""; LOCAL_SSHD_PID=""; LOCAL_SSHD_START=""; LOCAL_SSHD_CFG=""
 REMOTE_SESSION_DIR=""
+# Why the agent session ended: the signal this launcher received, the interactive ssh's exit status,
+# and when the agent launch started (empty until then; nothing is recorded for a failed setup).
+END_SIGNAL=""; CLAUDE_EXIT=""; LAUNCH_AT=""; LAUNCH_RECORDED=0; END_REASON=""; END_DETAILS=""
 # The box logs into THIS laptop as the box alias's `User`, so the login user must be US. The laptop's
 # own `id -un` is the single source of truth (whatever the box-side setup guessed, e.g. from a
 # project path); we force the box alias to it in Phase 2. In the simple reverse flow remote-harness
@@ -625,9 +628,14 @@ tunnel_supervisor() {
   trap '_stop=1' TERM
   trap '' HUP INT
   nap() { sleep "$1" & _nap=$!; wait "$_nap" 2>/dev/null; kill "$_nap" 2>/dev/null; return 0; }
+  local _napped _paused
   while [ "$_stop" = 0 ]; do
+    _napped=$(date +%s)
     nap "$_wait"  # 5 s between checks, or the backoff after a failed reconnect
     [ "$_stop" = 0 ] || break
+    # A suspended laptop runs no checks: the nap then ends long after it was due.
+    _paused=$(( $(date +%s) - _napped - _wait ))
+    [ "$_paused" -lt 60 ] || tunnel_log "checks paused for ${_paused}s; the laptop was probably asleep"
     # A launcher killed without cleanup: stop; the next launch's sweep releases its records.
     [ "$(proc_start "$$")" = "$_owner_start" ] || { tunnel_log "launcher is gone; supervisor stops"; break; }
     if [ -n "$LOCAL_SSHD_PID" ] && [ "$_sshd_warned" = 0 ] \
@@ -708,11 +716,136 @@ report_tunnel_supervisor() {
   fi
 }
 
+# ---- launch history ----------------------------------------------------------
+# ~/.remote-harness/launches.log (owner-only, the last 500 lines) keeps a line when a launch starts
+# its agent and one when it ends, with why, so the next launch of the project can say why the previous
+# one ended, including a launcher that never got to record its end. Tab-separated fields: time,
+# START|END, session, agent/ui, project, launcher pid:start time, reason, key=value details.
+LAUNCH_LOG="$HOME/.remote-harness/launches.log"
+launch_log() {  # event reason details
+  (umask 077
+    [ ! -L "$LAUNCH_LOG" ] && [ ! -L "$LAUNCH_LOG.tmp" ] || exit 0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$1" "$RULE_SESSION_ID" "$LAUNCH_BASE/$UI" \
+      "$(printf '%s' "$PROJ_DIR" | tr '\t\n' '  ')" "$$:$(proc_start "$$")" "$2" "$3" >> "$LAUNCH_LOG" || exit 0
+    chmod 600 "$LAUNCH_LOG"
+    if [ "$(wc -l < "$LAUNCH_LOG" | tr -d ' ')" -gt 1000 ]; then
+      tail -n 500 "$LAUNCH_LOG" > "$LAUNCH_LOG.tmp" && mv "$LAUNCH_LOG.tmp" "$LAUNCH_LOG"
+    fi
+  ) 2>/dev/null || true
+}
+
+# Classify the end from this launcher's view: a signal it received, or the interactive ssh's status,
+# which is the remote agent's or native bridge's own (the bridges exit 0 when the chat was closed in
+# their app, 128 + the signal that stopped them, and Orca's 3 after losing Orca Server), or 255 when the
+# connection dropped. Details: exit status, tunnel restarts, a tunnel still down, and laptop sleep.
+record_launch_end() {
+  local _restored _paused _slept
+  [ -n "$LAUNCH_AT" ] && [ "$LAUNCH_RECORDED" = 0 ] || return 0
+  LAUNCH_RECORDED=1
+  case "$END_SIGNAL:$UI:$CLAUDE_EXIT" in
+    INT:*) END_REASON=interrupted;;
+    HUP:*) END_REASON=terminal-closed;;
+    TERM:*) END_REASON=terminated;;
+    *:*:255) END_REASON=connection-lost;;
+    *:terminal:0) END_REASON=agent-exit;;
+    *:*:0) END_REASON=chat-closed;;
+    *:*:130) END_REASON=interrupted;;
+    *:orca:3) END_REASON=orca-lost;;
+    *:*:129) END_REASON=remote-hangup;;
+    *:*:143) END_REASON=remote-terminated;;
+    *) END_REASON=agent-error;;
+  esac
+  END_DETAILS="exit=${CLAUDE_EXIT:-none}"
+  if [ -n "$TUNNEL_LOG" ] && [ -s "$TUNNEL_LOG" ]; then
+    _restored=$(grep -c 'tunnel restored' "$TUNNEL_LOG" 2>/dev/null) || _restored=0
+    [ "$_restored" = 0 ] || END_DETAILS="$END_DETAILS restarts=$_restored"
+    if grep -q 'exited; reconnecting' "$TUNNEL_LOG" 2>/dev/null && ! tunnel_alive; then
+      END_DETAILS="$END_DETAILS tunnel-down=1"
+    fi
+    _paused=$(sed -n 's/.*checks paused for \([0-9][0-9]*\)s.*/\1/p' "$TUNNEL_LOG" | awk '{ s += $1 } END { print s + 0 }')
+    [ "$_paused" = 0 ] || END_DETAILS="$END_DETAILS asleep=$_paused"
+  fi
+  # macOS keeps the time of its last sleep, also when no supervisor watched a reused tunnel.
+  if [ "$OS" = Darwin ]; then
+    _slept=$(sysctl -n kern.sleeptime 2>/dev/null | sed -n 's/^{ sec = \([0-9][0-9]*\),.*/\1/p')
+    case "$_slept" in ''|*[!0-9]*) ;; *) [ "$_slept" -lt "$LAUNCH_AT" ] || END_DETAILS="$END_DETAILS slept-at=$_slept";; esac
+  fi
+  launch_log END "$END_REASON" "$END_DETAILS"
+}
+
+sleep_note() {  # details -> how long or when the laptop slept, or nothing
+  local _word _note=""
+  for _word in $1; do
+    case "$_word" in
+      asleep=*) _note=$(tr2 "for about $(( (${_word#*=} + 59) / 60 )) min" "约 $(( (${_word#*=} + 59) / 60 )) 分钟");;
+      slept-at=*)
+        [ -n "$_note" ] || [ "$OS" != Darwin ] \
+          || _note=$(tr2 "at $(date -r "${_word#*=}" '+%H:%M' 2>/dev/null)" "于 $(date -r "${_word#*=}" '+%H:%M' 2>/dev/null)");;
+    esac
+  done
+  printf '%s' "$_note"
+}
+
+launch_reason_text() {  # reason details -> one line for the user
+  local _text _word _slept
+  case "$1" in
+    agent-exit) _text=$(tr2 "the agent exited" "Agent 正常退出");;
+    chat-closed) _text=$(tr2 "the chat was closed or its workspace archived in the app" "会话在应用里被关闭或工作区被归档");;
+    interrupted) _text=$(tr2 "stopped with Ctrl-C" "按 Ctrl-C 结束");;
+    connection-lost) _text=$(tr2 "the interactive SSH connection to the remote dropped" "与远端的交互式 SSH 连接断开");;
+    orca-lost) _text=$(tr2 "the bridge lost contact with Orca Server" "桥接进程与 Orca Server 失去联系");;
+    remote-hangup) _text=$(tr2 "the remote agent or bridge got a hangup signal" "远端 Agent 或桥接进程收到挂断信号");;
+    remote-terminated) _text=$(tr2 "the remote agent or bridge was terminated" "远端 Agent 或桥接进程被终止");;
+    terminal-closed) _text=$(tr2 "this terminal was closed" "本地终端被关闭");;
+    terminated) _text=$(tr2 "the launcher was terminated" "启动器被终止");;
+    unrecorded) _text=$(tr2 "the launcher never recorded its end (it was killed, or the laptop shut down or crashed)" \
+                            "启动器没有记录结束（被强制终止，或笔记本关机、崩溃）");;
+    *) _text=$(tr2 "the remote agent exited with an error" "远端 Agent 异常退出");;
+  esac
+  for _word in $2; do
+    case "$_word" in
+      exit=none) ;;
+      exit=*) [ "$1" = agent-exit ] || [ "$1" = chat-closed ] || _text="$_text$(tr2 " (exit code ${_word#exit=})" "（退出码 ${_word#exit=}）")";;
+      restarts=*) _text="$_text$(tr2 "; the tunnel reconnected ${_word#*=} time(s)" "；隧道自动重连 ${_word#*=} 次")";;
+      tunnel-down=1) _text="$_text$(tr2 "; the tunnel was down at the end" "；结束时隧道处于断开状态")";;
+    esac
+  done
+  _slept=$(sleep_note "$2")
+  [ -z "$_slept" ] || _text="$_text$(tr2 "; the laptop slept $_slept" "；笔记本休眠过（${_slept}）")"
+  printf '%s' "$_text"
+}
+
+# Say why this project's previous launch ended when it was not the agent exiting, its chat closing, or
+# Ctrl-C. A launch that recorded no end and whose launcher still runs is a concurrent one: no message.
+report_previous_launch() {
+  local _last _when _event _sid _what _owner _reason _details _pid
+  [ -f "$LAUNCH_LOG" ] && [ ! -L "$LAUNCH_LOG" ] || return 0
+  _last=$(awk -F'\t' -v p="$(printf '%s' "$PROJ_DIR" | tr '\t\n' '  ')" '
+    $5 == p && $2 == "START" { sid = $3; line = $0 }
+    $5 == p && $2 == "END" && $3 == sid { line = $0 }
+    END { print line }' "$LAUNCH_LOG" 2>/dev/null)
+  [ -n "$_last" ] || return 0
+  IFS=$'\t' read -r _when _event _sid _what _ _owner _reason _details <<EOF
+$_last
+EOF
+  if [ "$_event" = START ]; then
+    _pid=${_owner%%:*}
+    case "$_pid" in ''|*[!0-9]*) return 0;; esac
+    [ "$(proc_start "$_pid")" != "${_owner#*:}" ] || return 0
+    _reason=unrecorded _details=""
+  fi
+  case "$_reason" in agent-exit|chat-closed|interrupted) return 0;; esac
+  warn "$(tr2 "The previous launch of this project ($_sid, $_what, $_when) ended: $(launch_reason_text "$_reason" "$_details")." \
+              "该项目上一次启动（${_sid}，${_what}，${_when}）的结束原因：$(launch_reason_text "$_reason" "$_details")。")"
+  say "  $(tr2 "Launch history: $LAUNCH_LOG" "启动记录：$LAUNCH_LOG")"
+}
+
 cleanup() {
   [ "$CLEANED" = 1 ] && return 0
   CLEANED=1
   [ -z "$STEP_LABEL" ] || step_end fail
   stop_tunnel_supervisor
+  record_launch_end
   write_local_resource_record
   local _total=0 _line _rc=""
   [ "$MOUNTED" = 1 ] && _total=2
@@ -986,9 +1119,9 @@ fi
   exit 2
 }
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 129' HUP
+trap 'END_SIGNAL=INT; cleanup; exit 130' INT
+trap 'END_SIGNAL=TERM; cleanup; exit 143' TERM
+trap 'END_SIGNAL=HUP; cleanup; exit 129' HUP
 if [ "$LOCAL_SSHD_MODE" = user ]; then
   LOCAL_SSHD_DIR="$LOCAL_SESSION_DIR/sshd"
   _setup_umask=$(umask)
@@ -1271,51 +1404,97 @@ else
 fi
 ok "Selected: ${_B}${PROJ_DIR}${_0}"
 PROJ_NAME="$(basename "$PROJ_DIR")"
+report_previous_launch
 register_gateway_project || { err "could not register the project with the forced gateway"; exit 1; }
 
-# Ended Orca chats of this project and agent can continue in this launch instead of a new chat. Only
-# this local terminal chooses one, in an arrow-key menu that starts on a new chat:
-# RH_RESUME_CHAT=<chat> continues that chat without asking, and RH_RESUME=0, --yes or a terminal
-# without cursor control never offers one. The agent host's claim checks the choice again.
+# Ended Orca chats of this project and agent can continue in this launch instead of a new chat, and
+# with Claude a terminal launch continues an Orca chat's conversation, while an Orca launch continues a
+# terminal launch's conversation in a new chat. Only this local terminal chooses one, in an arrow-key
+# menu that starts on a new conversation: RH_RESUME_CHAT=<chat or conversation ID> continues it
+# without asking, and RH_RESUME=0, --yes or a terminal without cursor control never offers one. The
+# agent host's claim checks the choice again.
 ORCA_CONTINUE=""
-choose_orca_chat() {
-  local listing label at recorded said ago pick
+TERMINAL_CONTINUE=""
+CONTINUE_RESUME=""
+continue_ago() {  # epoch -> "N min ago"
+  local _ago
+  _ago=$(( $(date +%s) - $1 ))
+  [ "$_ago" -ge 0 ] || _ago=0
+  if [ "$_ago" -lt 3600 ]; then tr2 "$((_ago / 60)) min ago" "$((_ago / 60)) 分钟前"
+  elif [ "$_ago" -lt 172800 ]; then tr2 "$((_ago / 3600)) h ago" "$((_ago / 3600)) 小时前"
+  else tr2 "$((_ago / 86400)) d ago" "$((_ago / 86400)) 天前"; fi
+}
+is_conversation_id() {  # a Claude session UUID, as the agent host lists it
+  case "$1" in *[!0-9a-f-]*|'') return 1;; esac
+  [ "${#1}" = 36 ]
+}
+choose_continue() {
+  local listing line key label at recorded said pick question
   local -a labels=() items=()
   if [ -n "${RH_RESUME_CHAT:-}" ]; then
-    ORCA_CONTINUE="$RH_RESUME_CHAT"
+    if ! is_conversation_id "$RH_RESUME_CHAT"; then
+      ORCA_CONTINUE="$RH_RESUME_CHAT"
+    elif [ "$UI" = orca ]; then
+      TERMINAL_CONTINUE="$RH_RESUME_CHAT"
+    else
+      err "$(tr2 "RH_RESUME_CHAT names a terminal conversation, which only an Orca launch continues." \
+                  "RH_RESUME_CHAT 指定的是终端对话，只有 Orca 启动才能继续它。")"
+      exit 1
+    fi
     return 0
   fi
   case "${RH_RESUME:-}" in 0|no) return 0;; esac
   [ "$ASSUME_YES" != 1 ] && [ "${TERM:-dumb}" != dumb ] && { : </dev/tty; } 2>/dev/null || return 0
+  # A terminal launch on an agent host that never ran an Orca launch skips the listing.
   listing=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    exec python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR")
-  " 2>/dev/null | sed -n 's/^RH_ORCA_CHAT=//p')
+    [ -d \"\$rh/.orca-identities\" ] || [ $(sq "$UI") = orca ] || exit 0
+    exec python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$UI")
+  " 2>/dev/null | grep -E '^RH_(ORCA|TERMINAL)_CHAT=')
   [ -n "$listing" ] || return 0
-  items[0]="$(tr2 "Start a new chat" "新建会话")"
-  while IFS=$'\t' read -r label at recorded said; do
-    case "$label" in ""|*[!A-Za-z0-9._-]*) continue;; esac
+  items[0]="$(tr2 "Start a new conversation" "新建会话")"
+  while IFS= read -r line; do
+    key=${line%%=*}
+    line=${line#*=}
+    recorded=1
+    if [ "$key" = RH_ORCA_CHAT ]; then
+      IFS=$'\t' read -r label at recorded said <<EOF
+$line
+EOF
+      case "$label" in ""|*[!A-Za-z0-9._-]*) continue;; esac
+    else
+      IFS=$'\t' read -r label at said <<EOF
+$line
+EOF
+      is_conversation_id "$label" || continue
+    fi
     case "$at" in ""|*[!0-9]*) continue;; esac
-    ago=$(( $(date +%s) - at ))
-    [ "$ago" -ge 0 ] || ago=0
-    if [ "$ago" -lt 3600 ]; then ago="$(tr2 "$((ago / 60)) min ago" "$((ago / 60)) 分钟前")"
-    elif [ "$ago" -lt 172800 ]; then ago="$(tr2 "$((ago / 3600)) h ago" "$((ago / 3600)) 小时前")"
-    else ago="$(tr2 "$((ago / 86400)) d ago" "$((ago / 86400)) 天前")"; fi
     said=$(printf '%s' "$said" | LC_ALL=C tr -d '\000-\037\177')
     [ "$recorded" = 1 ] || said="$(tr2 "(project not recorded)" "（未记录项目）") $said"
     labels[${#labels[@]}]="$label"
-    items[${#items[@]}]="${label} · ${ago} · ${said}"
+    if [ "$key" = RH_ORCA_CHAT ]; then
+      items[${#items[@]}]="$(tr2 "Orca chat" "Orca 会话") ${label} · $(continue_ago "$at") · ${said}"
+    else
+      items[${#items[@]}]="$(tr2 "Terminal conversation" "终端对话") ${label%%-*} · $(continue_ago "$at") · ${said}"
+    fi
   done <<EOF
 $listing
 EOF
   [ "${#labels[@]}" -gt 0 ] || return 0
-  pick=$(pick_menu "$(tr2 "Continue an earlier Orca chat of this project? (Up/Down, Enter)" \
-                          "要继续该项目之前的 Orca 会话吗？（上下键选择，回车确认）")" "${items[@]}")
+  if [ "$UI" = orca ]; then
+    question=$(tr2 "Continue an earlier conversation of this project? (Up/Down, Enter)" \
+                   "要继续该项目之前的会话吗？（上下键选择，回车确认）")
+  else
+    question=$(tr2 "Continue an earlier Orca chat of this project in the terminal? (Up/Down, Enter)" \
+                   "要在终端继续该项目之前的 Orca 会话吗？（上下键选择，回车确认）")
+  fi
+  pick=$(pick_menu "$question" "${items[@]}")
   case "$pick" in ''|*[!0-9]*|0) return 0;; esac
-  ORCA_CONTINUE="${labels[$((pick - 1))]}"
+  label="${labels[$((pick - 1))]}"
+  if is_conversation_id "$label"; then TERMINAL_CONTINUE="$label"; else ORCA_CONTINUE="$label"; fi
 }
-if [ "$UI" = orca ]; then
-  choose_orca_chat
+if [ "$UI" = orca ] || { [ "$UI" = terminal ] && [ "$LAUNCH_BASE" = claude ]; }; then
+  choose_continue
 fi
 
 # ===========================================================================
@@ -1329,16 +1508,40 @@ step_begin "$(tr2 "Mounting the project on the remote (sshfs)" "在远端挂载�
 #    The mount call itself resolves that default, so it costs no extra round trip.
 REMOTE_MOUNTPOINT="$REMOTE_MP"
 if [ -n "$ORCA_CONTINUE" ]; then
-  # The claim binds the chat to this launch and returns its mount; the bridge then reopens it.
-  REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+  # The claim binds the chat to this launch and returns its mount; the bridge then reopens it, or a
+  # terminal launch resumes the chat's Claude conversation there.
+  _claim_ui=""
+  [ "$UI" = orca ] || _claim_ui=" terminal"
+  _claim_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    exec python3 -EsB \"\$rh/scripts/orca-session.py\" claim \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$ORCA_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")
-  " | kv_value MOUNTPOINT)
+    exec python3 -EsB \"\$rh/scripts/orca-session.py\" claim \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$ORCA_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")$_claim_ui
+  ")
+  REMOTE_MOUNTPOINT=$(printf '%s\n' "$_claim_out" | kv_value MOUNTPOINT)
+  if [ "$UI" = terminal ]; then
+    CONTINUE_RESUME=$(printf '%s\n' "$_claim_out" | kv_value RESUME)
+    is_conversation_id "$CONTINUE_RESUME" || REMOTE_MOUNTPOINT=""
+  fi
   if [ -z "$REMOTE_MOUNTPOINT" ]; then
     err "$(tr2 "Could not continue Orca chat ${ORCA_CONTINUE}." "无法继续 Orca 会话 ${ORCA_CONTINUE}。")"
     exit 1
   fi
-  ok "$(tr2 "Continuing Orca chat ${ORCA_CONTINUE}" "将继续 Orca 会话 ${ORCA_CONTINUE}")"
+  if [ "$UI" = terminal ]; then
+    ok "$(tr2 "Continuing Orca chat ${ORCA_CONTINUE} in the terminal" "将在终端继续 Orca 会话 ${ORCA_CONTINUE}")"
+  else
+    ok "$(tr2 "Continuing Orca chat ${ORCA_CONTINUE}" "将继续 Orca 会话 ${ORCA_CONTINUE}")"
+  fi
+elif [ -n "$TERMINAL_CONTINUE" ]; then
+  # This launch's new Orca mount, registered to the terminal conversation that its new chat resumes.
+  REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+    rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    exec python3 -EsB \"\$rh/scripts/orca-session.py\" adopt \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$TERMINAL_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")
+  " | kv_value MOUNTPOINT)
+  if [ -z "$REMOTE_MOUNTPOINT" ]; then
+    err "$(tr2 "Could not continue terminal conversation ${TERMINAL_CONTINUE}." "无法继续终端对话 ${TERMINAL_CONTINUE}。")"
+    exit 1
+  fi
+  ok "$(tr2 "Continuing terminal conversation ${TERMINAL_CONTINUE%%-*} in a new Orca chat" \
+            "将在新的 Orca 会话中继续终端对话 ${TERMINAL_CONTINUE%%-*}")"
 elif [ "$UI" = orca ]; then
   if ! REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
@@ -1369,7 +1572,7 @@ while :; do
   [ -z "$_mounted_path" ] || REMOTE_MOUNTPOINT="$_mounted_path"
   case "$STATUS" in
     mounted|already-mounted)
-      if [ "$UI" = orca ] && [ "$STATUS" = already-mounted ]; then
+      if { [ "$UI" = orca ] || [ -n "$ORCA_CONTINUE" ]; } && [ "$STATUS" = already-mounted ]; then
         err "The Orca mount is already in use by another launch. Start a new Harness launch."
         exit 1
       fi
@@ -1387,7 +1590,7 @@ while :; do
       err "Aborted (sshfs missing)."; exit 1
       ;;
     not-empty)
-      if [ "$UI" = orca ]; then
+      if [ "$UI" = orca ] || [ -n "$ORCA_CONTINUE" ]; then
         err "The reserved Orca mount is not empty. Start a new Harness launch."
         exit 1
       fi
@@ -1531,7 +1734,9 @@ if [ "$rh_status" = INJECTED ]; then
       esac
     fi
     RESUME=0
-    case "${RH_RESUME:-}" in
+    [ -z "$CONTINUE_RESUME" ] || rh_resume="" rh_resume_args="--resume $CONTINUE_RESUME"
+    case "${CONTINUE_RESUME:+chosen}${RH_RESUME:-}" in
+      chosen*) RESUME=1;;
       1|yes) RESUME=1;;
       0|no) ;;
       *)
@@ -1546,7 +1751,8 @@ if [ "$rh_status" = INJECTED ]; then
     esac
     if [ "$RESUME" = 1 ] && [ -n "$rh_resume_args" ]; then
       EFF_LAUNCH="$LAUNCH_BASE $rh_resume_args${EFF_LAUNCH#"$LAUNCH_BASE"}"
-      ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
+      [ -n "$CONTINUE_RESUME" ] \
+        || ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
     fi
     EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
   fi
@@ -1707,9 +1913,12 @@ exec \"\${SHELL:-/bin/bash}\" -lic $(sq "$EFF_LAUNCH")"
   ssh -tt -o ClearAllForwardings=yes "$TARGET" "$_remote_cmd"
 }
 start_tunnel_supervisor
+LAUNCH_AT=$(date +%s)
+launch_log START started ""
 launch_remote_agent
 CLAUDE_EXIT=$?
 stop_tunnel_supervisor
+record_launch_end
 if [ "$UI" = terminal ] && [ "$CLAUDE_EXIT" = 255 ]; then
   (umask 077
     private_local_dirs "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null \
@@ -1721,15 +1930,27 @@ fi
 # Post-session cleanup offer
 # ===========================================================================
 sep
-if [ "$CLAUDE_EXIT" = 0 ]; then
-  ok "${LAUNCH} session ended."
-elif [ "$CLAUDE_EXIT" = 255 ] && [ "$UI" = terminal ]; then
-  warn "$(tr2 "Lost the connection to the remote ${LAUNCH} session; the next launch of this project offers to continue it." \
-              "与远端 ${LAUNCH} 会话的连接已断开；下次启动该项目时会询问是否继续该会话。")"
-else
-  warn "${LAUNCH} session ended (exit code $CLAUDE_EXIT)."
-fi
+case "$END_REASON" in
+  agent-exit) ok "${LAUNCH} session ended.";;
+  chat-closed) ok "$(tr2 "The $ui_label chat was closed; the session ended." "$ui_label 会话已关闭，本次会话结束。")";;
+  interrupted) ok "$(tr2 "Stopped with Ctrl-C; the session ended." "已按 Ctrl-C 结束本次会话。")";;
+  connection-lost)
+    if [ "$UI" = terminal ]; then
+      warn "$(tr2 "Lost the connection to the remote ${LAUNCH} session; the next launch of this project offers to continue it." \
+                  "与远端 ${LAUNCH} 会话的连接已断开；下次启动该项目时会询问是否继续该会话。")"
+    else
+      warn "$(tr2 "Lost the connection to the remote session, which ended the $ui_label chat; the next launch of this project offers to continue it." \
+                  "与远端会话的连接已断开，$ui_label 会话随之结束；下次启动该项目时可以在菜单里继续它。")"
+    fi;;
+  *) warn "$(tr2 "${LAUNCH} session ended: $(launch_reason_text "$END_REASON" "$END_DETAILS")." \
+                  "${LAUNCH} 会话结束：$(launch_reason_text "$END_REASON" "$END_DETAILS")。")";;
+esac
 report_tunnel_supervisor
+# The other reasons' text already says it.
+_slept=$(sleep_note "$END_DETAILS")
+case "$END_REASON" in agent-exit|chat-closed|interrupted|connection-lost)
+  [ -z "$_slept" ] || warn "$(tr2 "The laptop slept during the session ($_slept)." "会话期间笔记本休眠过（${_slept}）。")";;
+esac
 # cleanup() (armed via trap) auto-unmounts and drops the tunnel as this script exits.
 printf "\n${_B}Done.${_0}\n"
 [ "$UI" = terminal ] || exit "$CLAUDE_EXIT"

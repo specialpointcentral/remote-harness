@@ -2,10 +2,13 @@
 """Run one native Orca chat while the reverse Harness owns its transport.
 
 The launcher also uses `chats` to list a project's ended chats of one agent and `claim` to bind
-one of them to a new launch, which then continues that chat instead of creating one.
+one of them to a new launch, which then continues that chat instead of creating one. A terminal
+launch of Claude can claim an ended Orca chat too and resume its conversation at the chat's mount;
+`adopt` gives a new Orca launch a copy of an ended terminal conversation, which its new chat resumes.
 """
 from contextlib import contextmanager
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -22,7 +25,7 @@ import uuid
 
 from orca_native import (CODEX_CHATS, IDENTITIES, LEASE, MOUNTS, ORCA_VERSIONS, SESSION_NAME, UUID, OrcaError,
                          check_version, claude_command, config, private_dir, private_json, probe_claude,
-                         process_identity, require_orca_version, unverified_warning, write_once)
+                         process_identity, require_orca_version, reserve, unverified_warning, write_once)
 
 # How long Orca Server may stay unreachable, for example while an automatic update restarts it.
 RESTART_GRACE = 120
@@ -33,6 +36,15 @@ CLAUDE_CHAT = re.compile(r"claude_[0-9a-f]{32}")
 CODEX_CHAT = re.compile(r"codex_[0-9a-f]{32}")
 OWNED = "This mount belongs to an earlier Orca chat. Continue that chat from the launcher instead."
 CODEX_GONE = "Orca no longer has this Codex chat, so it cannot continue. Start a new chat."
+# How the bridge ended, for the launcher's record: 0 when the chat was closed or its workspace
+# archived in Orca, 128 + the signal when stopped by one (130 for Ctrl-C in the launcher), LOST when
+# Orca Server stayed unreachable, and 1 for any other failure.
+LOST = 3
+STOPPED_BY = []
+
+
+class OrcaLost(OrcaError):
+    """Orca Server stayed unreachable for longer than RESTART_GRACE."""
 
 
 class OrcaClient:
@@ -292,10 +304,63 @@ def registered_chat(client, path, record, workspace):
     return chat if isinstance(chat, str) and CLAUDE_CHAT.fullmatch(chat) else None
 
 
+def claude_projects():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+
+
+def claude_project_dir(directory):
+    """Where Claude Code keeps the conversations of sessions started in `directory`.
+
+    It names the folder after the sanitized path, cut to 200 characters plus a hash when longer.
+    """
+    projects = claude_projects()
+    name = re.sub(r"[^A-Za-z0-9]", "-", str(directory))
+    if len(name) <= 200:
+        return projects / name
+    found = glob.glob(os.path.join(glob.escape(str(projects)), glob.escape(name[:200]) + "-*"))
+    return Path(found[0]) if len(found) == 1 else None
+
+
 def claude_transcript(cwd, provider):
-    """Where Claude Code keeps the conversation of the session `provider` started in `cwd`."""
-    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-    return base / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{provider}.jsonl"
+    """The conversation of the Claude session `provider` started in `cwd`, or None."""
+    directory = claude_project_dir(cwd)
+    path = directory / f"{provider}.jsonl" if directory is not None else None
+    return path if path is not None and path.is_file() else None
+
+
+def fork_conversation(source, cwd):
+    """Copy a Claude conversation to a new session started in `cwd`; return the new session ID.
+
+    Orca resumes only a conversation recorded in the chat's own folder (the cwd its transcript
+    names), so a new chat continues a copy: the session ID and the working directories under the
+    original one change, the rest is kept, and the original stays as it was.
+    """
+    directory = claude_project_dir(cwd)
+    if directory is None:
+        raise OrcaError("The Orca mount path is too long to continue a terminal conversation.")
+    provider, original, root, lines = str(uuid.uuid4()), source.stem, None, []
+    for line in source.read_bytes().splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            entry = None
+        if isinstance(entry, dict):
+            if entry.get("sessionId") == original:
+                entry["sessionId"] = provider
+            here = entry.get("cwd")
+            if isinstance(here, str):
+                root = root or here
+                if here == root or here.startswith(root.rstrip("/") + "/"):
+                    entry["cwd"] = str(cwd) + here[len(root):]
+            line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode()
+        lines.append(line + b"\n")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = directory / f"{provider}.jsonl"
+    with os.fdopen(os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as stream:
+        stream.writelines(lines)
+    info = source.stat()
+    os.utime(target, (info.st_atime, info.st_mtime))
+    return provider
 
 
 def text_of(content):
@@ -355,10 +420,16 @@ def resumable_chats(home, client, project, agent="claude"):
     """Ended chats of one agent that a new launch of this project may continue, newest first.
 
     A chat continues in its Orca chat when Orca still has it. Otherwise a Claude chat continues in
-    a new Orca chat that resumes its Claude conversation; a Codex chat cannot.
+    a new Orca chat that resumes its Claude conversation; a Codex chat cannot. Without a client
+    (a terminal launch) only Claude chats whose conversation Claude Code still has are listed.
     """
-    mounts = private_dir(home / MOUNTS)
-    folders = client.call("folderWorkspace.list")["folderWorkspaces"]
+    if client is None and agent != "claude":
+        return []
+    try:
+        mounts = private_dir(home / MOUNTS)
+    except FileNotFoundError:
+        return []
+    folders = client.call("folderWorkspace.list")["folderWorkspaces"] if client else []
     named = UUID if agent == "claude" else CODEX_CHAT
     chats = []
     for path, record in chat_records(home, agent):
@@ -378,8 +449,8 @@ def resumable_chats(home, client, project, agent="claude"):
             workspace = chat_workspace(folders, cwd)
             # A Codex chat's record is named after the chat itself.
             chat = registered_chat(client, path, record, workspace) if agent == "claude" else path.stem
-            page = chat and client.call("agentSession.history", {"sessionId": chat, "direction": "tail",
-                                                                 "limit": 20})["page"]
+            page = chat and client and client.call("agentSession.history", {
+                "sessionId": chat, "direction": "tail", "limit": 20})["page"]
             items = [item for item in page.get("items", []) if isinstance(item, dict)] if page else []
             seen = [item["observedAt"] for item in items if type(item.get("observedAt")) in (int, float)]
             known = bool(workspace and page and page.get("sessionId") == chat)
@@ -392,7 +463,7 @@ def resumable_chats(home, client, project, agent="claude"):
                 said = last_message(items)
             elif known and seen:
                 last, said = max(seen) / 1000, last_message(items)
-            elif transcript.is_file():
+            elif transcript is not None:
                 last, said = transcript.stat().st_mtime, transcript_message(transcript)
             else:
                 continue
@@ -403,21 +474,68 @@ def resumable_chats(home, client, project, agent="claude"):
     return sorted(chats, key=lambda chat: chat["last"], reverse=True)
 
 
-def list_chats(home, agent, project):
-    if agent not in ("claude", "codex"):
+def terminal_conversations(home, project):
+    """Ended Claude conversations of the project's terminal launches, newest first.
+
+    Terminal launches mount the project at <RH_HOME>/mounts/<name>, so Claude Code keeps their
+    conversations together. None is listed while that mount is in use, since a running launch may
+    still write one. A conversation an Orca chat continues as a copy is listed again only once it
+    changed in the terminal after that copy.
+    """
+    name = project.rstrip("/").rpartition("/")[2]
+    if name in ("", ".", ".."):
+        return []
+    default = home / "mounts" / name
+    directory = claude_project_dir(os.path.realpath(default))
+    if directory is None or os.path.ismount(default) or not directory.is_dir():
+        return []
+    copied = {}
+    for _, record in chat_records(home, "claude"):
+        if isinstance(record.get("from"), str) and type(record.get("created")) is int:
+            copied[record["from"]] = max(copied.get(record["from"], 0), record["created"])
+    found = []
+    for path in directory.glob("*.jsonl"):
+        try:
+            last = path.stat().st_mtime
+            if UUID.fullmatch(path.stem) and copied.get(path.stem, -1) < int(last):
+                found.append((last, path))
+        except OSError:
+            continue
+    conversations = []
+    for last, path in sorted(found, reverse=True):
+        try:
+            said = transcript_message(path)
+        except OSError:
+            continue
+        if said.strip():
+            conversations.append({"id": path.stem, "last": int(last), "said": shown(said)})
+            if len(conversations) == 5:
+                break
+    return conversations
+
+
+def list_chats(home, agent, project, ui="orca"):
+    if agent not in ("claude", "codex") or ui not in ("orca", "terminal"):
         raise OrcaError("Unsupported Orca Harness agent.")
-    client = OrcaClient(config(home, agent))
+    client = OrcaClient(config(home, agent)) if ui == "orca" else None
     for chat in resumable_chats(home, client, project, agent)[:9]:
         print(f"RH_ORCA_CHAT={chat['label']}\t{chat['last']}\t{int(chat['recorded'])}\t{chat['said']}")
+    if ui == "orca" and agent == "claude":
+        for conversation in terminal_conversations(home, project):
+            print(f"RH_TERMINAL_CHAT={conversation['id']}\t{conversation['last']}\t{conversation['said']}")
 
 
-def claim_chat(home, agent, label, sid, project):
-    """Bind an ended chat to the launch `sid`, whose bridge then continues it."""
-    if agent not in ("claude", "codex"):
+def claim_chat(home, agent, label, sid, project, ui="orca"):
+    """Bind an ended chat to the launch `sid`, whose bridge then continues it.
+
+    A terminal launch of Claude resumes the chat's conversation itself, at the chat's mount. Its
+    claim names the terminal session, so no Orca chat can run with it until that launch ends.
+    """
+    if agent not in ("claude", "codex") or ui not in ("orca", "terminal") or (ui, agent) == ("terminal", "codex"):
         raise OrcaError("Unsupported Orca Harness agent.")
     if not SESSION_NAME.fullmatch(label) or not SESSION_NAME.fullmatch(sid):
         raise OrcaError("Invalid Orca chat or launch name.")
-    client = OrcaClient(config(home, agent))
+    client = OrcaClient(config(home, agent)) if ui == "orca" else None
     with private_lock(home / "orca" / "resume.lock", "Another launch is continuing an Orca chat."):
         chat = next((chat for chat in resumable_chats(home, client, project, agent)
                      if chat["label"] == label), None)
@@ -431,6 +549,32 @@ def claim_chat(home, agent, label, sid, project):
         if chat["chat"]:
             record["chat"] = chat["chat"]
         replace_record(chat["path"], record)
+    return cwd, chat["path"].stem
+
+
+def adopt_conversation(home, agent, conversation, sid, project):
+    """Reserve the Orca mount of launch `sid` for a copy of an ended terminal conversation.
+
+    The identity record names the copy, so the bridge resumes it in a new chat, and from then on it
+    continues as that Orca chat, from Orca or from a terminal launch.
+    """
+    if agent != "claude":
+        raise OrcaError("Only a Claude conversation from a terminal launch can continue in Orca.")
+    if not UUID.fullmatch(conversation) or not SESSION_NAME.fullmatch(sid):
+        raise OrcaError("Invalid conversation or launch name.")
+    with private_lock(home / "orca" / "resume.lock", "Another launch is continuing an Orca chat."):
+        if not any(item["id"] == conversation for item in terminal_conversations(home, project)):
+            raise OrcaError(f"Conversation {conversation} cannot continue in Orca. It may belong to another "
+                            "project, a terminal launch may still use the project, or an Orca chat "
+                            "already continues it.")
+        source = claude_project_dir(os.path.realpath(home / "mounts" / project.rstrip("/").rpartition("/")[2]))
+        cwd = reserve(home, sid)
+        provider = fork_conversation(source / f"{conversation}.jsonl", cwd)
+        registry = private_dir(home / IDENTITIES, create=True)
+        write_once(registry / f"{provider}.json", {
+            "cwd": str(cwd), "session": f"{session_key(cwd)}.{sid}", "token": "", "agent": agent,
+            "project": project, "created": int(time.time()), "from": conversation,
+        })
     return cwd
 
 
@@ -521,9 +665,10 @@ def main():
             lease_path.unlink(missing_ok=True)
             leased = False
 
-    def stop(_signum, _frame):
+    def stop(signum, _frame):
         nonlocal stopped
         stopped = True
+        STOPPED_BY.append(signum)
         revoke()
 
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -637,7 +782,7 @@ def main():
                 break
             unavailable = time.monotonic() if unavailable is None else unavailable
             if time.monotonic() - unavailable >= RESTART_GRACE:
-                raise OrcaError("Lost contact with Orca Server. Releasing the Harness session.")
+                raise OrcaLost("Lost contact with Orca Server. Releasing the Harness session.")
     finally:
         revoke()
         if create_attempted and not closed:
@@ -655,17 +800,25 @@ def main():
 
 if __name__ == "__main__":
     try:
-        if sys.argv[1:2] == ["chats"] and len(sys.argv) == 5:
+        if sys.argv[1:2] == ["chats"] and len(sys.argv) in (5, 6):
             list_chats(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])
-        elif sys.argv[1:2] == ["claim"] and len(sys.argv) == 7:
-            print(f"MOUNTPOINT={claim_chat(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])}")
+        elif sys.argv[1:2] == ["claim"] and len(sys.argv) in (7, 8):
+            mountpoint, conversation = claim_chat(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])
+            print(f"MOUNTPOINT={mountpoint}")
+            if sys.argv[7:] == ["terminal"]:
+                print(f"RESUME={conversation}")
+        elif sys.argv[1:2] == ["adopt"] and len(sys.argv) == 7:
+            print(f"MOUNTPOINT={adopt_conversation(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])}")
         else:
             main()
+    except OrcaLost as error:
+        print("remote-harness:", error, file=sys.stderr)
+        sys.exit(LOST)
     except OrcaError as error:
         print("remote-harness:", error, file=sys.stderr)
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
         print("remote-harness: Orca bridge setup failed. Check docs/orca.md and the agent host configuration.",
               file=sys.stderr)
     else:
-        sys.exit(0)
+        sys.exit(128 + STOPPED_BY[0] if STOPPED_BY else 0)
     sys.exit(1)

@@ -135,9 +135,14 @@ class OrcaLiveTests(unittest.TestCase):
         self.assertTrue(created["ok"], created)
         return session_id
 
-    def start_bridge(self, label, launch=None):
-        """Start a launch on a new reservation, or with `launch`, one that continues the chat at `label`."""
-        if launch is None:
+    def start_bridge(self, label, launch=None, mount=None):
+        """Start a launch on a new reservation, or with `launch`, one that continues the chat at `label`.
+
+        With `mount`, the launch `label` uses that already registered mount.
+        """
+        if mount is not None:
+            pass
+        elif launch is None:
             mount = Path(subprocess.check_output(
                 ["python3", "-I", "-S", str(self.scripts / "orca_native.py"), "reserve", str(self.rh), label],
                 env=self.env, text=True, timeout=10).strip())
@@ -224,7 +229,7 @@ class OrcaLiveTests(unittest.TestCase):
         self.assertIsNone(bridge.poll(), log.read_text())
         self.assertTrue((session / "orca-lease.json").exists())
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=20), 0, log.read_text())
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
         self.assertFalse((session / "orca-lease.json").exists())
         self.assertNotIn("Lost contact", log.read_text())
 
@@ -233,7 +238,7 @@ class OrcaLiveTests(unittest.TestCase):
         self.send(session_id, "before the launcher exits")
         first = self.launch_in(mount)
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=20), 0, log.read_text())
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
         shutil.rmtree(session)  # the launcher's cleanup
         listed = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "chats",
                                  str(self.rh), "claude", "/local/project"], env=self.env, text=True,
@@ -253,7 +258,7 @@ class OrcaLiveTests(unittest.TestCase):
         self.assertEqual(launch["args"][launch["args"].index("--permission-mode") + 1], "default")
         self.assertTrue(launch["env"]["PATH"].startswith(str(session / "bin") + os.pathsep))
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=20), 0, log.read_text())
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
         self.assertFalse((session / "orca-lease.json").exists())
 
     def test_orca_claude_conversation_continues_after_its_workspace_was_deleted(self):
@@ -262,7 +267,7 @@ class OrcaLiveTests(unittest.TestCase):
         first = self.launch_in(mount)
         provider = next(arg.split("=", 1)[1] for arg in first["args"] if arg.startswith("--session-id="))
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=20), 0, log.read_text())
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
         shutil.rmtree(session)
         folder = next(folder for folder in self.orca.call("folderWorkspace.list")["folderWorkspaces"]
                       if folder["folderPath"] == str(mount))
@@ -285,7 +290,42 @@ class OrcaLiveTests(unittest.TestCase):
         self.assertIn("--append-system-prompt", launch["args"])
         self.assertTrue(launch["env"]["PATH"].startswith(str(session / "bin") + os.pathsep))
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=20), 0, log.read_text())
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
+
+    def test_orca_continues_a_terminal_conversation_in_a_new_chat(self):
+        # The conversation a terminal launch of /local/project left at its default mount.
+        provider = str(uuid.uuid4())
+        default = self.rh / "mounts" / "project"
+        key = "".join(char if char.isalnum() else "-" for char in str(default))
+        transcript = self.home / ".claude" / "projects" / key / f"{provider}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({
+            "type": "user", "sessionId": provider, "cwd": str(default), "uuid": str(uuid.uuid4()),
+            "timestamp": "2026-11-13T00:00:00Z",
+            "message": {"role": "user", "content": "asked in the terminal"}}) + "\n")
+        listed = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "chats",
+                                 str(self.rh), "claude", "/local/project"], env=self.env, text=True,
+                                capture_output=True, timeout=20)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual([line.split("\t")[::2] for line in listed.stdout.splitlines()],
+                         [[f"RH_TERMINAL_CHAT={provider}", "asked in the terminal"]])
+        adopted = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "adopt",
+                                  str(self.rh), "claude", provider, "adopted", "/local/project"],
+                                 env=self.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        mount = Path(adopted.stdout.strip().removeprefix("MOUNTPOINT="))
+        # Orca resumes only a conversation recorded in the chat's folder, so the chat resumes a copy.
+        (copy,) = [path.stem for path in (self.rh / ".orca-identities").glob("*.json")
+                   if json.loads(path.read_text()).get("from") == provider]
+
+        started = time.time()
+        bridge, log, session, mount, chat = self.start_bridge("adopted", "adopted", mount)
+        self.send(chat, "in the new Orca chat")
+        launch = self.launch_in(mount, after=started)
+        self.assertIn(f"--resume={copy}", launch["args"])
+        self.assertTrue(launch["env"]["PATH"].startswith(str(session / "bin") + os.pathsep))
+        bridge.terminate()
+        self.assertEqual(bridge.wait(timeout=20), 143, log.read_text())
 
 
 if __name__ == "__main__":

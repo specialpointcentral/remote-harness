@@ -169,7 +169,8 @@ supports_websockets = false
                 return match[1] if match else None
 
             yield child, wait_for(ready, detail=log.read_text)
-            self.assertEqual(child.wait(timeout=12), 0, log.read_text())
+            # 0 once the chat was closed in the app, 128 + SIGTERM after the test's terminate().
+            self.assertIn(child.wait(timeout=12), (0, 143), log.read_text())
             self.assertFalse((self.session / f"{manager}-lease.json").exists())
 
     def root_thread(self):
@@ -209,7 +210,8 @@ supports_websockets = false
     def revoke_pending(self, bridge, late_approval):
         self.assertIsNotNone(self.backend_pid(), "Expected a live private app server")
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=12), 0)
+        # Both bridges report the stop as 128 + SIGTERM, for the launcher's record.
+        self.assertEqual(bridge.wait(timeout=12), 143)
         wait_for(lambda: self.backend_pid() is None)
         model_requests = len(self.server.requests)
         late_approval()

@@ -47,11 +47,18 @@
   创建原生聊天。包装器将聊天身份和挂载绑定到 lease。清理后需保留身份和挂载的
   预留记录，已结束的聊天不会自行获得路由。只有在本地终端认领它的同一 Agent 启动
   （`orca-session.py claim`）才能在其原挂载点继续；桥接进程重新打开该聊天，Orca 已没有 Claude
-  聊天时，则新建聊天接着原对话继续。Orca Codex 聊天的线程和 rollout 保存在
+  聊天时，则新建聊天接着原对话继续。终端 Claude 启动也可以认领已结束的 Claude 聊天
+  （`claim ... terminal`），自己在该挂载点接着其对话继续。Orca Claude 启动则可以接管该项目已结束的
+  终端对话（`orca-session.py adopt`）：Orca 只恢复 cwd 为该聊天目录的对话记录，所以 adopt 以新的会话
+  ID 复制一份，把其中的 cwd 改到新挂载点，这份副本成为新聊天的身份。只有项目默认挂载点无人使用时才列出
+  终端对话，已接管过的要在之后有变化才会再次列出。Orca Codex 聊天的线程和 rollout 保存在
   `.orca-codex-chats/<chat>.state`（会话 `codex-home` 的 `sessions` 链接到这里），凭据副本仍留在会话中。桥接进程仅在重启后的 Orca Server 再次通过启动检查后才接管它；
   两个包装器都会拒绝由不受支持的 Orca 版本（`ORCA_APP_VERSION`）启动的已绑定聊天。不在
   `ORCA_VERSIONS` 中的版本，仅当它是已列出主次版本的更新补丁时才受支持，并在启动器中警告；
   codex-cli 按 `CODEX_VERSIONS` 适用同一规则。
+- 启动器把每次 Agent 启动的开始和结束原因追加到本机 `~/.remote-harness/launches.log`，同一项目
+  下次启动时提示异常结束。原生桥接进程在聊天于应用中被关闭时退出 0，被信号停止时退出 128 加信号值，
+  Orca 桥接进程与 Orca Server 失去联系后退出 3；启动器据此判断原因。
 - 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。
@@ -62,6 +69,8 @@
   插件写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。
   会话设置加一条 `autoMode.environment`，写明 runner，要求自动审核判断引号里的命令，而不是包装本身。
   它绝不添加放行规则；只有会话启动时用户和托管设置都没有 environment，才带上 `"$defaults"`。
+  不在项目默认挂载点时，会话设置还会把 `autoMemoryDirectory` 指向默认挂载点的记忆目录，除非用户或
+  托管设置已有该项。
 - Claude 只能看到 rh-run，所以它的 hook 用原始命令对照用户自己的规则：`Bash(...)` deny/ask 对共享词法器
   找到的任意一条简单命令生效，allow 只在 default/acceptEdits/dontAsk 模式（绝不包括 auto）下对单条普通命令
   生效。规则文件只在标识变化时重读。Codex 和 opencode 自己检查原命令：改写后在 `exit` 之后另起一行附上

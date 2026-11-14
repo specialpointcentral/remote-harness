@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { constants as osConstants } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -213,7 +214,8 @@ async function main() {
     rmSync(lease, { force: true });
     leased = false;
   }
-  function requestStop() {
+  function requestStop(signal) {
+    stoppedBy ??= signal;
     stop.abort();
     revoke();
   }
@@ -304,8 +306,12 @@ async function main() {
   }
 }
 
+// The launcher records how the bridge ended: 0 when the conversation was archived in Paseo, and
+// 128 + the signal when one stopped it (130 for Ctrl-C in the launcher).
+let stoppedBy = null;
 try {
   await main();
+  if (stoppedBy) process.exitCode = 128 + osConstants.signals[stoppedBy];
 } catch (error) {
   console.error("remote-harness:", error instanceof BridgeError ? error.message : "Paseo bridge setup failed.");
   process.exitCode = 1;

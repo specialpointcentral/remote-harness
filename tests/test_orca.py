@@ -371,22 +371,32 @@ fi
         return subprocess.run(shlex.split(hook["command"]), input=json.dumps({"tool_name": tool}),
                               capture_output=True, text=True, timeout=5)
 
-    def chats(self, project="/local/project"):
+    def chats_listing(self, project="/local/project", ui=()):
         result = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "chats",
-                                 str(self.rh), "claude", project], env=self.env, text=True,
+                                 str(self.rh), "claude", project, *ui], env=self.env, text=True,
                                 capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        return [line.removeprefix("RH_ORCA_CHAT=").split("\t") for line in result.stdout.splitlines()]
+        return result.stdout.splitlines()
 
-    def claim(self, label, launch, project="/local/project"):
+    def chats(self, project="/local/project", ui=()):
+        return [line.removeprefix("RH_ORCA_CHAT=").split("\t") for line in self.chats_listing(project, ui)
+                if line.startswith("RH_ORCA_CHAT=")]
+
+    def claim(self, label, launch, project="/local/project", ui=()):
         return subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "claim",
-                               str(self.rh), "claude", label, launch, project],
+                               str(self.rh), "claude", label, launch, project, *ui],
+                              env=self.env, text=True, capture_output=True, timeout=10)
+
+    def adopt(self, conversation, launch, project="/local/project"):
+        return subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "adopt",
+                               str(self.rh), "claude", conversation, launch, project],
                               env=self.env, text=True, capture_output=True, timeout=10)
 
     def end_launch(self, bridge, session):
-        """The bridge exits on Ctrl-C, then the launcher's cleanup removes the session."""
+        """The bridge exits on a signal, then the launcher's cleanup removes the session."""
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=8), 0)
+        # 128 + SIGTERM: the launcher records that the bridge was stopped, not that the chat closed.
+        self.assertEqual(bridge.wait(timeout=8), 143)
         shutil.rmtree(session)
 
     def test_ended_chat_continues_only_in_a_launch_that_claims_it(self):
@@ -538,6 +548,118 @@ fi
         result = self.wrapper_call(project, "--resume=" + provider)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_terminal_launch_continues_an_orca_chat_that_orca_takes_back_later(self):
+        bridge, log, session, project = self.start_bridge("from-orca")
+        identity = self.ready(bridge, log)
+        provider = provider_id(identity)
+        record_path = self.rh / ".orca-identities" / (provider + ".json")
+        self.end_launch(bridge, session)
+        # A terminal launch needs Claude's own conversation, not Orca's chat.
+        self.assertEqual(self.chats(ui=["terminal"]), [])
+        self.transcript(project, provider, "asked in orca", 1794400000)
+        self.assertEqual(self.chats(ui=["terminal"]), [["from-orca", "1794400000", "1", "asked in orca"]])
+        self.assertEqual(self.chats("/other/project", ui=["terminal"]), [])
+
+        claimed = self.claim("from-orca", "term", ui=["terminal"])
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        self.assertEqual(claimed.stdout, f"MOUNTPOINT={project}\nRESUME={provider}\n")
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record["session"], record["token"], record["chat"]),
+                         (str(project).replace("/", "_") + ".term", "", identity))
+        # While the terminal launch runs, no launch offers the chat and Orca cannot run it.
+        terminal = self.rh / ".sessions" / record["session"]
+        terminal.mkdir(mode=0o700)
+        self.assertEqual((self.chats(), self.chats(ui=["terminal"])), ([], []))
+        self.assertNotEqual(self.claim("from-orca", "other", ui=["terminal"]).returncode, 0)
+        self.assertNotEqual(self.wrapper_call(project, "--resume", provider).returncode, 0)
+        terminal.rmdir()
+
+        # Afterwards an Orca launch reopens the same chat, which resumes the same conversation.
+        bridge, session, chat, requests = self.continue_chat("from-orca", "back")
+        self.assertEqual(chat, identity)
+        self.assertIn(("agentSession.reveal", {"sessionId": identity}), requests)
+        self.assertEqual(self.wrapper_call(project, "--resume", provider).returncode, 0)
+        self.end_launch(bridge, session)
+
+    def test_orca_launch_continues_a_copy_of_a_terminal_conversation_in_a_new_chat(self):
+        conversation = str(uuid.uuid4())
+        default = self.rh.resolve() / "mounts" / "project"
+        folder = self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(default))
+        folder.mkdir(parents=True)
+        source = folder / (conversation + ".jsonl")
+        entries = [
+            {"type": "summary", "summary": "earlier work"},
+            {"type": "user", "sessionId": conversation, "cwd": str(default),
+             "message": {"role": "user", "content": "asked in the terminal"}},
+            {"type": "assistant", "sessionId": conversation, "cwd": str(default / "src"),
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "回答"}]}},
+            {"type": "user", "sessionId": conversation, "cwd": "/elsewhere", "message": {
+                "role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]}},
+        ]
+        source.write_text("".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+                          + "not json\n")
+        os.utime(source, (1794300000, 1794300000))
+        original = source.read_bytes()
+        # A conversation without a typed message, and any other project, are not offered.
+        self.transcript(default, str(uuid.uuid4()), "<command-name>/clear</command-name>", 1794300100)
+        self.assertEqual(self.chats_listing(),
+                         [f"RH_TERMINAL_CHAT={conversation}\t1794300000\tasked in the terminal"])
+        # Terminal launches key their mount by the project folder's name.
+        self.assertEqual(self.chats_listing("/local/other"), [])
+        self.assertEqual(self.chats_listing(ui=["terminal"]), [])
+        self.assertNotEqual(self.adopt(conversation, "elsewhere", "/local/other").returncode, 0)
+        self.assertNotEqual(self.adopt(str(uuid.uuid4()), "unknown").returncode, 0)
+        self.assertNotEqual(self.adopt("../" + conversation, "invalid").returncode, 0)
+        self.assertFalse(any(self.mounts.iterdir()))
+
+        adopted = self.adopt(conversation, "to-orca")
+        self.assertEqual(adopted.returncode, 0, adopted.stderr)
+        project = self.mounts / "to-orca"
+        self.assertEqual(adopted.stdout, f"MOUNTPOINT={project}\n")
+        # Orca resumes only a conversation recorded in the chat's folder: the chat gets a copy under
+        # a new session ID, with the terminal mount's directories moved to its own mount.
+        registry = self.rh / ".orca-identities"
+        (record_path,) = [path for path in registry.glob("*.json")
+                          if json.loads(path.read_text()).get("from") == conversation]
+        provider = record_path.stem
+        self.assertNotEqual(provider, conversation)
+        self.assertEqual(source.read_bytes(), original)
+        copy = (self.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(project))
+                / (provider + ".jsonl"))
+        lines = copy.read_text().splitlines()
+        self.assertEqual(lines[-1], "not json")
+        copied = [json.loads(line) for line in lines[:-1]]
+        self.assertEqual(copied[0], entries[0])
+        self.assertEqual([entry.get("sessionId") for entry in copied[1:]], [provider] * 3)
+        self.assertEqual([entry["cwd"] for entry in copied[1:]], [str(project), str(project / "src"), "/elsewhere"])
+        self.assertEqual(copied[2]["message"], entries[2]["message"])
+        self.assertEqual((copy.stat().st_mtime, copy.stat().st_mode & 0o777), (1794300000, 0o600))
+        # It now continues as this launch's chat, also if this launch fails, and is not offered again.
+        self.assertNotEqual(self.adopt(conversation, "again").returncode, 0)
+        self.assertEqual(self.chats_listing(), ["RH_ORCA_CHAT=to-orca\t1794300000\t1\tasked in the terminal"])
+
+        start = len(self.requests)
+        bridge, log, session, _ = self.start_bridge("to-orca", launch="to-orca")
+        chat = self.ready(bridge, log)
+        created = next(params for method, params in self.requests[start:] if method == "agentSession.create")
+        self.assertEqual(created["resumeFrom"], {"providerSessionId": provider})
+        result = self.wrapper_call(project, "--resume", provider)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["args"][:2], ["--resume", provider])
+        self.assertNotEqual(self.wrapper_call(project, "--resume", conversation).returncode, 0)
+        self.end_launch(bridge, session)
+
+        # From then on it continues as that Orca chat, in Orca or in a terminal launch.
+        self.assertEqual(self.chats_listing(), [f"RH_ORCA_CHAT=to-orca\t1794500000\t1\twhere were we? [2J"])
+        self.assertEqual(self.chats(ui=["terminal"]), [["to-orca", "1794300000", "1", "asked in the terminal"]])
+        claimed = self.claim("to-orca", "term", ui=["terminal"])
+        self.assertEqual(claimed.stdout, f"MOUNTPOINT={project}\nRESUME={provider}\n")
+        self.assertEqual(json.loads(record_path.read_text())["chat"], chat)
+        # Once the terminal conversation changes again, it is offered again.
+        later = json.loads(record_path.read_text())["created"] + 60
+        os.utime(source, (later, later))
+        self.assertIn(f"RH_TERMINAL_CHAT={conversation}\t{later}\tasked in the terminal", self.chats_listing())
+
     def test_concurrent_same_project_cannot_use_other_or_unknown_identity(self):
         first, first_log, _, first_project = self.start_bridge("first", "auto")
         first_id = self.ready(first, first_log)
@@ -566,7 +688,7 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--dangerously-skip-permissions", json.loads(result.stdout)["args"])
         second.terminate()
-        self.assertEqual(second.wait(timeout=8), 0)
+        self.assertEqual(second.wait(timeout=8), 143)
         self.assertIn(("agentSession.close", {"sessionId": second_id}), self.requests)
 
     def test_archived_workspace_revokes_lease_and_closes_chat(self):
@@ -770,7 +892,7 @@ fi
             bridge, log, _, _ = self.start_bridge(label)
             self.ready(bridge, log)
             bridge.terminate()
-            self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+            self.assertEqual(bridge.wait(timeout=8), 143, log.read_text())
         self.assertEqual(len(self.groups), 1)
         self.assertEqual(self.groups[0]["name"], "Remote Harness")
         self.assertEqual(self.groups[0]["parentPath"], str(self.mounts))
@@ -788,7 +910,7 @@ fi
             bridge, log, _, _ = self.start_bridge(label)
             self.ready(bridge, log)
             bridge.terminate()
-            self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+            self.assertEqual(bridge.wait(timeout=8), 143, log.read_text())
         self.assertEqual(self.groups, [legacy, {
             "id": "created-group", "name": "Remote Harness", "parentPath": str(self.mounts),
         }])
@@ -841,7 +963,7 @@ fi
                 bridge, log, _, _ = self.start_bridge("supported-" + version.replace(".", "-"))
                 self.ready(bridge, log)
                 bridge.terminate()
-                self.assertEqual(bridge.wait(timeout=8), 0, log.read_text())
+                self.assertEqual(bridge.wait(timeout=8), 143, log.read_text())
                 self.assertEqual("has not been verified" in log.read_text(), warned, log.read_text())
 
 

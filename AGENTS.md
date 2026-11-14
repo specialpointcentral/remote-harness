@@ -50,13 +50,23 @@ it provides files over SSHFS and executes project commands through a forced gate
   Keep the identity and mount reservations across cleanup: an ended chat never acquires a route by
   itself. Only a launch of the same agent that claims it in the local terminal
   (`orca-session.py claim`) continues it at its own mount; the bridge reopens the chat, or for
-  Claude resumes its conversation in a new chat when Orca no longer has it. An Orca Codex chat's
+  Claude resumes its conversation in a new chat when Orca no longer has it. A terminal Claude
+  launch may claim an ended Claude chat too (`claim ... terminal`) and resume its conversation at
+  that mount itself. An Orca Claude launch may instead adopt an ended terminal conversation of the
+  project (`orca-session.py adopt`): Orca resumes only a transcript whose cwd is the chat's folder,
+  so adopt copies it under a new session ID with the cwds moved to the new mount, and the copy
+  becomes the identity of the new chat. Terminal conversations are offered only while the
+  project's default mount is unused, and an adopted one again only after it changes. An Orca Codex chat's
   thread and rollouts live in `.orca-codex-chats/<chat>.state` (the session `codex-home` links
   `sessions` there); its credential copy stays in the session.
   The bridge adopts a restarted Orca Server only after it passes the startup checks again, and both
   wrappers refuse a bound chat launched by an unsupported Orca build (`ORCA_APP_VERSION`). A build
   outside `ORCA_VERSIONS` is supported only as a newer patch of a listed major.minor, with a
   launcher warning; codex-cli follows the same rule with `CODEX_VERSIONS`.
+- The launcher appends each agent launch's start and end reason to the laptop's
+  `~/.remote-harness/launches.log`, and the next launch of the project reports an abnormal end.
+  Native bridges exit 0 when their chat was closed in the app, 128 + the signal that stopped them,
+  and the Orca bridge 3 after losing Orca Server; the launcher maps these statuses to reasons.
 - With Codex and either native UI, the configured wrapper starts a private stdio app server with
   built-in shell and code execution disabled. The app server enforces native approval on the
   private MCP command tool. The command tool checks the lease, gateway policy and Codex rules
@@ -73,7 +83,9 @@ it provides files over SSHFS and executes project commands through a forced gate
   the same form; Codex accepts `updatedInput` only with `allow`, which keeps its own approval.
   The session settings add an `autoMode.environment` entry that names the runner and asks the
   classifier to judge the quoted command, not the wrapper. It never adds an allow rule. It brings
-  `"$defaults"` only when no user or managed environment exists at session start.
+  `"$defaults"` only when no user or managed environment exists at session start. Away from the
+  project's default mount, the settings also point `autoMemoryDirectory` at that mount's memory
+  directory, unless the user or managed settings set one.
 - Since Claude sees only rh-run, its hook applies the user's own rules to the original command:
   `Bash(...)` deny/ask on any simple command the shared lexer finds, allow only for a plain single
   command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their

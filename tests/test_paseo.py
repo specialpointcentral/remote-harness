@@ -257,7 +257,7 @@ class PaseoBridgeTests(PaseoFixture):
         request = json.loads(self.wait_state('created'))
         self.assertEqual(request['modeId'], 'bypassPermissions')
         self.bridge.terminate()
-        self.assertEqual(self.bridge.wait(timeout=8), 0)
+        self.assertEqual(self.bridge.wait(timeout=8), 143)  # 128 + SIGTERM, for the launcher's record
         result = json.loads((self.state / 'archive-called').read_text())
         self.assertEqual(result, {'agentId': request['agentId'], 'leaseLive': False})
 
@@ -394,7 +394,7 @@ class PaseoNativeRuntimeTests(ClaudeSessionFixture):
         with self.assertRaises(subprocess.TimeoutExpired):
             bridge.wait(timeout=3)  # A completed turn and a closed mobile client leave the lease live.
         bridge.terminate()
-        self.assertEqual(bridge.wait(timeout=12), 0, bridge_log.read_text())
+        self.assertEqual(bridge.wait(timeout=12), 143, bridge_log.read_text())
         self.assertFalse((session / 'paseo-lease.json').exists())
 
 

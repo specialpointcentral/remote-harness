@@ -77,6 +77,13 @@ Bypass 拒绝。因此会话设置加了一条 `autoMode.environment`。这一�
 或 `~/.claude`）和托管设置都没有定义 environment，会话才加上 `"$defaults"`。所以用户自己的
 environment 既不会被替换，也不会被重复。
 
+Claude 的自动记忆按工作目录存放。终端和 Paseo 启动把项目挂载在默认挂载点
+`<RH_HOME>/mounts/<目录名>`。每次 Orca 启动以及带 `--remote-mountpoint` 的启动都挂载在别处，记忆会
+从空白开始。因此，不在默认挂载点的会话会把 `autoMemoryDirectory` 设为默认挂载点的记忆目录，即 Claude
+为终端启动使用的 `<$CLAUDE_CONFIG_DIR 或 ~/.claude>/projects/<净化后的物理路径>/memory`。Claude 接受
+flag 设置中的这一项，但从不接受项目设置中的。会话启动时，用户或托管设置已有 `autoMemoryDirectory`
+的，以该设置为准，会话不再添加。
+
 Claude 要求 2.1.295 或更新版本。路由 `PreToolUse` hook 设置 `onFailure: "block"`：hook 无法启动、
 超时、崩溃或返回无效 JSON 时，Claude 会阻止调用，避免 Bash 在 Agent 主机上执行未经改写的原命令。
 默认的 hook 失败行为会在没有路由改写的情况下继续普通审批流程；Python 的异常捕获无法覆盖被 Claude
@@ -232,6 +239,14 @@ SSH config 和 private key。每次 `inject-rule.sh on` 还会启动 `session-re
 活跃挂载会被拒绝复用，而非替换。本地 `resources.env` 保存隧道 PID、启动时间、配置、gateway
 和授权，远端确认释放后才回收；后续启动重试延期清理，网络或检查失败时保留资源。PID 被复用
 不会导致误杀隧道。
+
+启动器把每次启动到 Agent 开始运行的情况记在本机 `~/.remote-harness/launches.log`（仅本人可读，
+保留最近 500 行）：一行 START，一行带原因的 END。原因来自启动器收到的信号，或交互式 ssh 的退出码：
+即 Agent 或原生桥接进程自己的退出码，连接断开时为 255。Orca 和 Paseo 桥接进程在聊天于应用中被关闭时
+退出 0，被信号停止时退出 128 加信号值（在启动器中按 Ctrl-C 为 130）；Orca 桥接进程与 Orca Server
+失去联系后退出 3。END 行还会记下隧道重连次数、结束时隧道是否仍断开，以及笔记本休眠：隧道监管进程
+在某次检查迟到一分钟以上时记一笔，macOS 则直接给出上次休眠的时间。同一项目下次启动时，若上一次不是
+Agent 退出、聊天关闭或 Ctrl-C 结束的，启动器会提示原因；启动器没记下结束且已不在运行的，也会提示。
 
 每个注入会话具有 `impl` 快照，包含 router、guard、dispatcher、工具垫片、reaper 和依赖。
 生成的入口及 watcher 使用这些副本，实现目录位于 Codex 可写的 SSH runtime 根之外。本机 gateway

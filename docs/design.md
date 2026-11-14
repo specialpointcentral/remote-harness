@@ -94,6 +94,15 @@ when neither the user's settings (`$CLAUDE_CONFIG_DIR` or `~/.claude`) nor manag
 environment when the session starts. A user's own environment is therefore neither replaced nor
 duplicated.
 
+Claude keeps auto memory per working directory. Terminal and Paseo launches mount a project at its
+default mountpoint, `<RH_HOME>/mounts/<folder name>`. Every Orca launch, and a launch with
+`--remote-mountpoint`, mounts it elsewhere and would start with no memory. A session away from the
+default mountpoint therefore sets `autoMemoryDirectory` to the default mountpoint's memory directory,
+`<$CLAUDE_CONFIG_DIR or ~/.claude>/projects/<sanitized physical path>/memory`, which Claude itself
+uses for terminal launches. Claude accepts this setting from flag settings but never from project
+settings. A user or managed `autoMemoryDirectory` present when the session starts takes precedence,
+and the session then adds none.
+
 Claude requires version 2.1.295 or newer. Its routing `PreToolUse` hook sets `onFailure: "block"`:
 if the hook cannot start, times out, crashes or returns invalid JSON, Claude blocks the call before
 Bash can execute the original command on the agent host. The default hook failure behavior would
@@ -287,6 +296,18 @@ implementation for GC to retry. Unregistered live mounts are refused rather than
 `resources.env` records retain the tunnel PID/start/config, gateway, authorization and local config
 until remote release is confirmed. Later launches retry deferred cleanup; network or inspection
 errors preserve resources. PID reuse cannot authorize tunnel kills.
+
+The launcher records each launch that starts its agent in the laptop's
+`~/.remote-harness/launches.log` (owner-only, the last 500 lines): a START line, and an END line with
+the reason. The reason comes from a signal the launcher received, or from the interactive ssh's
+exit status: the agent's or native bridge's own, or 255 when the connection dropped. The Orca and
+Paseo bridges exit 0 when the chat was closed in their app and 128 plus the signal that stopped them
+(130 for Ctrl-C in the launcher); the Orca bridge exits 3 after losing Orca Server. The END line
+also notes tunnel restarts, a tunnel still down at the end, and laptop sleep: the tunnel supervisor
+logs a check that ran at least a minute late, and macOS reports the time of its last sleep. The next
+launch of the same project reports a previous launch that ended any other way than the agent
+exiting, its chat closing, or Ctrl-C, including one whose launcher never recorded an end and no
+longer runs.
 
 Each injected session has an `impl` snapshot containing its router, guard, dispatcher, tool shim,
 reaper and dependencies. Generated entries and the watcher use those copies. The implementation
