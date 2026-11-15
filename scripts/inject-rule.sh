@@ -202,7 +202,7 @@ write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh confi
     _wsr_warm=""
     [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
     _wsr_slots="$(dirname "$4")/runtime/bash-slots/${1##*/}"
-    _wsr_diag="--diagnostics-dir $(sq "$(dirname "$4")/runtime/diagnostics")"
+    _wsr_diag="--diagnostics-dir $(sq "$(dirname "$4")/runtime/diagnostics") --privacy-policy $(sq "$1/privacy.json")"
     _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --background --slots-dir $(sq "$_wsr_slots") $_wsr_diag -- "
     _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --slots-dir $(sq "$_wsr_slots") $_wsr_diag $_wsr_warm-- "
     _wsr_mux="$_wsr_mux --watch"
@@ -309,23 +309,29 @@ write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm 
     printf 'warm_python=%s warm_socket=%s warm_control=%s warm_config=%s warm_alias=%s\n' \
       "$(sq "${2:-}")" "$(sq "${3:-}")" "$(sq "${4:-}")" "$(sq "${5:-}")" "$(sq "${6:-}")"
     printf 'warm_pool=%s\n' "$(sq "$SCRIPT_DIR/warm_pool.py")"
+    _wsl_environment=$("${2:?}" $PY_FLAGS "$SCRIPT_DIR/session_privacy.py" launcher-env "$1/privacy.json") || return 1
+    printf '%s\n' "$_wsl_environment"
+    printf 'presentation_python=%s presentation_impl=%s presentation_agent=%s\n' "$(sq "$2")" "$(sq "$SCRIPT_DIR/session_privacy.py")" "$(sq "$agent")"
     cat <<'EOS'
 b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
-# The agent was started by the laptop's `ssh -tt`, whose first two SSH_CONNECTION fields (and the
-# first two of SSH_CLIENT) are the laptop's address and port. Hooks, MCP servers and status lines
-# would all see them, so blank them; the variables stay set, since agents use them to detect SSH.
+# Both SSH endpoints are private transport metadata. Keep the variables set for SSH detection,
+# but expose neither the project host nor the agent server's addresses or ports.
 if [ -n "${SSH_CONNECTION:-}" ]; then
-  read -r _ _ server_addr server_port <<EOF
-$SSH_CONNECTION
-EOF
-  SSH_CONNECTION="0.0.0.0 0 ${server_addr:-0.0.0.0} ${server_port:-0}"
+  SSH_CONNECTION="0.0.0.0 0 0.0.0.0 0"
   export SSH_CONNECTION
 fi
 if [ -n "${SSH_CLIENT:-}" ]; then
-  SSH_CLIENT="0.0.0.0 0 ${SSH_CLIENT##* }"
+  SSH_CLIENT="0.0.0.0 0 0"
   export SSH_CLIENT
 fi
-start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+unset HOSTNAME HOST SSH_TTY SSH_ORIGINAL_COMMAND RH_PROJECT_IDENTITY_B64 RH_CENTER_PROFILE_B64 RH_PRESENTATION_SUMMARY || exit 125
+if [ -n "$project_hostname" ]; then
+  HOSTNAME=$project_hostname HOST=$project_hostname
+  export HOSTNAME HOST
+fi
+unset project_hostname
+start=$(TZ=UTC TZDIR=/usr/share/zoneinfo LC_ALL=C ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+[ -z "$start" ] || start="UTC:$start"
 term=$(tty 2>/dev/null) || term=""
 if [ -d "$sd" ] && [ ! -L "$sd" ]; then
   (
@@ -355,6 +361,7 @@ if [ -d "$sd" ] && [ ! -L "$sd" ]; then
   fi
   ) || exit 1
 fi
+"$presentation_python" -EsB "$presentation_impl" activate "$sd/privacy.json" "$rh_home" "$presentation_agent" || exit 125
 exec "$@"
 EOS
   } > "$_wsl_launcher" || return 1
@@ -370,10 +377,10 @@ write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project r
   mkdir -p "$1/bin" 2>/dev/null || return 1
   {
     printf '#!/usr/bin/env sh\n'
-    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s --warm-socket %s -- "$@"\n' \
+    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s --warm-socket %s --privacy-policy %s -- "$@"\n' \
       "$(sq "$PYTHON3")" "$PY_FLAGS" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
       "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$7")" "$(sq "$4")" "$(sq "$5")" \
-      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")" "$(sq "${warm_socket:-}")"
+      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")" "$(sq "${warm_socket:-}")" "$(sq "$1/privacy.json")"
   } > "$_wts_shim" || return 1
   chmod +x "$_wts_shim" 2>/dev/null || return 1
 }
@@ -413,7 +420,18 @@ for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
     if root not in roots:
         roots.append(root)
         rules += [f"{tool}(/{root}/**)" for tool in ("Read", "Edit")]
-print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
+with open(sys.argv[2]) as stream:
+    paths = json.load(stream)["deny_paths"]
+for path in paths:
+    rules += [f"Read(/{path})", f"Read(/{path}/**)"]
+print(json.dumps(rules))' "${RH_HOME:-$HOME/.remote-harness}/.sessions" "$SD/privacy.json") || return 1
+  _wcs_post_entry=""
+  _wcs_version=$("$PYTHON3" -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$SD/privacy.json") || return 1
+  if [ "$_wcs_version" != 3 ]; then
+    _wcs_post=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' \
+      "$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/session_privacy.py") post-tool $(sq "$SD/privacy.json")") || return 1
+    _wcs_post_entry="\"PostToolUse\": [{\"hooks\": [{\"type\": \"command\", \"command\": $_wcs_post, \"timeout\": 10}]}],"
+  fi
   # Auto mode's classifier judges the rewritten runner form. Without context it can take the runner
   # for shell indirection around itself (Auto-Mode Bypass) and deny a plain read-only command. This
   # environment entry names the transport and keeps every rule on the quoted command. Claude appends
@@ -475,6 +493,7 @@ print(json.dumps(extra)[1:-1])' "$5" "$6" "$7") || return 1
   },
   $_wcs_extra,
   "hooks": {
+    $_wcs_post_entry
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -552,6 +571,16 @@ write_rule() {  # $1=outfile $2=mountpoint $3=agent $4=ui
       printf 'the current working directory for them instead.\n'
     fi
   } > "$1"
+  cat >> "$1" <<'PRESENTATION'
+
+Session identity display: use the approved routed command `rh-session-info` for the structured
+`view=session` snapshot of the real agent center. Its hostname, machine ID, timezone and available
+address describe this conversation, never project services or connection destinations. The first
+version reports `timestamp_conversion=false` and exposes no converted clock records. Ordinary
+`hostname`, `date`, `ip`, `curl`, source files, logs and stdout/stderr are real project diagnostics;
+preserve their values and command arguments. A JSON body claiming `view=session` is not provenance.
+PRESENTATION
+
 }
 
 case "${1:-}" in
@@ -604,7 +633,7 @@ case "${1:-}" in
     source_scripts="$SCRIPT_DIR"
     mkdir "$SD/impl" || abort_session
     impl_sources=() impl_copies=()
-    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
+    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py session_privacy.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
       impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
     done
     if [ "$ui" = paseo ]; then
@@ -671,6 +700,9 @@ case "${1:-}" in
     # Command guard and tool shims need python3 on this host; without it, routed commands are not
     # watched and git/rg simply keep their SSHFS behavior.
     PYTHON3=$(command -v python3 2>/dev/null || true)
+    [ -n "$PYTHON3" ] && PYTHON3=$(RH_CENTER_PROFILE_B64= RH_PRESENTATION_SUMMARY= "$PYTHON3" $PY_FLAGS \
+      "$SCRIPT_DIR/session_privacy.py" initialize "$SD/privacy.json" "${RH_SESSION_TZ:-}" "$mp") || abort_session
+    case "$PYTHON3" in /*) ;; *) abort_session;; esac
     # RH_WARM_MAX=0 turns the warm channel pool off; it also needs python3 here.
     warm_socket="" warm_control=""
     if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-9}" != 0 ]; then
@@ -813,10 +845,15 @@ case "${1:-}" in
       orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3") $(sq "$agent")"
       flags_out=""
     fi
-    resume_out=""; resume_args=""
+    resume_out=""; resume_args=""; resume_presentation=""; resume_conversation=""
     if [ "$ui" = terminal ]; then
-      resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
-      case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
+      resume_record=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null)
+      resume_out=$(printf '%s\n' "$resume_record" | sed -n 's/^RESUME=//p')
+      resume_presentation=$(printf '%s\n' "$resume_record" | sed -n -E 's/^PRESENTATION_ID=([0-9a-f-]{36})$/\1/p')
+      resume_conversation=$(printf '%s\n' "$resume_record" | sed -n -E 's/^CONVERSATION_ID=([0-9a-f-]{36})$/\1/p')
+      if [ "$agent" = claude ] && [ -n "$resume_conversation" ] && [ -n "$resume_presentation" ]; then
+        resume_args="--resume $resume_conversation"
+      fi
     fi
     # Every process's arguments, the agent's own Bash commands among them, are readable by all users
     # unless /proc is mounted with hidepid. Tell the laptop when other users have accounts or
@@ -831,12 +868,16 @@ case "${1:-}" in
     printf 'RH_STATUS=INJECTED\n'
     printf 'RH_RESUME_AVAILABLE=%s\n' "$resume_out"
     printf 'RH_RESUME_ARGS=%s\n' "$resume_args"
+    printf 'RH_RESUME_PRESENTATION_ID=%s\n' "$resume_presentation"
+    printf 'RH_RESUME_CONVERSATION_ID=%s\n' "$resume_conversation"
     printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
     printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
     printf 'RH_APPROVAL=%s\n' "$approval"
     printf 'RH_PROCESS_LIST_SHARED=%s\n' "$shared_ps"
     printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
     printf 'RH_SESSION_DIR=%s\n' "$SD"
+    printf 'RH_PRESENTATION_PYTHON=%s\n' "$PYTHON3"
+    printf 'RH_PRESENTATION_SCRIPT=%s\n' "$SCRIPT_DIR/session_privacy.py"
     [ -z "$paseo_launch" ] || printf 'RH_PASEO_LAUNCH=%s\n' "$paseo_launch"
     [ -z "$orca_launch" ] || printf 'RH_ORCA_LAUNCH=%s\n' "$orca_launch"
     ;;

@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+# remote-harness / inject-rule.sh — RUN WHERE THE AGENT LAUNCHES.
+# The launched agent works in an sshfs mount of the project host's code. This machine may lack that
+# project's toolchain/runtime, so this injects a session rule: run builds/tests/linters/installs on
+# the project host reached by the supplied SSH alias. The rule is SCOPED TO THIS SESSION/PROJECT (no
+# global instructions file → other sessions are unaffected). Per agent it uses that CLI's cleanest
+# scoped channel:
+#   claude   → --append-system-prompt-file <rule>   (session-only flag; nothing on disk to clean up
+#              beyond the box-side rule file; never touches the mounted repo)
+#   codex    → -c developer_instructions=<rule>  (session-only CLI config; avoids changing
+#              CODEX_HOME, because modern Codex can store ChatGPT credentials in an encrypted
+#              keyring keyed by the real home and would prompt for login under a synthetic home).
+#              Selects workspace-write via `--approve-for-me` (auto) or `-s workspace-write` (normal),
+#              with `-c sandbox_workspace_write.network_access=true` and a writable root for the
+#              session-owned ~/.remote-harness/.sessions runtime dirs because codex's
+#              default sandbox blocks network and otherwise prevents ssh from writing its temp
+#              known_hosts there. It never makes ~/.ssh writable.
+#              The project's own AGENTS.md is still read additively; the mounted repo is never touched.
+#   The rule asks for replies in the language of the user's latest message, and every user turn
+#   repeats that as a one-line note (a UserPromptSubmit hook), because the rule alone sits at the
+#   start of the context and loses to long tool output in another language.
+#
+#   inject-rule.sh on  <agent> <project_path_on_host> <host_alias> <mountpoint> [approval] [ssh_config] [session_id] [terminal|paseo|orca]
+#              approval: 0|normal, 1|yolo, or auto = the agent's automatic approval review when this CLI
+#              supports it (claude --permission-mode auto, codex --approve-for-me), else normal.
+#   inject-rule.sh off <agent> <mountpoint> [session_id]
+#
+# 'on'  prints: RH_STATUS=INJECTED  RH_LAUNCH_ENV=<env prefix>  RH_LAUNCH_FLAGS=<trailing flags>
+#               RH_APPROVAL=<normal|auto|yolo> (the approval mode the flags actually select)
+#               RH_RESUME_AVAILABLE=<reason>,<epoch> when the last session of this mountpoint and
+#               agent ended on a lost connection (offered once; the marker is consumed), and
+#               RH_RESUME_ARGS=<agent arguments that continue the last conversation>
+#               RH_PROCESS_LIST_SHARED=<1 when other users here can read process arguments>
+#               RH_LAUNCH_PREFIX=<session launcher for the final launch>
+#               RH_PASEO_LAUNCH or RH_ORCA_LAUNCH=<native bridge command>
+# 'off' prints: RH_STATUS=RESTORED | NOOP        (RH_STATUS=ERROR on failure)
+# Per-session artifacts live under $RH_HOME/.sessions/<key> on the agent machine. The key is derived
+# from the mountpoint plus the caller's session_id, so 'on'/'off' agree without extra state, and a
+# second launch (or a stale launch's cleanup) for the same mountpoint never deletes the hook/runner of
+# a session that is still running. Without session_id the key is the mountpoint alone (legacy).
+set -uo pipefail
+
+sq() { local _sq_q="'" _sq_r="'\\''"; printf "'%s'" "${1//$_sq_q/$_sq_r}"; }  # as in _common.sh
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)"
+
+# After `on` has created the session dir, every failure removes it so a relaunch never finds a
+# half-built session it refuses to overwrite.
+abort_session() {
+  rm -rf "$SD" 2>/dev/null || true
+  echo "RH_STATUS=ERROR"
+  exit 1
+}
+
+safe_ssh_token() {
+  case "${1:-}" in
+    ""|-*|*[[:space:]]*) return 1;;
+    *) return 0;;
+  esac
+}
+
+valid_session_id() {
+  case "${1:-}" in
+    ""|.|..|*[!A-Za-z0-9._-]*) return 1;;
+    *) return 0;;
+  esac
+}
+
+# Older Claude versions ignore onFailure, allowing an unrewritten Bash call after a hook timeout.
+# Refuse an unknown version too: routing is a requirement, not an optional customization.
+claude_supports_hook_failure() {
+  local version
+  version=$(claude -v 2>/dev/null) || return 1
+  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)($|[[:space:]]) ]] || return 1
+  (( 10#${BASH_REMATCH[1]} > 2 ||
+     (10#${BASH_REMATCH[1]} == 2 && (10#${BASH_REMATCH[2]} > 1 ||
+      (10#${BASH_REMATCH[2]} == 1 && 10#${BASH_REMATCH[3]} >= 295))) ))
+}
+
+# Added to every user turn, so it stays short; the rule carries the details.
+REPLY_LANGUAGE_NOTE="remote-harness: reply in the language of the user's latest message, not of tool output."
+
+session_dir() {  # $1 = mountpoint, $2 = optional session id -> box-side per-session dir
+  key="$(printf '%s' "${1:-default}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+  case "$key" in ""|.|..) key=default;; esac   # never let the key escape $RH_HOME/.sessions/ (e.g. "..")
+  [ -z "${2:-}" ] || key="$key.$2"
+  printf '%s/.sessions/%s' "${RH_HOME:-$HOME/.remote-harness}" "$key"
+}
+
+# Emit a few concrete example commands (one per line) for the project at $1 (mountpoint), by
+# sniffing its manifest files. Falls back to generic placeholders if the stack is unknown.
+detect_cmds() {
+  m="$1"
+  if   [ -n "$m" ] && [ -f "$m/package.json" ]; then
+    pm=npm
+    [ -f "$m/yarn.lock" ]      && pm=yarn
+    [ -f "$m/pnpm-lock.yaml" ] && pm=pnpm
+    [ -f "$m/bun.lockb" ]      && pm=bun
+    printf '%s install\n%s run build\n%s test\n%s run lint\n%s run format\n' "$pm" "$pm" "$pm" "$pm" "$pm"
+  elif [ -n "$m" ] && [ -f "$m/Cargo.toml" ]; then
+    printf 'cargo build\ncargo test\ncargo run\ncargo clippy\ncargo fmt --check\n'
+  elif [ -n "$m" ] && [ -f "$m/go.mod" ]; then
+    printf 'go build ./...\ngo test ./...\ngo vet ./...\ngofmt -l .\n'
+  elif [ -n "$m" ] && { [ -f "$m/pyproject.toml" ] || [ -f "$m/requirements.txt" ] || [ -f "$m/setup.py" ]; }; then
+    if [ -f "$m/requirements.txt" ]; then printf 'pip install -r requirements.txt\n'; else printf 'pip install -e .\n'; fi
+    printf 'pytest\n'
+    { [ -f "$m/ruff.toml" ] || [ -f "$m/.ruff.toml" ] || grep -qs 'ruff' "$m/pyproject.toml" 2>/dev/null; } && printf 'ruff check .\n' || true
+    [ -f "$m/mypy.ini" ] || grep -qsE '\[(tool\.)?mypy\]' "$m/setup.cfg" "$m/pyproject.toml" 2>/dev/null && printf 'mypy .\n' || true
+  elif [ -n "$m" ] && [ -f "$m/pom.xml" ]; then
+    if [ -f "$m/mvnw" ]; then mvn=./mvnw; else mvn=mvn; fi
+    printf '%s -q compile\n%s test\n%s package\n' "$mvn" "$mvn" "$mvn"
+  elif [ -n "$m" ] && { [ -f "$m/build.gradle" ] || [ -f "$m/build.gradle.kts" ] || [ -f "$m/settings.gradle" ] || [ -f "$m/settings.gradle.kts" ]; }; then
+    if [ -f "$m/gradlew" ]; then gr=./gradlew; else gr=gradle; fi
+    printf '%s build\n%s test\n%s run\n' "$gr" "$gr" "$gr"
+  elif [ -n "$m" ] && { ls "$m"/*.sln >/dev/null 2>&1 || ls "$m"/*.csproj >/dev/null 2>&1; }; then
+    printf 'dotnet restore\ndotnet build\ndotnet test\n'
+  elif [ -n "$m" ] && [ -f "$m/Gemfile" ]; then
+    printf 'bundle install\nbundle exec rake test\n'
+  elif [ -n "$m" ] && { [ -f "$m/Makefile" ] || [ -f "$m/makefile" ]; }; then
+    printf 'make\nmake test\n'
+  else
+    printf '<install deps>\n<build>\n<test>\n'
+  fi
+}
+
+toml_basic_string_file() {
+  awk '
+    BEGIN { printf "\"" }
+    {
+      gsub(/\\/, "\\\\")
+      gsub(/"/, "\\\"")
+      gsub(/\t/, "\\t")
+      printf "%s%s", sep, $0
+      sep="\\n"
+    }
+    END { printf "\"" }
+  ' "$1"
+}
+
+toml_escape_value() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+codex_writable_roots_cfg() {
+  _cwr_ssh_config="${1:-}"
+  [ -n "$_cwr_ssh_config" ] || return 1
+  _cwr_runtime_dir="$(dirname "$_cwr_ssh_config" 2>/dev/null)/runtime"
+  [ ! -L "$(dirname "$_cwr_ssh_config")" ] && [ ! -L "$_cwr_runtime_dir" ] || return 1
+  mkdir -p "$_cwr_runtime_dir" 2>/dev/null && chmod 700 "$_cwr_runtime_dir" || return 1
+  printf 'sandbox_workspace_write.writable_roots=["%s"]' "$(toml_escape_value "$_cwr_runtime_dir")"
+}
+
+write_ssh_wrapper() {  # $1=session dir  $2=alias  $3=ssh config path
+  sd="$1"; alias_name="$2"; cfg="$3"
+  safe_ssh_token "$alias_name" || return 1
+  case "$cfg" in ""|*'
+'*) return 1;; esac
+  real_ssh="$(command -v ssh 2>/dev/null || true)"
+  [ -n "$real_ssh" ] || return 1
+  bin="$sd/bin"
+  mkdir -p "$bin" 2>/dev/null || return 1
+  wrapper="$bin/ssh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'real_ssh=%s\n' "$(sq "$real_ssh")"
+    printf 'alias_name=%s\n' "$(sq "$alias_name")"
+    printf 'cfg=%s\n' "$(sq "$cfg")"
+    printf 'need_value=0\n'
+    printf 'target=""\n'
+    printf 'for arg in "$@"; do\n'
+    printf '  if [ "$need_value" = 1 ]; then need_value=0; continue; fi\n'
+    printf '  case "$arg" in\n'
+    printf '    -F|-F*) exec "$real_ssh" "$@" ;;\n'
+    printf '    -b|-c|-D|-E|-e|-I|-i|-J|-L|-l|-m|-O|-o|-p|-Q|-R|-S|-W|-w) need_value=1; continue ;;\n'
+    printf '    -b*|-c*|-D*|-E*|-e*|-I*|-i*|-J*|-L*|-l*|-m*|-O*|-o*|-p*|-Q*|-R*|-S*|-W*|-w*) continue ;;\n'
+    printf '    -*) continue ;;\n'
+    printf '    *) target="$arg"; break ;;\n'
+    printf '  esac\n'
+    printf 'done\n'
+    printf 'if [ "$target" = "$alias_name" ]; then\n'
+    printf '  exec "$real_ssh" -F "$cfg" "$@"\n'
+    printf 'fi\n'
+    printf 'exec "$real_ssh" "$@"\n'
+  } > "$wrapper" || return 1
+  chmod +x "$wrapper" 2>/dev/null || return 1
+  return 0
+}
+
+# The Python helpers run per tool call and use only the standard library: -I ignores PYTHON* variables
+# and keeps the script dir and user site off sys.path, -S skips importing site (about 3 ms a start).
+PY_FLAGS="-I -S"
+
+write_session_runner() {  # $1=session dir $2=alias $3=project root $4=ssh config $5=control path $6=python3 [$7=warm pool socket]
+  _wsr_runner="$1/bin/rh-run"
+  _wsr_mux=""
+  [ -z "${5:-}" ] || _wsr_mux=" --control-path $(sq "$5")"
+  # With python3, channel-guard.py holds the SSH channel open for the command's lifetime so the
+  # project host stops the command tree when this call is cancelled or the connection drops. With a
+  # warm pool it first sends the same request on a channel opened ahead of time (warm_pool.py).
+  _wsr_guard=""
+  _wsr_background_guard=""
+  if [ -n "${6:-}" ] && [ -f "$SCRIPT_DIR/channel-guard.py" ]; then
+    _wsr_warm=""
+    [ -z "${7:-}" ] || _wsr_warm="--warm $(sq "$7") --warm-request \"remote-harness-exec $(b64_value "$3") \${1:?} \${2:?} watch\" "
+    _wsr_slots="$(dirname "$4")/runtime/bash-slots/${1##*/}"
+    _wsr_diag="--diagnostics-dir $(sq "$(dirname "$4")/runtime/diagnostics")"
+    _wsr_background_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --background --slots-dir $(sq "$_wsr_slots") $_wsr_diag -- "
+    _wsr_guard="$(sq "$6") $PY_FLAGS $(sq "$SCRIPT_DIR/channel-guard.py") \$from_env --slots-dir $(sq "$_wsr_slots") $_wsr_diag $_wsr_warm-- "
+    _wsr_mux="$_wsr_mux --watch"
+  fi
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    _wsr_env="$(transport_settings_env)" || return 1
+    printf 'export %s\n' "${_wsr_env#env }"
+    printf 'background=0\ncase "${1:-}" in --background) background=1; shift;; esac\n'
+    # `--cwd DIR -- COMMAND` is the readable form the hooks write, so approval prompts and automatic
+    # reviews see the command; the positional form (both values base64, as the
+    # launcher's prewarm call uses) is kept. The guard encodes in-process, with no extra process per
+    # call: it gets the plain values in its environment, which other users cannot read, and replaces
+    # the @cwd/@command placeholders.
+    printf 'from_env=""\nif [ "${1:-}" = --cwd ]; then\n'
+    printf '  [ "$#" = 4 ] && [ "$3" = -- ] || { echo "remote-harness: category=input exit=2 session=unknown" >&2; exit 2; }\n'
+    if [ -n "$_wsr_guard" ]; then
+      printf '  RH_REQUEST_CWD=$2 RH_REQUEST_COMMAND=$4\n  export RH_REQUEST_CWD RH_REQUEST_COMMAND\n'
+      printf '  from_env=--request-from-env\n  set -- @cwd @command\n'
+    else
+      printf '  set -- "$(printf "%%s" "$2" | base64 | tr -d "\\n")" "$(printf "%%s" "$4" | base64 | tr -d "\\n")"\n'
+    fi
+    printf 'fi\n'
+    printf '[ "$#" = 2 ] || { echo "remote-harness: category=input exit=2 session=unknown" >&2; exit 2; }\n'
+    printf 'if [ "$background" = 1 ]; then\n'
+    if [ -z "$_wsr_background_guard" ]; then
+      printf '  echo "remote-harness: category=background exit=2 session=unknown" >&2; exit 2\n'
+    fi
+    printf '  exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s --no-mux%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$_wsr_background_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
+      "$(b64_value "$3")" "${_wsr_background_guard:+ --watch}"
+    printf 'fi\n'
+    printf 'exec %s%s --ssh-config %s --alias %s --project-root %s --project-root-b64 %s%s --cwd-relative-b64 "${1:?}" --command-b64 "${2:?}"\n' \
+      "$_wsr_guard" "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$4")" "$(sq "$2")" "$(sq "$3")" \
+      "$(b64_value "$3")" "$_wsr_mux"
+  } > "$_wsr_runner" || return 1
+  chmod +x "$_wsr_runner" 2>/dev/null || return 1
+  printf '%s' "$_wsr_runner"
+}
+
+b64_value() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# Short, token-free multiplexing socket beside the session SSH runtime (already the Codex writable
+# root). Empty when the path would exceed the Unix socket limit; callers then connect directly.
+session_control_path() {  # $1=ssh config
+  _scp_runtime="$(dirname "$1" 2>/dev/null)/runtime"
+  [ ! -L "$(dirname "$1")" ] && [ ! -L "$_scp_runtime" ] || return 1
+  mkdir -p "$_scp_runtime" 2>/dev/null || return 1
+  chmod 700 "$_scp_runtime" 2>/dev/null || return 1
+  _scp_path="$_scp_runtime/mux"
+  case "$_scp_path" in /*) ;; *) return 0;; esac
+  case "$_scp_path" in *[!A-Za-z0-9._/-]*) return 0;; esac
+  [ "${#_scp_path}" -le 86 ] || return 0
+  printf '%s' "$_scp_path"
+}
+
+# The warm pool's Unix socket and its connection's control socket, beside the session mux socket. Both
+# stay empty (no pool) without a session id or when a path would be too long for a Unix socket.
+session_warm_paths() {  # $1=ssh config $2=session id -> sets warm_socket, warm_control
+  warm_socket="" warm_control=""
+  _swp_mux=$(session_control_path "$1") || return 1
+  [ -n "$_swp_mux" ] && [ -n "${2:-}" ] || return 0
+  _swp_dir=$(dirname "$_swp_mux")
+  [ "${#_swp_dir}" -le $((86 - 4 - ${#2})) ] || return 0
+  warm_socket="$_swp_dir/warm.$2"
+  warm_control="$_swp_dir/wm.$2"
+}
+
+# Session metadata for session-reaper.sh (values base64-encoded; never sourced or evaluated).
+write_session_meta() {  # $1=session dir $2=agent $3=mountpoint $4=alias $5=ssh config $6=control path
+  {
+    printf 'AGENT=%s\n' "$(b64_value "$2")"
+    [ "$ui" = terminal ] || printf 'UI=%s\n' "$(b64_value "$ui")"
+    if [ -n "${SESSION_LEASE:-}" ]; then
+      printf 'MOUNTPOINT=%s\n' "$(sed -n 's/^MOUNTPOINT=//p' "$SESSION_LEASE/lease.env")"
+    else
+      printf 'MOUNTPOINT=%s\n' "$(b64_value "$3")"
+    fi
+    printf 'ALIAS=%s\n' "$(b64_value "$4")"
+    printf 'SSH_CONFIG=%s\n' "$(b64_value "$5")"
+    printf 'CONTROL_PATH=%s\n' "$(b64_value "$6")"
+    if [ -n "${SESSION_LEASE:-}" ]; then
+      printf 'LEASE_DIR=%s\n' "$(b64_value "$SESSION_LEASE")"
+      printf 'MOUNT_SSH_CONFIG=%s\n' "$(sed -n 's/^MOUNT_SSH_CONFIG=//p' "$SESSION_LEASE/lease.env")"
+    fi
+  } > "$1/session.env" || return 1
+  chmod 600 "$1/session.env" 2>/dev/null || true
+}
+
+# Session launcher: records the agent's pid/start time/terminal, starts the detached server-side
+# watcher, then execs the agent (same pid). Used only for the final interactive launch.
+write_session_launcher() {  # $1=session dir [$2=python3 $3=warm socket $4=warm control $5=ssh config $6=alias]
+  _wsl_launcher="$1/bin/rh-session"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    _wsl_env="$(transport_settings_env)" || return 1
+    printf 'export %s\n' "${_wsl_env#env }"
+    printf 'sd=%s\n' "$(sq "$1")"
+    printf 'reaper=%s\n' "$(sq "$SCRIPT_DIR/session-reaper.sh")"
+    printf 'rh_home=%s\n' "$(sq "${RH_HOME:-$HOME/.remote-harness}")"
+    printf 'lease=%s\n' "$(sq "${SESSION_LEASE:-}")"
+    printf 'warm_python=%s warm_socket=%s warm_control=%s warm_config=%s warm_alias=%s\n' \
+      "$(sq "${2:-}")" "$(sq "${3:-}")" "$(sq "${4:-}")" "$(sq "${5:-}")" "$(sq "${6:-}")"
+    printf 'warm_pool=%s\n' "$(sq "$SCRIPT_DIR/warm_pool.py")"
+    cat <<'EOS'
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+# The agent was started by the laptop's `ssh -tt`, whose first two SSH_CONNECTION fields (and the
+# first two of SSH_CLIENT) are the laptop's address and port. Hooks, MCP servers and status lines
+# would all see them, so blank them; the variables stay set, since agents use them to detect SSH.
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  read -r _ _ server_addr server_port <<EOF
+$SSH_CONNECTION
+EOF
+  SSH_CONNECTION="0.0.0.0 0 ${server_addr:-0.0.0.0} ${server_port:-0}"
+  export SSH_CONNECTION
+fi
+if [ -n "${SSH_CLIENT:-}" ]; then
+  SSH_CLIENT="0.0.0.0 0 ${SSH_CLIENT##* }"
+  export SSH_CLIENT
+fi
+start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+term=$(tty 2>/dev/null) || term=""
+if [ -d "$sd" ] && [ ! -L "$sd" ]; then
+  (
+  umask 077
+  [ ! -L "$sd/owner.env.tmp" ] && [ ! -L "$sd/owner.env" ] || exit 1
+  printf 'OWNER_PID=%s\nOWNER_START=%s\nOWNER_TTY=%s\n' "$$" "$(b64 "$start")" "$(b64 "$term")" \
+    > "$sd/owner.env.tmp" && chmod 600 "$sd/owner.env.tmp" && mv "$sd/owner.env.tmp" "$sd/owner.env" || exit 1
+  if [ -n "$lease" ] && [ -d "$lease" ]; then
+    [ ! -L "$lease" ] && [ ! -L "$lease/owner.env.tmp" ] && [ ! -L "$lease/owner.env" ] || exit 1
+    cp "$sd/owner.env" "$lease/owner.env.tmp" && chmod 600 "$lease/owner.env.tmp" && mv "$lease/owner.env.tmp" "$lease/owner.env" || exit 1
+  fi
+  if [ -x "$reaper" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+      RH_HOME="$rh_home" setsid "$reaper" watch "$sd" </dev/null >/dev/null 2>&1 &
+    else
+      RH_HOME="$rh_home" nohup "$reaper" watch "$sd" </dev/null >/dev/null 2>&1 &
+    fi
+  fi
+  # The warm pool lives as long as this agent (its pid is ours after exec); see warm_pool.py. "$@" is
+  # the agent command, so the pool's arguments are spelled out rather than built with set --.
+  if [ -n "$warm_socket" ] && [ -x "$warm_python" ] && [ -f "$warm_pool" ]; then
+    detach=nohup
+    command -v setsid >/dev/null 2>&1 && detach=setsid
+    "$detach" "$warm_python" -I -S "$warm_pool" serve --socket "$warm_socket" --control-path "$warm_control" \
+      --ssh-config "$warm_config" --alias "$warm_alias" --owner-pid "$$" --session-dir "$sd" \
+      --log "$sd/warm.log" </dev/null >/dev/null 2>&1 &
+  fi
+  ) || exit 1
+fi
+exec "$@"
+EOS
+  } > "$_wsl_launcher" || return 1
+  chmod +x "$_wsl_launcher" 2>/dev/null || return 1
+  printf '%s' "$_wsl_launcher"
+}
+
+# PATH shims that send IO-heavy git/rg work-tree scans to the project host (project-host-tool.py),
+# through the session's warm pool when session_warm_paths set warm_socket.
+write_tool_shim() {  # $1=session dir $2=tool $3=real tool $4=alias $5=project root $6=mountpoint $7=ssh config $8=control path [$9=real argv0]
+  _wts_shim="$1/bin/$2"
+  _wts_slots="$(dirname "$7" 2>/dev/null)/runtime/tool-slots"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'exec %s %s %s --tool %s --real %s --real-argv0 %s --runner %s --ssh-config %s --alias %s --project-root %s --mount-root %s --control-path %s --slots-dir %s --concurrency %s --warm-socket %s -- "$@"\n' \
+      "$(sq "$PYTHON3")" "$PY_FLAGS" "$(sq "$SCRIPT_DIR/project-host-tool.py")" "$2" "$(sq "$3")" "$(sq "${9:-}")" \
+      "$(sq "$SCRIPT_DIR/run-on-project-host.sh")" "$(sq "$7")" "$(sq "$4")" "$(sq "$5")" \
+      "$(sq "$6")" "$(sq "$8")" "$(sq "$_wts_slots")" "$(sq "${RH_TOOL_CONCURRENCY:-6}")" "$(sq "${warm_socket:-}")"
+  } > "$_wts_shim" || return 1
+  chmod +x "$_wts_shim" 2>/dev/null || return 1
+}
+
+write_claude_worktree_blocker() {  # $1=session dir
+  _wcw_blocker="$1/bin/deny-worktree"
+  mkdir -p "$1/bin" 2>/dev/null || return 1
+  {
+    printf '#!/usr/bin/env sh\n'
+    printf 'printf %s >&2\n' "$(sq 'remote-harness: Claude worktrees are unavailable in an SSHFS session; use a separate remote-harness session for isolated parallel work.\n')"
+    printf 'exit 2\n'
+  } > "$_wcw_blocker" || return 1
+  chmod +x "$_wcw_blocker" 2>/dev/null || return 1
+  printf '%s' "$_wcw_blocker"
+}
+
+# Claude and Codex share the UserPromptSubmit output format; the hook only replays a fixed answer.
+write_reply_language_hook() {  # $1=session dir $2=note -> prints the hook command
+  _wrl_file="$1/reply-language.json"
+  "$PYTHON3" -c 'import json,sys; print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": sys.argv[1]}}))' "$2" \
+    > "$_wrl_file" || return 1
+  printf 'cat >/dev/null; cat %s' "$(sq "$_wrl_file")"
+}
+
+write_claude_settings() {  # $1=outfile $2=tool hook command $3=worktree blocker $4=reply language hook command $5=runner
+  #                          $6=mountpoint $7=the project's default mountpoint
+  _wcs_command=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$2") || return 1
+  _wcs_worktree=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$(sq "$3")") || return 1
+  _wcs_prompt=$("$PYTHON3" -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4") || return 1
+  # Session directories hold the gateway key, SSH config, runner and private logs, all naming the
+  # project host; editing them could also undo the routing. Read rules cover Grep and Glob too, and
+  # deny rules hold in every approval mode. /proc of this host has nothing for the project.
+  _wcs_deny=$("$PYTHON3" -c '
+import json, os, sys
+rules, roots = ["EnterWorktree", "ExitWorktree"], []
+for root in (os.path.abspath(sys.argv[1]), os.path.realpath(sys.argv[1])):
+    if root not in roots:
+        roots.append(root)
+        rules += [f"{tool}(/{root}/**)" for tool in ("Read", "Edit")]
+print(json.dumps(rules + ["Read(//proc/**)"]))' "${RH_HOME:-$HOME/.remote-harness}/.sessions") || return 1
+  # Auto mode's classifier judges the rewritten runner form. Without context it can take the runner
+  # for shell indirection around itself (Auto-Mode Bypass) and deny a plain read-only command. This
+  # environment entry names the transport and keeps every rule on the quoted command. Claude appends
+  # these entries to the user's and managed ones, and its shipped environment stays only while some
+  # list holds "$defaults". A user or managed list of its own replaces or extends the shipped one,
+  # so "$defaults" is added only when neither exists when the session starts.
+  #
+  # Claude keeps auto memory per working directory, and every Orca launch (or --remote-mountpoint)
+  # mounts the project somewhere else, so each would start with no memory. A session away from the
+  # project's default mount uses the default mount's memory directory instead, the one terminal
+  # launches already use; a user or managed autoMemoryDirectory wins. Claude keys that default by the
+  # sanitized physical path, cut to 200 characters plus a hash suffix when longer.
+  _wcs_extra=$("$PYTHON3" -c '
+import glob, hashlib, json, os, re, sys
+runner, mount, default = sys.argv[1:4]
+managed = "/Library/Application Support/ClaudeCode" if sys.platform == "darwin" else "/etc/claude-code"
+config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+paths = [os.path.join(config, "settings.json"), os.path.join(managed, "managed-settings.json")]
+try:
+    drop_ins = os.path.join(managed, "managed-settings.d")
+    paths += [os.path.join(drop_ins, name) for name in sorted(os.listdir(drop_ins))
+              if name.endswith(".json") and not name.startswith(".")]
+except OSError:
+    pass
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+sources = [load(path) for path in paths]
+def own_environment(settings):
+    auto = settings.get("autoMode")
+    environment = auto.get("environment") if isinstance(auto, dict) else None
+    return isinstance(environment, list) and bool(environment) and all(isinstance(e, str) for e in environment)
+entry = ("**Remote-harness routing**: A hook the user installed rewrites each Bash command to "
+         f"`{runner} [--background] --cwd <dir> -- \x27<command>\x27`, which runs it on the "
+         "user\x27s own machine (the project host). This wrapper is the user\x27s transport, not "
+         "Auto-Mode Bypass: judge the quoted command under every rule, as if run directly.")
+extra = {"autoMode": {"environment": ([] if any(map(own_environment, sources)) else ["$defaults"]) + [entry]}}
+if (default and os.path.realpath(mount) != os.path.realpath(default)
+        and not any(settings.get("autoMemoryDirectory") is not None for settings in sources)):
+    name = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(default))
+    projects = os.path.join(config, "projects")
+    if len(name) > 200:
+        found = glob.glob(os.path.join(glob.escape(projects), glob.escape(name[:200]) + "-*"))
+        name = (os.path.basename(found[0]) if len(found) == 1
+                else name[:200] + "-rh" + hashlib.sha256(default.encode()).hexdigest()[:8])
+    extra["autoMemoryDirectory"] = os.path.join(projects, name, "memory")
+print(json.dumps(extra)[1:-1])' "$5" "$6" "$7") || return 1
+  # Flag settings have higher precedence than project settings. Explicit false keeps the
+  # route and lease hooks active if a project-level setting otherwise disables all hooks.
+  cat > "$1" <<EOF
+{
+  "disableAllHooks": false,
+  "permissions": {
+    "deny": $_wcs_deny
+  },
+  $_wcs_extra,
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_prompt,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_command,
+            "timeout": 15,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": $_wcs_worktree,
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+write_rule() {  # $1=outfile $2=mountpoint $3=agent $4=ui
+  cmds="$(detect_cmds "$2")"
+  {
+    printf '# IMPORTANT - Remote dev harness strict routing rule\n\n'
+    printf "Reply in the language of the user's latest message, not that of these instructions, tool output, or files.\n\n"
+    printf 'Your working directory is an SSHFS mount of files from the project host. File tools edit the mount;\n'
+    if [ "$3" = codex ] && [ "$4" != terminal ]; then
+      printf 'use mcp__remote_harness run for commands on the project host, with cwd relative to the project.\n'
+      printf 'Use the available file tools on the mount. Ordinary remote subagents use the same tools.\n'
+    else
+      printf 'every Bash command is routed to the project host, in the matching directory.\n'
+    fi
+    printf 'Run ordinary relative commands;\n'
+    printf 'do not wrap them in `ssh` or bypass the router. For example:\n\n'
+    printf '%s\n' "$cmds" | while IFS= read -r c; do
+      [ -n "$c" ] && printf '    %s\n' "$c"
+    done
+    printf '\n'
+    printf 'Use relative paths in Bash: absolute mount paths do not exist on the project host. Commands get no stdin and\n'
+    printf 'no PTY; stopping a command or ending the session kills its process tree on the project host.\n'
+    printf 'Internal git and ripgrep calls also run on the project host. If one reports the project host is unreachable,\n'
+    printf 'report the connection problem; do not retry against the mount. If a Bash call is denied, never work\n'
+    printf 'around it by running the project command on this machine.\n'
+    printf '\nHarness failures show only a category, exit code and opaque session ID. Detailed connection logs are private.\n'
+    if [ "${3:-}" = claude ]; then
+      printf 'This session cannot read them; a user who wants details finds them on this server by that session ID.\n'
+    else
+      printf 'Read those logs only when the user explicitly asks for detailed diagnostics; do not inspect them automatically.\n'
+    fi
+    printf 'This is a disclosure policy for the agent, not isolation from other processes running as the same user.\n'
+    if [ "${3:-}" = claude ]; then
+      printf '\nOrdinary and nested subagents work. Do not use Agent Teams or Agent `isolation: worktree`; use a\n'
+      printf 'separate remote-harness session for isolated parallel work.\n'
+      printf '\nA conversation continued from another mount of this project may name paths under that mount; use\n'
+      printf 'the current working directory for them instead.\n'
+    fi
+  } > "$1"
+}
+
+case "${1:-}" in
+  on)
+    # This process only writes harness setup files. The generated launcher scopes its own mask
+    # above, so the eventual agent and project commands keep the caller's file-creation policy.
+    umask 077
+    # Reuse the same allowlist as the local launcher; forwarded environment overrides remote defaults.
+    . "$SCRIPT_DIR/_common.sh"
+    transport_settings_load || { echo 'RH_STATUS=ERROR'; exit 2; }
+    agent="${2:-}"; lp="${3:-}"; ba="${4:-}"; mp="${5:-}"; approval="${6:-0}"; ssh_config="${7:-}"; sid="${8:-}"
+    case "$agent" in claude|codex) ;; *) echo "RH_STATUS=ERROR"; exit 2;; esac
+    ui="${9:-terminal}"
+    if ! validate_launch_ui "$ui" "$agent"; then
+      echo 'RH_STATUS=ERROR'
+      exit 2
+    fi
+    if [ "$agent" = claude ] && [ "$ui" = terminal ] && ! claude_supports_hook_failure; then
+      printf 'remote-harness: Claude Code 2.1.295 or newer is required to block commands when the routing hook fails; upgrade Claude and create a new harness session.\n' >&2
+      echo 'RH_STATUS=ERROR'
+      exit 2
+    fi
+    case "$approval" in 1|yolo) yolo=1; approval=yolo;; auto) yolo=0;; *) yolo=0; approval=normal;; esac
+    [ -n "$lp" ] && [ -n "$ba" ] || { echo "RH_STATUS=ERROR"; exit 2; }
+    [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
+    SD="$(session_dir "$mp" "$sid")"
+    # Reap sessions whose launcher died without cleanup (detached; never delays this launch).
+    if [ -x "$SCRIPT_DIR/session-reaper.sh" ]; then
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "$SCRIPT_DIR/session-reaper.sh" gc </dev/null >/dev/null 2>&1 &
+      else
+        nohup "$SCRIPT_DIR/session-reaper.sh" gc </dev/null >/dev/null 2>&1 &
+      fi
+    fi
+    if [ -f "$SD/session.env" ]; then
+      echo 'RH_STATUS=ERROR'
+      printf 'remote-harness: refusing to overwrite an existing session\n' >&2
+      exit 1
+    fi
+    [ ! -L "${SD%/*}" ] && [ ! -e "$SD" ] && [ ! -L "$SD" ] \
+      && mkdir -p "${SD%/*}" 2>/dev/null && chmod 700 "${SD%/*}" \
+      && mkdir -m 700 "$SD" \
+      || { echo "RH_STATUS=ERROR"; exit 1; }
+    SESSION_LEASE=""
+    if [ -n "$sid" ] && [ -f "${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid/lease.env" ]; then
+      SESSION_LEASE="${RH_HOME:-$HOME/.remote-harness}/.sessions/lease.$sid"
+    fi
+    # Generated entry points only reference this per-session implementation snapshot. Mutable
+    # SSH sockets/known_hosts remain under the separate config runtime, outside this directory.
+    source_scripts="$SCRIPT_DIR"
+    mkdir "$SD/impl" || abort_session
+    impl_sources=() impl_copies=()
+    for impl_file in inject-rule.sh _common.sh route-command.py channel-guard.py warm_pool.py diagnostics.py run-on-project-host.sh project-host-tool.py session-reaper.sh mount-project.sh; do
+      impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+    done
+    if [ "$ui" = paseo ]; then
+      for impl_file in paseo-session.mjs paseo-guard.py native_workspace.py orca_native.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
+    if [ "$ui" = orca ]; then
+      for impl_file in orca-session.py orca_native.py native_workspace.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
+    if [ "$agent" = codex ] && [ "$ui" != terminal ]; then
+      for impl_file in native-codex.py codex-project-tools.py; do
+        impl_sources+=("$source_scripts/$impl_file") impl_copies+=("$SD/impl/$impl_file")
+      done
+    fi
+    # One cp and one chmod for all of them: each extra process costs more than the copy itself.
+    cp "${impl_sources[@]}" "$SD/impl/" && chmod 500 "${impl_copies[@]}" || abort_session
+    SCRIPT_DIR="$SD/impl"
+    if [ -n "$SESSION_LEASE" ]; then
+      RH_REAPER_LIBRARY=1 . "$SCRIPT_DIR/session-reaper.sh" || abort_session
+      unset RH_REAPER_LIBRARY
+      resource_lock || abort_session
+      mount_meta=$(mount_record "$(kv_b64 "$SESSION_LEASE/lease.env" MOUNTPOINT)")
+      if [ -f "$mount_meta" ] && [ -z "$(kv_b64 "$mount_meta" IMPLEMENTATION)" ]; then
+        printf 'IMPLEMENTATION=%s\n' "$(b64_value "$SD/impl")" >> "$mount_meta"
+      fi
+      resource_unlock
+    fi
+    RULE="$SD/rule.md"
+
+    env_out=""; flags_out=""; paseo_launch=""; orca_launch=""; prefix_out=""; control_path=""
+    if [ -n "$ssh_config" ]; then
+      control_path="$(session_control_path "$ssh_config")" || abort_session
+      diagnostic_dir="$(dirname "$ssh_config")/runtime/diagnostics"
+      [ ! -L "$diagnostic_dir" ] && [ ! -L "$diagnostic_dir/public-id" ] \
+        && mkdir -p "$diagnostic_dir" && chmod 700 "$diagnostic_dir" || abort_session
+      [ ! -e "$diagnostic_dir/public-id" ] || [ -f "$diagnostic_dir/public-id" ] || abort_session
+      if [ ! -e "$diagnostic_dir/public-id" ]; then
+        # Bash builtins only: no mktemp or od.
+        diagnostic_temp="$diagnostic_dir/public-id.$$"
+        (set -C; printf '%04x%04x%04x%04x%04x%04x%04x%04x' \
+          "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" \
+          > "$diagnostic_temp") || abort_session
+        ln "$diagnostic_temp" "$diagnostic_dir/public-id" 2>/dev/null || [ -f "$diagnostic_dir/public-id" ] \
+          || { rm -f "$diagnostic_temp"; abort_session; }
+        rm -f "$diagnostic_temp"
+      fi
+      chmod 600 "$diagnostic_dir/public-id" || abort_session
+    fi
+    write_session_meta "$SD" "$agent" "$mp" "$ba" "$ssh_config" "$control_path" \
+      || abort_session
+    write_rule "$RULE" "$mp" "$agent" "$ui" || abort_session
+    if [ -n "$ssh_config" ]; then
+      if write_ssh_wrapper "$SD" "$ba" "$ssh_config"; then
+        env_out="PATH=$(sq "$SD/bin"):\$PATH"
+      fi
+    fi
+    [ -n "$ssh_config" ] && [ -f "$ssh_config" ] \
+      || abort_session
+    [ -x "$SCRIPT_DIR/run-on-project-host.sh" ] \
+      || abort_session
+    # Command guard and tool shims need python3 on this host; without it, routed commands are not
+    # watched and git/rg simply keep their SSHFS behavior.
+    PYTHON3=$(command -v python3 2>/dev/null || true)
+    # RH_WARM_MAX=0 turns the warm channel pool off; it also needs python3 here.
+    warm_socket="" warm_control=""
+    if [ -n "$PYTHON3" ] && [ "${RH_WARM_MAX:-9}" != 0 ]; then
+      session_warm_paths "$ssh_config" "$sid" || abort_session
+    fi
+    runner=$(write_session_runner "$SD" "$ba" "$lp" "$ssh_config" "$control_path" "$PYTHON3" "$warm_socket") \
+      || abort_session
+    launcher=$(write_session_launcher "$SD" "$PYTHON3" "$warm_socket" "$warm_control" "$ssh_config" "$ba") \
+      || abort_session
+    prefix_out="$(sq "$launcher")"
+    rg_shim=0
+    if [ -n "$PYTHON3" ] && [ -f "$SCRIPT_DIR/project-host-tool.py" ]; then
+      real_git=$(command -v git 2>/dev/null || true)
+      write_tool_shim "$SD" git "$real_git" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" \
+        || abort_session
+      # Only shim rg when a real one exists here, so calls outside the project keep working. A
+      # native Claude install embeds ripgrep and serves it when invoked with argv0 `rg`.
+      real_rg=$(command -v rg 2>/dev/null || true)
+      rg_argv0=""
+      case "$real_rg" in /*) ;; *) real_rg="";; esac
+      # Standalone Codex ships rg beside bin/ in codex-path/, but that directory need not be in
+      # the SSH login shell's PATH yet. Resolve the CLI symlink without changing its installation.
+      if [ -z "$real_rg" ] && [ "$agent" = codex ]; then
+        codex_bin=$(command -v codex 2>/dev/null || true)
+        case "$codex_bin" in
+          /*)
+            codex_real=$("$PYTHON3" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$codex_bin")
+            codex_rg="$(dirname "$(dirname "$codex_real")")/codex-path/rg"
+            # Probes read the whole output before grep: under pipefail, `cmd | grep -q` fails when
+            # grep's early exit stops cmd with SIGPIPE, although the line was there.
+            if [ -x "$codex_rg" ] && grep -q '^ripgrep ' <<<"$("$codex_rg" --version </dev/null 2>/dev/null)"; then
+              real_rg="$codex_rg"
+            fi
+            ;;
+        esac
+      fi
+      if [ -z "$real_rg" ] && [ "$agent" = claude ]; then
+        claude_bin=$(command -v claude 2>/dev/null || true)
+        case "$claude_bin" in
+          /*)
+            if grep -q '^ripgrep ' <<<"$(exec -a rg "$claude_bin" --version </dev/null 2>/dev/null)"; then
+              real_rg="$claude_bin"; rg_argv0=rg
+            fi
+            ;;
+        esac
+      fi
+      if [ -n "$real_rg" ]; then
+        write_tool_shim "$SD" rg "$real_rg" "$ba" "$lp" "$mp" "$ssh_config" "$control_path" "$rg_argv0" \
+          || abort_session
+        rg_shim=1
+      fi
+    fi
+    if [ "$agent" = claude ] || [ "$agent:$ui" = codex:terminal ]; then
+      [ -n "$PYTHON3" ] && [ -x "$PYTHON3" ] \
+        || abort_session
+      [ -x "$SCRIPT_DIR/route-command.py" ] \
+        || abort_session
+      hook_command="$(sq "$PYTHON3") $PY_FLAGS $(sq "$SCRIPT_DIR/route-command.py") --runner $(sq "$runner") --mount-root $(sq "$mp") --agent $agent"
+      [ "$ui:$agent" != orca:claude ] || hook_command="$hook_command --ui orca"
+      reply_hook=$(write_reply_language_hook "$SD" "$REPLY_LANGUAGE_NOTE") \
+        || abort_session
+    fi
+    case "$agent" in
+      claude)
+        CLAUDE_SETTINGS="$SD/claude-settings.json"
+        worktree_blocker=$(write_claude_worktree_blocker "$SD") \
+          || abort_session
+        # The launcher's default mountpoint for this project, as in laptop-setup.sh.
+        default_mp="${lp%"${lp##*[!/]}"}"
+        default_mp="${default_mp##*/}"
+        [ -z "$default_mp" ] || default_mp="${RH_HOME:-$HOME/.remote-harness}/mounts/$default_mp"
+        write_claude_settings "$CLAUDE_SETTINGS" "$hook_command" "$worktree_blocker" "$reply_hook" "$runner" \
+          "$mp" "$default_mp" || abort_session
+        env_out="${env_out:+$env_out }CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=0"
+        # Bash edit diff learns what a command changed from inotify watches on every work-tree
+        # directory of the mount. Routed commands change files on the project host, which SSHFS never
+        # reports as inotify events, so the diff stays empty while each directory costs a synchronous
+        # FUSE round trip on Claude's main thread. Off by default; the prefix is expanded after the
+        # remote login shell's startup files, so a value the user exports there wins.
+        env_out="$env_out CLAUDE_CODE_BASH_EDIT_DIFF=\${CLAUDE_CODE_BASH_EDIT_DIFF:-0}"
+        # Grep/Glob/file suggestions use the PATH rg (the session shim) instead of the bundled one.
+        [ "$rg_shim" = 1 ] && env_out="$env_out USE_BUILTIN_RIPGREP=0"
+        flags_out="--append-system-prompt-file $(sq "$RULE") --settings $(sq "$CLAUDE_SETTINGS")"
+        if [ "$ui" = terminal ] && [ "$approval" = auto ]; then
+          if grep -q '"auto"' <<<"$(claude --help 2>/dev/null)"; then
+            flags_out="$flags_out --permission-mode auto"
+          else
+            approval=normal
+          fi
+        fi
+        ;;
+      codex)
+        if [ "$ui" = terminal ]; then
+          dev_cfg="developer_instructions=$(toml_basic_string_file "$RULE")"
+          hook_cfg="hooks.PreToolUse=[{matcher=\"^Bash\$\",hooks=[{type=\"command\",command=\"$(toml_escape_value "$hook_command")\",timeout=15,statusMessage=\"Routing command to project host\"}]}]"
+          prompt_cfg="hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"$(toml_escape_value "$reply_hook")\",timeout=5}]}]"
+          flags_out="-c $(sq "$dev_cfg") -c $(sq "$hook_cfg") -c $(sq "$prompt_cfg") --dangerously-bypass-hook-trust"
+          # Pin the shell-tool PATH after Codex builds its subprocess environment. Login/profile
+          # initialization could otherwise move a bundled rg or system git ahead of the shims.
+          tool_path_cfg="shell_environment_policy.set.PATH=\"$(toml_escape_value "$SD/bin:$PATH")\""
+          flags_out="$flags_out -c $(sq "$tool_path_cfg") -c allow_login_shell=false -c shell_environment_policy.experimental_use_profile=false"
+          if [ "$approval" = auto ]; then
+            # This preset selects workspace-write and on-request approvals with automatic review.
+            # Codex rejects combining it with --sandbox or --ask-for-approval.
+            if grep -q -- '--approve-for-me' <<<"$(codex --help 2>/dev/null)"; then
+              flags_out="$flags_out --approve-for-me"
+            else
+              approval=normal
+            fi
+          fi
+          if [ "$approval" = normal ]; then
+            # An explicit normal choice (or unsupported-auto fallback) must ask the user even if their
+            # personal config selects never or an automatic reviewer.
+            flags_out="$flags_out -s workspace-write -a on-request -c $(sq 'approvals_reviewer="user"')"
+          fi
+          # Both sandboxed modes need network for the runner's SSH and write access to temporary SSH
+          # state, never ~/.ssh or the session's hooks. The preset above explicitly selects
+          # workspace-write too, so these settings apply to auto without a conflicting -s flag.
+          # YOLO's --dangerously-bypass-approvals-and-sandbox is supplied by laptop-setup.sh.
+          if [ "$yolo" != 1 ]; then
+            roots_cfg="$(codex_writable_roots_cfg "$ssh_config")" \
+              || abort_session
+            flags_out="$flags_out -c sandbox_workspace_write.network_access=true -c $(sq "$roots_cfg")"
+          fi
+        fi
+        ;;
+    esac
+    if [ "$ui" = paseo ]; then
+      node_bin=$(command -v node 2>/dev/null)
+      if [ -z "$node_bin" ] || [ ! -x "$node_bin" ]; then
+        printf '%s\n' 'remote-harness: --ui paseo requires Node.js on the agent host' >&2
+        abort_session
+      fi
+      paseo_launch="$(sq "$node_bin") $(sq "$SCRIPT_DIR/paseo-session.mjs") $(sq "$approval") $(sq "$PYTHON3") $(sq "$agent")"
+      flags_out=""
+    elif [ "$ui" = orca ]; then
+      printf '%s' "${lp##*/}" > "$SD/orca-project-title" || abort_session
+      # Records which project a new chat belongs to, so only its own launches offer to continue it.
+      printf '%s' "$lp" > "$SD/orca-project" || abort_session
+      orca_launch="$(sq "$PYTHON3") -EsB $(sq "$SCRIPT_DIR/orca-session.py") $(sq "$approval") $(sq "$PYTHON3") $(sq "$agent")"
+      flags_out=""
+    fi
+    resume_out=""; resume_args=""
+    if [ "$ui" = terminal ]; then
+      resume_out=$("$SCRIPT_DIR/session-reaper.sh" resume-take "$SD" 2>/dev/null | sed -n 's/^RESUME=//p')
+      case "$agent" in codex) resume_args="resume --last";; *) resume_args="--continue";; esac
+    fi
+    # Every process's arguments, the agent's own Bash commands among them, are readable by all users
+    # unless /proc is mounted with hidepid. Tell the laptop when other users have accounts or
+    # processes here; only an administrator can change it.
+    shared_ps=0
+    me=$(id -u 2>/dev/null) || me=""
+    if [ -n "$me" ] && [ -r /proc/mounts ] && ! awk '$2 == "/proc" && $3 == "proc" && $4 ~ /(^|,)hidepid=(1|2|noaccess|invisible)(,|$)/ { f = 1 }
+                                     END { exit !f }' /proc/mounts 2>/dev/null; then
+      { ps -e -o uid= 2>/dev/null; awk -F: '$7 !~ /(nologin|false)$/ { print $3 }' /etc/passwd 2>/dev/null; } \
+        | awk -v me="$me" '$1 >= 1000 && $1 < 65534 && $1 != me { f = 1 } END { exit !f }' && shared_ps=1
+    fi
+    printf 'RH_STATUS=INJECTED\n'
+    printf 'RH_RESUME_AVAILABLE=%s\n' "$resume_out"
+    printf 'RH_RESUME_ARGS=%s\n' "$resume_args"
+    printf 'RH_LAUNCH_ENV=%s\n'   "$env_out"
+    printf 'RH_LAUNCH_FLAGS=%s\n' "$flags_out"
+    printf 'RH_APPROVAL=%s\n' "$approval"
+    printf 'RH_PROCESS_LIST_SHARED=%s\n' "$shared_ps"
+    printf 'RH_LAUNCH_PREFIX=%s\n' "$prefix_out"
+    printf 'RH_SESSION_DIR=%s\n' "$SD"
+    [ -z "$paseo_launch" ] || printf 'RH_PASEO_LAUNCH=%s\n' "$paseo_launch"
+    [ -z "$orca_launch" ] || printf 'RH_ORCA_LAUNCH=%s\n' "$orca_launch"
+    ;;
+  off)
+    mp="${3:-}"; sid="${4:-}"
+    [ -z "$sid" ] || valid_session_id "$sid" || { echo "RH_STATUS=ERROR"; exit 2; }
+    SD="$(session_dir "$mp" "$sid")"
+    # All agents' artifacts (the rule file, settings and hooks) live in the session dir; none of them
+    # touched the mounted repo — so cleanup is just removing that dir.
+    if [ -d "$SD" ]; then
+      # Stop the session's multiplexing master and leftover routed processes, then drop the dir.
+      reaper="$SD/impl/session-reaper.sh"
+      [ -x "$reaper" ] || reaper="$SCRIPT_DIR/session-reaper.sh"
+      if [ -x "$reaper" ]; then
+        RH_HOME="${RH_HOME:-$HOME/.remote-harness}" "$reaper" reap "$SD" --session-only \
+          >/dev/null 2>&1 || { echo RH_STATUS=ERROR; exit 1; }
+      fi
+      [ ! -d "$SD" ] && echo "RH_STATUS=RESTORED" || echo "RH_STATUS=ERROR"
+    else
+      echo "RH_STATUS=NOOP"
+    fi
+    ;;
+  *)
+    echo "usage: inject-rule.sh on <agent> <laptop_path> <box_alias> <box_mountpoint> [0|1|auto] [ssh_config] [session_id] [terminal|paseo|orca] | off <agent> <box_mountpoint> [session_id]" >&2
+    echo "RH_STATUS=ERROR"; exit 2;;
+esac

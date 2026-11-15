@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 DISPATCHER = ROOT / 'scripts' / 'run-on-project-host.sh'
 METADATA_VARS = ('SSH_CLIENT', 'SSH_CONNECTION', 'SSH_TTY', 'SSH_ORIGINAL_COMMAND',
-                 'RH_GATEWAY_SESSION_DIR', 'HOSTNAME', 'HOST')
+                 'RH_GATEWAY_SESSION_DIR')
 
 
 def encoded(value):
@@ -171,7 +171,7 @@ umask 027
 
     def test_readonly_profile_metadata_fails_cleanly_before_command(self):
         with self.profile.open('a') as profile:
-            profile.write('readonly HOSTNAME\n')
+            profile.write('readonly SSH_TTY\n')
         for snapshot_disabled in (False, True):
             with self.subTest(snapshot_disabled=snapshot_disabled):
                 if snapshot_disabled:
@@ -191,6 +191,57 @@ umask 027
         self.assertEqual(self.flags(), ['-lc'])
         self.assertFalse(self.snapshot.exists())
 
+    def test_session_timezone_wins_after_profile_snapshot_and_fallback(self):
+        (self.session / 'session-timezone').write_text('Asia/Seoul')
+        with self.profile.open('a') as profile:
+            profile.write('export TZ=Asia/Hong_Kong TZDIR=/missing-zoneinfo\n')
+        command = 'printf "%s|%s|" "$TZ" "${TZDIR-unset}"; date +%z'
+        for fallback in (False, False, True):
+            if fallback:
+                (self.session / 'shell-snapshot.off').touch()
+            result = subprocess.run(['sh', str(DISPATCHER), '--dispatch', encoded(self.project),
+                                     encoded('.'), encoded(command)], env=self.env,
+                                    capture_output=True, text=True, timeout=8)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, 'Asia/Seoul|unset|+0900\n', ''))
+
+    def test_readonly_timezone_stops_before_command(self):
+        (self.session / 'session-timezone').write_text('Asia/Seoul')
+        with self.profile.open('a') as profile:
+            profile.write('readonly TZ=Asia/Hong_Kong\n')
+        for fallback in (False, True):
+            if fallback:
+                (self.session / 'shell-snapshot.off').touch()
+            result = subprocess.run(['sh', str(DISPATCHER), '--dispatch', encoded(self.project),
+                                     encoded('.'), encoded('printf executed')], env=self.env,
+                                    capture_output=True, text=True, timeout=8)
+            self.assertEqual(result.returncode, 125)
+            self.assertEqual(result.stdout, '')
+
+    def test_explicit_project_timezone_is_preserved(self):
+        (self.session / 'session-timezone').write_text('Asia/Seoul')
+        result = subprocess.run(['sh', str(DISPATCHER), '--dispatch', encoded(self.project),
+                                 encoded('.'), encoded('TZ=UTC date +%z')], env=self.env,
+                                capture_output=True, text=True, timeout=8)
+        self.assertEqual((result.returncode, result.stdout), (0, '+0000\n'))
+
+    def test_v3_display_never_overrides_project_identity_or_login_timezone(self):
+        (self.session / 'presentation-v3').write_text('3')
+        (self.session / 'project-timezone').write_text('')
+        with self.profile.open('a') as profile:
+            profile.write('export TZ=Asia/Hong_Kong\n')
+            profile.write('export HOSTNAME=project-real.example\n')
+        command = 'printf "%s|%s|" "$HOSTNAME" "$TZ"; date +%z'
+        for fallback in (False, False, True):
+            if fallback:
+                (self.session / 'shell-snapshot.off').touch()
+            result = subprocess.run(['sh', str(DISPATCHER), '--dispatch', encoded(self.project),
+                encoded('.'), encoded(command)], env=self.env, capture_output=True, text=True, timeout=8)
+            self.assertEqual((result.returncode, result.stdout), (0, 'project-real.example|Asia/Hong_Kong|+0800\n'))
+        (self.session / 'project-timezone').write_text('Asia/Seoul')
+        result = subprocess.run(['sh', str(DISPATCHER), '--dispatch', encoded(self.project),
+            encoded('.'), encoded('TZ=UTC date +%z')], env=self.env, capture_output=True, text=True, timeout=8)
+        self.assertEqual((result.returncode, result.stdout), (0, '+0000\n'))
+
     def test_profile_nounset_preserves_clean_command_environment(self):
         with self.profile.open('a') as profile:
             profile.write('set -u\n')
@@ -199,11 +250,14 @@ umask 027
     def test_direct_git_helper_receives_developer_environment_without_metadata(self):
         if not shutil.which('git'):
             self.skipTest('git is not installed')
+        (self.session / 'session-timezone').write_text('Asia/Seoul')
+        self.env.update(TZ='Asia/Hong_Kong', TZDIR='/missing-zoneinfo')
         helper = self.home / '.local' / 'bin' / 'git-rh-metadata'
         helper.parent.mkdir(parents=True)
         helper.write_text(f'''#!{sys.executable}
 import json, os, sys
 print(json.dumps({{'metadata': {{key: os.environ.get(key) for key in {METADATA_VARS!r}}},
+                  'timezone': [os.environ.get('TZ'), os.environ.get('TZDIR')],
                   'kept': {{key: os.environ.get(key) for key in {tuple(self.kept_env)!r}}},
                   'credentials': {{key: os.environ.get(key) for key in ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY')}}}},
                  sort_keys=True))
@@ -217,6 +271,7 @@ sys.exit(23)
                                 capture_output=True, timeout=8)
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(result.stdout, json.dumps({
+            'timezone': ['Asia/Seoul', None],
             'metadata': dict.fromkeys(METADATA_VARS), 'kept': self.kept_env,
             'credentials': {'OPENAI_API_KEY': None, 'ANTHROPIC_API_KEY': None}},
             sort_keys=True) + '\n')

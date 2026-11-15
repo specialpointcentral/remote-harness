@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from orca_native import LEASE, OrcaError, active_lease, private_json
+from orca_native import LEASE, OrcaError, active_lease, private_json, session_presentation
 
 MAX_CONTENT = 512 * 1024
 MAX_OUTPUT = 128 * 1024
@@ -84,6 +84,7 @@ class ProjectTools:
         self.lease = session / lease_name
         self.token = token
         lease = self.check()
+        session_presentation(session, lease)  # Validate once at startup; project results stay original.
         self.mount = Path(lease["cwd"]).resolve(strict=True)
         self.approval = lease["approval"]
         account = private_json(session / "codex-home" / "harness-account.json")
@@ -151,12 +152,12 @@ class ProjectTools:
                     if not select.select([child.stdout], [], [], 0.2)[0]:
                         continue
                     chunk = os.read(child.stdout.fileno(), 65536)
-                    if not chunk:
-                        break
                     tail.extend(chunk)
                     if len(tail) > MAX_OUTPUT:
                         truncated = True
                         del tail[:-MAX_OUTPUT]
+                    if not chunk:
+                        break
                 status = child.wait(timeout=2)
             finally:
                 if child.poll() is None:

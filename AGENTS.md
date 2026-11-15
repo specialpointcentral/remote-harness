@@ -22,6 +22,9 @@ it provides files over SSHFS and executes project commands through a forced gate
   `paseo-guard.py` / `orca-claude.py` protect Claude tool calls. `native-codex.py` binds the
   Codex app server to the chat's private lease, and `codex-project-tools.py` provides its routed tools.
 - `scripts/channel-guard.py`: holds a routed Bash command's SSH channel open for its lifetime.
+- `scripts/session_privacy.py`: v3 real center profile and presentation-ID/binding cache;
+  no project source mapping or result replacement. `project-session-info.sh` owns the private table
+  on the project host and provides the approved `rh-session-info` session view.
 - `scripts/warm_pool.py`: per-session pool of channels opened ahead of time on the gateway's wait
   verb (`serve`), and the client half channel-guard and the tool shim use.
 - `reference/` and `docs/`: English Markdown has matching `.cn.md` documentation.
@@ -92,10 +95,26 @@ it provides files over SSHFS and executes project commands through a forced gate
   command in default/acceptEdits/dontAsk mode (never auto). Rule files are re-read only when their
   identity changes. Terminal Codex checks the original itself: its rewrite repeats it on a new line
   after `exit`, which the shell never parses, and Codex's exec policy (`.rules`, forced `rm`) reads it.
-- Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc`. `rh-session` blanks the
-  laptop's address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Linux sshfs mounts use
-  `fsname=remote-harness` and keep their source in the mount record; `mounts` is owner-only. Shim
-  stderr maps the project root back to the mount.
+- Claude sessions deny Read/Edit on `$RH_HOME/.sessions` and Read on `/proc` and host metadata files
+  (including timezone/localtime and resolved targets). `rh-session` blanks all addresses and ports
+  in `SSH_CONNECTION`/`SSH_CLIENT`. v3 displays the authenticated center's real hostname, machine
+  ID, effective TZ/TZDIR and verified identity address. Only the project host owns and executes the
+  private fixed table; the center caches target profile, presentation UUID and binding digests.
+  `rh-session-info` runs through ordinary approved exec and returns `view=session`; no output body
+  can declare itself trusted. Preserve commands, paths, destinations, business data, diagnostics,
+  project HOSTNAME/HOST/TZ and SSHFS/SFTP bytes. `--project-timezone` / `RH_PROJECT_TZ` explicitly
+  overrides only project execution. v3 rejects legacy `--session-timezone` / `RH_SESSION_TZ`;
+  existing frozen v2 sessions keep their old semantics. Native claim/adopt retains presentation
+  identity; Claude disconnect recovery names the exact UUID. Generic terminal Codex `resume --last`
+  is refused because it cannot establish that binding; native Codex keeps its registered thread.
+  Missing optional fields are not invented. The first adapter reports timestamp_conversion=false
+  and preserves every timestamp group. New native leases carry an explicit presentation policy
+  version; a missing policy cannot downgrade them. Pre-policy live sessions require a known private
+  read-only injector snapshot and retain their original environment and frozen MCP implementation.
+  Select/bind use the injector-returned absolute Python and frozen script paths. Preserve raw POSIX
+  TZ strings and safe custom zone filenames; validate TZDIR separately. Linux sshfs uses
+  fsname=remote-harness, keeps its source in
+  the owner-only mount record, and shim stderr maps project root back to the mount.
 
 ## Gateway Security
 

@@ -14,6 +14,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -147,9 +148,14 @@ class OrcaLiveTests(unittest.TestCase):
                 ["python3", "-I", "-S", str(self.scripts / "orca_native.py"), "reserve", str(self.rh), label],
                 env=self.env, text=True, timeout=10).strip())
         else:
-            mount = Path(subprocess.check_output(
+            claimed = subprocess.run(
                 ["python3", "-EsB", str(self.scripts / "orca-session.py"), "claim", str(self.rh), "claude",
-                 label, launch, "/local/project"], env=self.env, text=True, timeout=20).strip().removeprefix("MOUNTPOINT="))
+                 label, launch, "/local/project"], env=dict(self.env, RH_REQUIRE_PRESENTATION_V3='1'),
+                text=True, capture_output=True, timeout=20)
+            self.assertEqual(claimed.returncode, 0, claimed.stderr)
+            claimed_values = dict(line.split('=', 1) for line in claimed.stdout.splitlines())
+            self.assertIn('PRESENTATION_ID', claimed_values)
+            mount = Path(claimed_values['MOUNTPOINT'])
         transport = self.rh / ".sessions" / "transport"
         transport.mkdir(parents=True, exist_ok=True)
         (transport / "ssh_config").touch()
@@ -159,6 +165,15 @@ class OrcaLiveTests(unittest.TestCase):
             env=self.env, text=True, capture_output=True, timeout=20)
         self.assertEqual(started.returncode, 0, started.stderr)
         values = dict(line.split("=", 1) for line in started.stdout.splitlines())
+        from fixtures.privacy import bind_v3
+        session = Path(values["RH_SESSION_DIR"])
+        requested = None
+        for record in (self.rh / '.orca-identities').glob('*.json'):
+            data = json.loads(record.read_text())
+            if data.get('session') == session.name:
+                requested = data.get('presentation_id')
+                self.assertIsNotNone(requested, 'A v3 fixture cannot upgrade an unbound legacy chat')
+        bind_v3(session, self.rh, project='/local/project', presentation_id=requested)
         command = ("export " + values["RH_LAUNCH_ENV"] + "; exec " + values["RH_LAUNCH_PREFIX"]
                    + " " + values["RH_ORCA_LAUNCH"])
         log = self.home / f"bridge-{label}.log"
@@ -294,8 +309,19 @@ class OrcaLiveTests(unittest.TestCase):
 
     def test_orca_continues_a_terminal_conversation_in_a_new_chat(self):
         # The conversation a terminal launch of /local/project left at its default mount.
-        provider = str(uuid.uuid4())
         default = self.rh / "mounts" / "project"
+        from unittest.mock import patch
+        from fixtures.privacy import bind_v3
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+        from session_privacy import capture, private_json
+        seed = self.rh / '.sessions' / 'terminal-presentation'
+        seed.mkdir(mode=0o700, parents=True)
+        with patch.dict(os.environ, self.env, clear=True):
+            capture(seed / 'privacy.json', '', str(default))
+        provider = private_json(seed / 'privacy.json')['presentation_id']
+        bind_v3(seed, self.rh, project='/local/project')
+        shutil.rmtree(seed)
         key = "".join(char if char.isalnum() else "-" for char in str(default))
         transcript = self.home / ".claude" / "projects" / key / f"{provider}.jsonl"
         transcript.parent.mkdir(parents=True)
@@ -311,9 +337,12 @@ class OrcaLiveTests(unittest.TestCase):
                          [[f"RH_TERMINAL_CHAT={provider}", "asked in the terminal"]])
         adopted = subprocess.run(["python3", "-EsB", str(self.scripts / "orca-session.py"), "adopt",
                                   str(self.rh), "claude", provider, "adopted", "/local/project"],
-                                 env=self.env, text=True, capture_output=True, timeout=20)
+                                 env=dict(self.env, RH_REQUIRE_PRESENTATION_V3='1'),
+                                 text=True, capture_output=True, timeout=20)
         self.assertEqual(adopted.returncode, 0, adopted.stderr)
-        mount = Path(adopted.stdout.strip().removeprefix("MOUNTPOINT="))
+        adopted_values = dict(line.split('=', 1) for line in adopted.stdout.splitlines())
+        self.assertEqual(adopted_values['PRESENTATION_ID'], provider)
+        mount = Path(adopted_values['MOUNTPOINT'])
         # Orca resumes only a conversation recorded in the chat's folder, so the chat resumes a copy.
         (copy,) = [path.stem for path in (self.rh / ".orca-identities").glob("*.json")
                    if json.loads(path.read_text()).get("from") == provider]

@@ -8,7 +8,7 @@ import sys
 
 from native_workspace import CHAT_REQUIRED, protected
 from orca_native import (SESSION_NAME, OrcaError, SessionEnded, active_lease, check_version,
-                         claude_command, live_session, private_json)
+                         claude_command, live_session, private_json, session_presentation)
 
 SESSION_ENV = "RH_CLAUDE_SESSION"
 TOKEN_ENV = "RH_CLAUDE_TOKEN"
@@ -56,9 +56,14 @@ def main():
     check_version(command)
     env = os.environ.copy()
     env.update(lease["env"])
-    for key in (SESSION_ENV, TOKEN_ENV, "SSH_CONNECTION", "SSH_CLIENT"):
+    presentation = session_presentation(session, lease)
+    keys = (SESSION_ENV, TOKEN_ENV, "SSH_CONNECTION", "SSH_CLIENT")
+    if presentation.version:
+        keys += ("TZ", "TZDIR")
+    for key in keys:
         if key not in lease["env"]:
             env.pop(key, None)
+    presentation.environment(env)
     os.execve(command, [str(command), *args], env)
 
 

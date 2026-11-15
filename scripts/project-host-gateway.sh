@@ -102,6 +102,8 @@ case "$original" in
     case "$4" in git|rg) ;; *) fail "unsupported project tool" ;; esac
     case "$5" in -) ;; ""|*[!A-Za-z0-9+/=,]*) fail "invalid tool argument encoding" ;; esac
     require_session_root "$2"
+    RH_GATEWAY_SESSION_DIR=$session_dir
+    export RH_GATEWAY_SESSION_DIR
     exec "$dispatcher" --dispatch-tool "$2" "$3" "$4" "$5"
     ;;
   internal-sftp|internal-sftp\ *|sftp-server|sftp-server\ *|/usr/libexec/sftp-server|/usr/libexec/sftp-server\ *|/usr/lib/openssh/sftp-server|/usr/lib/openssh/sftp-server\ *)

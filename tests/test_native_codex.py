@@ -14,6 +14,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 
 from fixtures.codex_native_model import CHILD_PATH, Model
+from fixtures.privacy import policy
 
 from test_paseo import PaseoFixture, SCRIPTS
 
@@ -22,7 +23,7 @@ from test_paseo import PaseoFixture, SCRIPTS
 def prepare_proxy(fixture, cli, account_config):
     scripts = fixture.rh / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("native-codex.py", "orca_native.py", "native_workspace.py"):
+    for name in ("native-codex.py", "orca_native.py", "native_workspace.py", "session_privacy.py"):
         shutil.copy2(SCRIPTS / name, scripts / name)
     sys.path.insert(0, str(scripts))
     from orca_native import process_identity
@@ -31,10 +32,11 @@ def prepare_proxy(fixture, cli, account_config):
     sessions.mkdir(mode=0o700)
     session = sessions / "paseo-codex"
     session.mkdir(mode=0o700)
+    policy(session)
     (session / "bin").mkdir()
     impl = session / "impl"
     impl.mkdir()
-    for name in ("codex-project-tools.py", "orca_native.py", "route-command.py",
+    for name in ("codex-project-tools.py", "orca_native.py", "session_privacy.py", "route-command.py",
                  "run-on-project-host.sh"):
         shutil.copy2(SCRIPTS / name, impl / name)
     (session / "rule.md").write_text("This is the private Harness routing rule.")
@@ -63,7 +65,7 @@ class NativeCodexTests(PaseoFixture):
     def test_orca_extra_chats_are_blocked_before_codex_starts(self):
         scripts = self.rh / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("native-codex.py", "orca_native.py", "native_workspace.py"):
+        for name in ("native-codex.py", "orca_native.py", "native_workspace.py", "session_privacy.py"):
             shutil.copy2(SCRIPTS / name, scripts / name)
         cli = self.script("codex", 'touch "$HOME/codex-started"\n')
         config = self.rh / "codex.json"
@@ -127,7 +129,7 @@ class NativeCodexTests(PaseoFixture):
     def test_codex_cli_patch_policy(self):
         scripts = self.rh / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("native-codex.py", "orca_native.py", "native_workspace.py"):
+        for name in ("native-codex.py", "orca_native.py", "native_workspace.py", "session_privacy.py"):
             shutil.copy2(SCRIPTS / name, scripts / name)
         config = self.rh / "codex.json"
         cli = self.home / "codex-version"
@@ -179,7 +181,8 @@ class NativeCodexTests(PaseoFixture):
         session = self.home / "session"
         impl = session / "impl"
         impl.mkdir(parents=True)
-        for name in ("codex-project-tools.py", "orca_native.py", "route-command.py",
+        policy(session)
+        for name in ("codex-project-tools.py", "orca_native.py", "session_privacy.py", "route-command.py",
                      "run-on-project-host.sh"):
             source = SCRIPTS / name
             if source.exists():
@@ -240,6 +243,20 @@ printf '{"matchedRules":[]}\n'
                 self.assertEqual((mount / "sub" / "edited").read_text(), "routed file edit")
                 self.assertEqual(tool(4, "read_file", path="sub/edited")["content"][0]["text"],
                                  "routed file edit")
+                private = '203.0.113.45 agent-hk-private.example Asia/Hong_Kong'
+                self.assertFalse(tool(10, "write_file", path="sub/private", content=private)["isError"])
+                self.assertEqual((mount / "sub" / "private").read_text(), private)
+                self.assertEqual(tool(11, "read_file", path="sub/private")["content"][0]["text"],
+                                 private)
+                # Project output is preserved, including identifiers across the tail's cut.
+                (runner / "rh-run").write_text(
+                    f'#!{sys.executable}\nimport sys\nsys.stdout.write("203.0.113.45 " + "x" * (128*1024-5))\n'
+                    'raise SystemExit(17)\n')
+                filtered = tool(12, "run", command="printf large")
+                self.assertTrue(filtered["isError"])
+                self.assertIn('Exit code: 17', filtered["content"][0]["text"])
+                self.assertEqual(filtered["content"][0]["text"][:55],
+                                 ('Exit code: 17\n[Earlier output truncated]\n3.45 ' + 'x' * 20)[:55])
                 (mount / "link").symlink_to(self.home, target_is_directory=True)
                 self.assertTrue(tool(5, "write_file", path="link/outside", content="no")["isError"])
                 self.assertFalse((self.home / "outside").exists())
@@ -261,7 +278,9 @@ printf '{"matchedRules":[]}\n'
 import json, os, sys
 for line in sys.stdin:
     frame = json.loads(line)
-    response = {"frame": frame, "codexHome": os.environ["CODEX_HOME"], "pid": os.getpid()}
+    response = {"frame": frame, "codexHome": os.environ["CODEX_HOME"], "pid": os.getpid(),
+                "timezone": os.environ.get("TZ"), "tzdir": os.environ.get("TZDIR"),
+                "hostname": os.environ.get("HOSTNAME")}
     if frame.get("method") == "thread/start":
         response["thread"] = {"id": "private-thread"}
     print(json.dumps({"id": frame["id"], "result": response}), flush=True)
@@ -275,7 +294,22 @@ exec {sys.executable!r} {str(fake)!r}
             self, cli, 'model = "fixture"\nmodel_provider = "fixture-provider"\n'
                        '[features]\ncode_mode = true\n'
                        '[mcp_servers.unsafe]\ncommand = "/bin/sh"\n')
+        # The actual native process must restore a v3 center snapshot after the daemon overlay.
+        from unittest.mock import patch
+        from session_privacy import capture
+        from fixtures.privacy import bind_v3
+        cache = lease.parent / 'privacy.json'
+        legacy = getattr(self, 'legacy_presentation', False)
+        if legacy:
+            from fixtures.privacy import pre_policy_snapshot
+            pre_policy_snapshot(lease.parent)
+        else:
+            cache.unlink()
+            with patch.dict(os.environ, {'TZ': 'Asia/Seoul'}, clear=True):
+                capture(cache, '', str(mount))
+            bind_v3(lease.parent, self.rh)
         original = self.home / "account" / "config.toml"
+        self.env.update(TZ="Asia/Hong_Kong", TZDIR="/daemon/zoneinfo", HOSTNAME="agent-hk-private.example")
         with subprocess.Popen(
             launch, env=self.env,
             text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -293,11 +327,22 @@ exec {sys.executable!r} {str(fake)!r}
                     "config": {"features.shell_tool": True, "mcp_servers": {"unsafe": {}}},
                 })["result"]
                 backend = started["pid"]
+                if legacy:
+                    self.assertEqual(started['timezone'], self.env['TZ'])
+                    self.assertEqual(started['tzdir'], self.env['TZDIR'])
+                    self.assertEqual(started['hostname'], self.env['HOSTNAME'])
+                else:
+                    self.assertEqual(started["timezone"], "Asia/Seoul")
+                    self.assertIsNone(started["tzdir"])
+                    import socket
+                    self.assertEqual(started["hostname"], socket.gethostname())
                 settings = Path(started["codexHome"]) / "config.toml"
                 self.assertNotEqual(settings, original)
                 self.assertNotIn("unsafe", settings.read_text())
                 import tomllib
                 config = tomllib.loads(settings.read_text())
+                self.assertEqual(config['mcp_servers']['remote_harness']['args'][1],
+                                 str(lease.parent / 'impl' / 'codex-project-tools.py'))
                 self.assertFalse(config["features"]["code_mode"]["enabled"])
                 self.assertTrue(config["features"]["multi_agent_v2"])
                 self.assertEqual((config["model"], config["model_provider"]),
@@ -330,6 +375,10 @@ exec {sys.executable!r} {str(fake)!r}
                                env=self.env, input="", capture_output=True, text=True, timeout=5)
         self.assertNotEqual(stale.returncode, 0)
         self.assertEqual(stale.stdout, "")
+
+    def test_live_pre_policy_codex_keeps_legacy_environment_and_frozen_mcp(self):
+        self.legacy_presentation = True
+        self.test_app_server_pins_policy_and_exits_when_the_live_lease_is_revoked()
 
     @unittest.skipUnless(sys.version_info >= (3, 11), "requires Python 3.11+")
     def test_orca_chat_keeps_its_conversation_for_a_later_session(self):

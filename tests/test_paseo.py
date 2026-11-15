@@ -50,17 +50,18 @@ class PaseoOptionTests(PaseoFixture):
         for name in ('simple-bootstrap.sh', 'simple-dispatch.sh', 'simple-laptop-setup.sh', '_common.sh'):
             shutil.copy2(SCRIPTS / name, local)
         self.script('ssh', "printf 'PORT=27678\\nCONFIG=/remote/ssh_config\\n'\n")
-        shutil.copy2(self.script('record', 'printf "%s\\n" "$@" > "$HOME/launch"\n'),
+        shutil.copy2(self.script('record', 'printf "%s\\n" "$@" > "$HOME/launch"\nprintf "%s" "$RH_PROJECT_TZ" > "$HOME/timezone"\n'),
                      local / 'laptop-setup.sh')
         self.env.update(RH_SIMPLE_CACHE=str(self.home / 'cache'), RH_LOCAL_SSHD='system')
         result = subprocess.run(
             ['bash', str(local / 'simple-bootstrap.sh'), '--mode', 'reverse', '--via', 'testbox',
-             '--launch', 'claude', '--ui', 'paseo', '--approval', 'normal'],
+             '--launch', 'claude', '--ui', 'paseo', '--approval', 'normal', '--project-timezone', 'Asia/Seoul'],
             cwd=self.home, input='\ny\n', env=self.env, text=True, capture_output=True,
             timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         launch = (self.home / 'launch').read_text().splitlines()
         self.assertEqual(launch[launch.index('--ui') + 1], 'paseo')
+        self.assertEqual((self.home / 'timezone').read_text(), 'Asia/Seoul')
 
     def test_native_ui_rejects_other_providers_before_setup(self):
         self.script('ssh', 'touch "$HOME/ssh-ran"\nexit 1\n')
@@ -134,6 +135,8 @@ fi
         sessions.mkdir(mode=0o700)
         session = sessions / 'bound'
         session.mkdir(mode=0o700)
+        from fixtures.privacy import policy
+        policy(session)
         lease = session / 'paseo-lease.json'
         lease.write_text(json.dumps({'provider': 'claude', 'token': 'test', 'pid': os.getpid(),
                                     'identity': process_identity(os.getpid()),
@@ -156,6 +159,44 @@ fi
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.marker.exists())
         self.assertNotEqual(self.launch('paseo-claude.py', self.mount).returncode, 0)
+
+    def test_live_pre_policy_paseo_provider_keeps_legacy_daemon_environment(self):
+        from fixtures.privacy import pre_policy_snapshot
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+        from orca_native import process_identity
+        session = self.rh / '.sessions' / 'legacy'
+        session.mkdir(mode=0o700, parents=True)
+        session.parent.chmod(0o700)
+        pre_policy_snapshot(session)
+        lease = session / 'paseo-lease.json'
+        lease.write_text(json.dumps({'provider': 'claude', 'token': 'test', 'pid': os.getpid(),
+            'identity': process_identity(os.getpid()), 'cwd': str(self.mount),
+            'env': {'PATH': self.env['PATH']}}))
+        lease.chmod(0o600)
+        settings = session / 'paseo-claude-settings.json'
+        settings.write_text('{"disableAllHooks":false}')
+        settings.chmod(0o600)
+        agent = self.bin / 'agent'
+        agent.write_text(f'''#!/bin/sh
+if [ "$1" = --version ]; then echo '2.1.319 (Claude Code)'; exit; fi
+exec {shlex.quote(sys.executable)} -c 'import json,os; print(json.dumps(dict(os.environ)))'
+''')
+        env = dict(self.env, RH_CLAUDE_SESSION=str(session), RH_CLAUDE_TOKEN='test',
+            TZ='<+03>-3', TZDIR='/daemon/legacy-zones', HOSTNAME='legacy-daemon', SSH_CLIENT='hidden')
+        for _ in range(2):  # a provider restart reuses the same old live lease
+            result = self.launch('paseo-claude.py', self.mount, '--settings', settings.read_text(), env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actual = json.loads(result.stdout)
+            for key in ('TZ', 'TZDIR', 'HOSTNAME'):
+                self.assertEqual(actual[key], env[key])
+            self.assertNotIn('SSH_CLIENT', actual)
+        marker = session / 'presentation-policy.json'
+        marker.write_text('{"version":1,"presentation_policy":3}')
+        marker.chmod(0o600)
+        result = self.launch('paseo-claude.py', self.mount, '--settings', settings.read_text(), env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
 
 
 @unittest.skipUnless(shutil.which('node'), 'Node.js is required for the Paseo bridge')
@@ -193,6 +234,8 @@ class PaseoBridgeTests(PaseoFixture):
         values = dict(line.split('=', 1) for line in result.stdout.splitlines())
         self.assertIn('RH_PASEO_LAUNCH', values, 'injector did not supply a native bridge')
         self.session = Path(values['RH_SESSION_DIR'])
+        from fixtures.privacy import bind_v3
+        bind_v3(self.session, self.rh)
         command = ('export ' + values['RH_LAUNCH_ENV'] + '; exec '
                    + values['RH_LAUNCH_PREFIX'] + ' ' + values['RH_PASEO_LAUNCH'])
         self.log = (self.home / 'bridge.log').open('w+')
@@ -353,6 +396,8 @@ class PaseoNativeRuntimeTests(ClaudeSessionFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in result.stdout.splitlines())
         session = Path(values['RH_SESSION_DIR'])
+        from fixtures.privacy import bind_v3
+        bind_v3(session, Path(self.env['RH_HOME']), project=self.project)
         # Keep the real Claude hook and bridge. Replace only the transport across hosts with
         # a fixed dispatcher into a separate project directory.
         (session / 'bin/rh-run').write_text(

@@ -109,9 +109,60 @@ Agent 主机上的隐私：除非 `/proc` 以 `hidepid` 挂载，该主机上的
 自己执行的 `bash -c '<命令>'`，这与在共享主机上运行任何 Agent 相同；`inject-rule.sh` 会在该主机上有其他
 用户的账号或进程时报告，启动器提示一次。Linux 上的 sshfs 挂载在所有人可读的挂载表中显示固定的 fsname
 `remote-harness`，会话改从私有的挂载记录读取挂载来源。默认挂载点位于仅本人可访问的 `mounts` 目录。Claude
-会话禁止 Read/Edit（同时覆盖 Grep 和 Glob）访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`；`rh-session`
-清除 `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Bash 输出本身会出现项目主机的路径和用户名，并像
-其它工具输出一样进入模型上下文。
+会话禁止 Read/Edit（同时覆盖 Grep 和 Glob）访问 `$RH_HOME/.sessions`，并禁止读取 `/proc` 和主机元数据文件，
+包括 `/etc/timezone`、`/etc/localtime` 及其解析目标、`/etc/hostname`、`/etc/hosts`、机器标识与 DMI 路径。
+`rh-session` 清除 `SSH_CONNECTION`/`SSH_CLIENT` 中的所有地址和端口。native wrapper 合并 daemon
+环境后重新应用中心快照。
+
+新会话使用展示策略 v3。已认证中心的登录环境提供真实主机名、可用机器 ID、有效 `TZ`/`TZDIR`
+和已验证的 SSH 服务端地址。缺少可信依据的可选字段标记为 unavailable，不推断国家或云区域。
+未设置 `TZ` 时仍使用中心真实的 `/etc/localtime`；只有 zoneinfo 符号链接或相同的时区数据能验证
+IANA 名称时才显示它。自定义时区目录与有效时区一起固定，不修改系统主机名或机器 ID。
+
+`project-session-info.sh` 在项目主机的 `~/.remote-harness/presentation-v3` 中生成权威原值/目标表，
+存储位置必须在项目工作树之外。目录 0700、文件 0600；固定顺序记录严格解析，不进行 shell 求值。
+原子创建、权限、摘要以及项目/逻辑会话绑定会拒绝损坏、符号链接和变更状态。每把 gateway 密钥
+只能保留一个不可变展示绑定。新逻辑对话使用独立 presentation UUID；Orca claim/adopt 换挂载点
+仍保留该 UUID。没有绑定的旧对话需要新建 v3 对话。中心只持久保存目标 profile、presentation ID
+和版本/绑定摘要，既不接收项目原值字段，也不进行第二遍替换。
+
+需要会话展示身份时，使用经过正常审批的路由命令 `rh-session-info`。这个可信项目侧适配器在回传前
+生成结构化 `view=session` 中心身份；其中地址是会话身份，不是项目服务端点。普通 `hostname`、
+`date`、`ip`、`curl`、stdout/stderr、诊断、业务日志、源码、Git/rg 记录及 SSHFS/SFTP 文件字节
+保留项目真实值。命令、参数、路径和目的地址不变；正文自行声明 `view=session` 不会触发解析或
+成为可信来源。v3 不安装结果替换 hook。
+
+首版适配器报告 `timestamp_conversion=false`，不输出已换算的时钟记录。未知、历史、无偏移、
+带偏移以及业务时间戳均以完整原组保持不变；不进行固定小时偏移替换，也不伪造二进制 TZif。
+
+项目实际执行保留自己的登录环境，包括 `HOSTNAME`/`HOST` 和用户 `TZ`。
+`--project-timezone IANA` / `RH_PROJECT_TZ` 是显式项目执行覆盖，应用于 profile/快照加载之后及内部
+Git/rg，显式 `TZ=UTC date` 仍可覆盖它。它不设置中心展示时区。v3 明确拒绝旧的
+`--session-timezone` / `RH_SESSION_TZ` 并给出迁移提示，不静默改变旧共享选项的含义。已冻结 v2
+会话仍使用旧项目身份展示和共享时区，不原地反转 v2 表。
+
+native provider 重启也兼容引入 policy 之前的会话，但缺少 policy 本身不会触发兼容：私有、只读的
+冻结 injector 必须匹配从 native Paseo 支持（63812a7）到 65a8567 的八个已发布快照之一。这些会话
+保留原 daemon TZ/TZDIR/HOSTNAME 行为和私有冻结 Codex MCP 实现。新会话在私有 manifest 与 lease
+中记录展示策略版本；缺失、损坏或互相冲突的策略状态会被拒绝，未知旧快照需要新建会话。
+
+展示初始化使用 injector 返回的 `RH_PRESENTATION_PYTHON` 和 `RH_PRESENTATION_SCRIPT`，即登录
+环境选定的绝对解释器路径及私有冻结实现。后续 SSH 为路径和每个参数正确引用，不在普通 SSH PATH
+重新寻找 Python，也不调用可变的全局 helper。
+
+有效 TZ 字符串完整保留 POSIX 引号缩写（`<+03>-3`）、DST 规则、可选前导冒号，以及已记录 TZDIR 中
+的安全时区文件名（如 `custom.v1`）。两端校验明确 POSIX 表达式的语法，拒绝控制字符和 shell
+元字符。安全的裸名称可能是自定义文件，不会因此声称是有效 IANA 名称。项目侧解析记录不需要
+中心时区文件，TZDIR 的校验规则仍独立保留。
+
+终端 Claude 使用明确的 conversation UUID。断线标记携带确切 conversation/presentation UUID，
+恢复使用 `--resume <UUID>`，不猜最近更新的对话。native Codex 继续自己的已登记私有 thread。
+终端 Codex 通用 `resume --last` 无法证明 thread 绑定，v3 明确拒绝这条恢复路径，提示新建对话或
+继续已绑定的 native Codex 会话。终端 CLI 内手动切换历史不在 Harness 自动恢复保证内。旧断线标记
+缺少确切身份时不能混入 v3。lease/owner 进程身份仍使用 UTC 和 C locale。
+
+这是展示边界，不是操作系统沙箱；不修改网络出口、地理定位、延迟、历史消息或外部遥测。同一用户
+任意 shell 仍能读取私有 Harness 状态，替换表不构成对该用户的隔离边界。
 
 这会阻止直接和常见间接本机 Agent 路径。任意项目 shell 仍是图灵完备的，而且 gateway SFTP 没有
 chroot 到登记项目。绝对安全边界需要独立本机 OS 账号；该账号只能访问目标项目，不保存 AI 凭据，

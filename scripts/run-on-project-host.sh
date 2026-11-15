@@ -265,9 +265,14 @@ make_agent_guard_path() {
 # $guard_path, and always remove it.
 # A signal ends the dispatcher: carrying on after the guard is gone would run without it.
 start_agent_guard() {
+  session_info="${RH_GATEWAY_SESSION_DIR:-}/session-info"
   scrub_agent_credentials
   scrub_host_metadata
   guard_path=$(make_agent_guard_path)
+  if [ -f "$session_info" ] && [ ! -L "$session_info" ]; then
+    cp "$session_info" "$guard_path/rh-session-info" || fail "cannot install session view"
+    chmod 700 "$guard_path/rh-session-info" || fail "cannot install session view"
+  fi
   active_command_pid="" active_command_helper="" active_command_claim=""
   trap cleanup_dispatch EXIT
   trap 'cleanup_dispatch; exit 129' HUP
@@ -320,7 +325,7 @@ resolve_target() {  # $1=project root b64 $2=relative cwd b64 -> target_physical
 AGENT_CREDENTIAL_VARS="ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR OPENAI_API_KEY CODEX_API_KEY CODEX_HOME"
 # Incidental connection/session and explicit hostname values, not the developer's identity or
 # configuration. Keep HOME, USER, LOGNAME, SSH_AUTH_SOCK and toolchain variables available.
-HOST_METADATA_VARS="SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_ORIGINAL_COMMAND RH_GATEWAY_SESSION_DIR HOSTNAME HOST"
+HOST_METADATA_VARS="SSH_CLIENT SSH_CONNECTION SSH_TTY SSH_ORIGINAL_COMMAND RH_GATEWAY_SESSION_DIR"
 
 scrub_agent_credentials() {
   # shellcheck disable=SC2086 # a fixed list of names.
@@ -757,9 +762,29 @@ select_shell_snapshot() {
   return 0
 }
 
+session_timezone() {
+  session_tz=""
+  _st_file="${RH_GATEWAY_SESSION_DIR:-}/session-timezone"
+  if [ -e "${RH_GATEWAY_SESSION_DIR:-}/presentation-v3" ]; then
+    _st_file="${RH_GATEWAY_SESSION_DIR:-}/project-timezone"
+  fi
+  [ -n "${RH_GATEWAY_SESSION_DIR:-}" ] || return 0
+  [ ! -L "$_st_file" ] || fail "invalid session timezone policy"
+  if [ -e "$_st_file" ]; then
+    [ -f "$_st_file" ] || fail "invalid session timezone policy"
+    session_tz=$(cat "$_st_file") || fail "cannot read session timezone"
+    case "$session_tz" in
+      "") return 0;;
+      /*|*/|*//*|*[!A-Za-z0-9_+/-]*) fail "invalid session timezone";;
+    esac
+    [ "${#session_tz}" -le 128 ] && [ -f "/usr/share/zoneinfo/$session_tz" ] || fail "session timezone unavailable"
+  fi
+}
+
 dispatch() {
   # The gateway names this session's directory, which holds the snapshot; commands never see it.
   snapshot_dir=${RH_GATEWAY_SESSION_DIR:-}
+  session_timezone
   [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || fail "internal dispatch needs project root, cwd, and command"
   watch_mode=0
   if [ "$#" -eq 4 ]; then
@@ -787,6 +812,12 @@ dispatch() {
     # Zsh aborts on a readonly unset even in an OR-list. Inspect types with builtins first;
     # the default expansion also keeps absent names harmless under the profile's nounset option.
     environment_guard="for __rh_unset_name in $AGENT_CREDENTIAL_VARS $HOST_METADATA_VARS; do case \${(tP)__rh_unset_name-} in *readonly*) $guard_failure ;; esac; done; builtin unset __rh_unset_name; $environment_guard"
+  fi
+  if [ -n "$session_tz" ]; then
+    environment_guard="$environment_guard $unset_command TZ TZDIR 2>/dev/null || { $guard_failure }; export TZ=$(sq "$session_tz");"
+    if [ "$shell_kind" = zsh ]; then
+      environment_guard="for __rh_unset_name in TZ TZDIR; do case \${(tP)__rh_unset_name-} in *readonly*) $guard_failure ;; esac; done; builtin unset __rh_unset_name; $environment_guard"
+    fi
   fi
   export GIT_OPTIONAL_LOCKS=0
   start_agent_guard
@@ -849,6 +880,12 @@ find_project_tool() {  # $1=tool name
 # survive. When stdin is the SSH channel, closing it (the agent-side caller was cancelled or the
 # connection dropped) terminates the tool instead of leaving it scanning the project.
 dispatch_tool() {
+  session_timezone
+  if [ -n "$session_tz" ]; then
+    unset TZ TZDIR || fail "cannot set session timezone"
+    TZ=$session_tz
+    export TZ
+  fi
   [ "$#" -eq 4 ] || fail "internal tool dispatch needs project root, cwd, tool, and arguments"
   resolve_target "$1" "$2"
   tool=$3

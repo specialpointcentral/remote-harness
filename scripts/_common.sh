@@ -1,4 +1,187 @@
 #!/usr/bin/env bash
+
+# One optional IANA timezone for this session, validated on both hosts. Never source its file.
+validate_session_timezone() {
+  case "$1" in
+    "") return 0;;
+    /*|*/|*//*|*[!A-Za-z0-9_+/-]*) printf 'invalid session timezone\n' >&2; return 1;;
+  esac
+  [ "${#1}" -le 128 ] && [ -f "/usr/share/zoneinfo/$1" ] || {
+    printf 'session timezone is unavailable\n' >&2; return 1;
+  }
+}
+
+# Executed on the project host, before connecting to the agent. Do not use SSH client fields or
+# infer country/cloud region from a timezone. Optional location labels must be supplied explicitly.
+project_timezone() {
+  _pt_zone=${TZ:-}
+  _pt_zone=${_pt_zone#:}
+  if [ -n "$_pt_zone" ] && validate_session_timezone "$_pt_zone" 2>/dev/null; then
+    printf '%s' "$_pt_zone"; return 0
+  fi
+  _pt_link=$(readlink /etc/localtime 2>/dev/null) || _pt_link=""
+  case "$_pt_link" in */zoneinfo/*)
+    _pt_zone=${_pt_link#*/zoneinfo/}
+    if validate_session_timezone "$_pt_zone" 2>/dev/null; then printf '%s' "$_pt_zone"; return 0; fi;;
+  esac
+  if [ -r /etc/timezone ]; then
+    _pt_zone=$(cat /etc/timezone)
+    if [ -n "$_pt_zone" ] && validate_session_timezone "$_pt_zone" 2>/dev/null; then
+      printf '%s' "$_pt_zone"; return 0
+    fi
+  fi
+  printf 'cannot determine an IANA timezone\n' >&2
+  return 1
+}
+
+project_identity_b64() (
+  # Validated ASCII fields allow JSON generation without requiring Python on the project host.
+  _pi_name=$(hostname 2>/dev/null) || _pi_name=""
+  case "$_pi_name" in *[!A-Za-z0-9._-]*) _pi_name="";; esac
+  _pi_v4="" _pi_v6="" _pi_id=""
+  if command -v ip >/dev/null 2>&1; then
+    # Route lookup reads the kernel routing table; it does not send a packet to these addresses.
+    _pi_v4=$(ip -o route get 192.0.2.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}')
+    _pi_v6=$(ip -o -6 route get 2001:db8::1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}')
+  elif command -v ipconfig >/dev/null 2>&1; then
+    _pi_if=$(route -n get default 2>/dev/null | awk '$1=="interface:" {print $2; exit}')
+    [ -z "$_pi_if" ] || _pi_v4=$(ipconfig getifaddr "$_pi_if" 2>/dev/null) || _pi_v4=""
+  fi
+  case "$_pi_v4" in *[!0-9.]*) _pi_v4="";; esac
+  case "$_pi_v6" in *[!0-9A-Fa-f:]*) _pi_v6="";; esac
+  for _pi_file in /etc/machine-id /var/lib/dbus/machine-id; do
+    if [ -r "$_pi_file" ]; then _pi_id=$(cat "$_pi_file"); break; fi
+  done
+  case "$_pi_id" in *[!0-9A-Fa-f-]*) _pi_id="";; esac
+  _pi_country=${RH_SESSION_COUNTRY:-} _pi_region=${RH_SESSION_REGION:-}
+  case "$_pi_country" in ""|[A-Z][A-Z]) ;; *) return 1;; esac
+  case "$_pi_region" in *[!A-Za-z0-9._-]*) return 1;; esac
+  validate_session_timezone "${RH_SESSION_TZ:-}" && [ -n "${RH_SESSION_TZ:-}" ] || return 1
+  printf '{"hostname":"%s","ipv4":"%s","ipv6":"%s","machine_id":"%s","timezone":"%s","country":"%s","region":"%s"}' \
+    "$_pi_name" "$_pi_v4" "$_pi_v6" "$_pi_id" "$RH_SESSION_TZ" "$_pi_country" "$_pi_region" | base64 | tr -d '\n'
+)
+
+# Shared syntax for the shell profile collector and project adapter; never execute a TZ value.
+effective_timezone_awk() {
+  cat <<'AWK'
+function tz_clock(text, maximum, parts, n, i) {
+  if(text!~/^[+-]?[0-9][0-9]?[0-9]?(:[0-9][0-9]?(:[0-9][0-9]?)?)?$/) return 0
+  sub(/^[+-]/,"",text); n=split(text,parts,":")
+  if(parts[1]+0>maximum) return 0
+  for(i=2;i<=n;i++) if(parts[i]+0>59) return 0
+  return 1
+}
+function tz_abbr( size) {
+  if(substr(tz_rest,1,1)=="<") {
+    size=index(tz_rest,">")
+    if(size<5 || substr(tz_rest,2,size-2)!~/^[A-Za-z0-9+-]+$/) return 0
+  } else {
+    if(!match(tz_rest,/^[A-Za-z]+/)) return 0
+    size=RLENGTH; if(size<3) return 0
+  }
+  tz_rest=substr(tz_rest,size+1); return 1
+}
+function tz_offset( value) {
+  if(!match(tz_rest,/^[+-]?[0-9]+(:[0-9][0-9]?(:[0-9][0-9]?)?)?/)) return 0
+  value=substr(tz_rest,1,RLENGTH); tz_rest=substr(tz_rest,RLENGTH+1)
+  return tz_clock(value,24)
+}
+function tz_rule(rule, parts, n, date, month) {
+  n=split(rule,parts,"/"); if(n>2 || (n==2 && !tz_clock(parts[2],167))) return 0
+  date=parts[1]
+  if(date~/^M[0-9][0-9]?\.[0-9]\.[0-9]$/) {
+    sub(/^M/,"",date); split(date,month,".")
+    return month[1]>=1 && month[1]<=12 && month[2]>=1 && month[2]<=5 && month[3]<=6
+  }
+  if(date!~/^J?[0-9][0-9]?[0-9]?$/) return 0
+  if(substr(date,1,1)=="J") { sub(/^J/,"",date); return date>=1 && date<=365 }
+  return date+0<=365
+}
+function valid_effective_timezone(value, named, rules, n) {
+  if(length(value)>255 || value~/[^A-Za-z0-9_+<>\/:,.-]/) return 0
+  if(value=="") return 1
+  named=value; sub(/^:/,"",named)
+  if(named~/^[A-Za-z0-9_+\/.-]+$/) return 1
+  tz_rest=named
+  if(!tz_abbr() || !tz_offset()) return 0
+  if(tz_rest=="") return 1
+  if(!tz_abbr()) return 0
+  if(tz_rest~/^[+-]?[0-9]/ && !tz_offset()) return 0
+  if(tz_rest=="") return 1
+  if(substr(tz_rest,1,1)!=",") return 0
+  n=split(substr(tz_rest,2),rules,",")
+  return n==2 && tz_rule(rules[1]) && tz_rule(rules[2])
+}
+AWK
+}
+
+validate_effective_timezone() {
+  case "$1" in *[!A-Za-z0-9_+\<\>/:,.-]*) return 1;; esac
+  LC_ALL=C awk -v value="$1" "$(effective_timezone_awk)
+BEGIN { exit !valid_effective_timezone(value) }"
+}
+
+# The injector supplies both absolute paths. Every argument stays quoted across ordinary SSH.
+presentation_command() {
+  printf 'exec %s -EsB %s' "$(sq "$1")" "$(sq "$2")"
+  shift 2
+  for _pc_arg in "$@"; do printf ' %s' "$(sq "$_pc_arg")"; done
+}
+
+# Fixed-order, restricted records for the project-owned v3 table. Never source these records.
+host_profile_records() (
+  _hp_zone=$(project_timezone 2>/dev/null) || _hp_zone=""
+  _hp_effective=${TZ-$_hp_zone}
+  validate_effective_timezone "$_hp_effective" || return 1
+  _hp_dir=${TZDIR:-}
+  case "$_hp_dir" in *[!A-Za-z0-9_+/:,.-]*) _hp_dir="";; esac
+  _hp_json=$(RH_SESSION_TZ="${_hp_zone:-UTC}" project_identity_b64) || return 1
+  # project_identity_b64 emits only these validated, quoted ASCII fields in this exact order.
+  printf '%s' "$_hp_json" | { base64 --decode 2>/dev/null || base64 -D; } | \
+    awk -v zone="$_hp_zone" -v effective="$_hp_effective" -v directory="$_hp_dir" '
+      BEGIN { FS="\"" }
+      { printf "HOSTNAME=%s\nIPV4=%s\nIPV6=%s\nMACHINE_ID=%s\nTIMEZONE=%s\nEFFECTIVE_TZ=%s\nEFFECTIVE_TZDIR=%s\nCOUNTRY=%s\nREGION=%s\n", $4,$8,$12,$16,zone,effective,directory,$24,$28 }'
+)
+
+validate_presentation_options() {
+  if [ -n "${RH_SESSION_TZ:-}" ]; then
+    printf 'v3 does not accept --session-timezone/RH_SESSION_TZ; use --project-timezone/RH_PROJECT_TZ for project execution; display timezone comes from the center. Start a new session.\n' >&2
+    return 1
+  fi
+  validate_session_timezone "${RH_PROJECT_TZ:-}"
+}
+
+# Local disconnect evidence includes one exact conversation/profile pair. Never source it.
+write_local_resume_marker() (
+  umask 077
+  _lrm_file=$1
+  [ ! -L "$_lrm_file" ] && [ ! -L "${_lrm_file%/*}" ] || return 1
+  _lrm_temp=$(mktemp "${_lrm_file}.XXXXXX") || return 1
+  trap 'rm -f "$_lrm_temp"' EXIT
+  printf 'VERSION=3\nTIME=%s\nPRESENTATION_ID=%s\nCONVERSATION_ID=%s\n' "$2" "$3" "$4" > "$_lrm_temp"
+  chmod 600 "$_lrm_temp" && mv "$_lrm_temp" "$_lrm_file"
+)
+
+read_local_resume_marker() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && \
+    [ "$(find "$1" -prune -type f -perm 600 -print)" = "$1" ] || return 1
+  LC_ALL=C awk '
+    NR==1 && $0~/^[0-9]+$/ { legacy=$0; next }
+    NR==1 { if($0!="VERSION=3") exit 1 }
+    NR==2 { if($0!~/^TIME=[0-9]+$/) exit 1 }
+    NR==3 || NR==4 {
+      key=(NR==3 ? "PRESENTATION_ID=" : "CONVERSATION_ID=")
+      if(index($0,key)!=1) exit 1
+      value=substr($0,length(key)+1)
+      if(value!="" && (length(value)!=36 || value~/[^0-9a-f-]/)) exit 1
+    }
+    { if(NR>4) exit 1; lines=lines $0 "\n" }
+    END {
+      if(legacy && NR==1) printf "VERSION=2\nTIME=%s\n",legacy
+      else if(NR==4) printf "%s",lines
+      else exit 1
+    }' "$1"
+}
 # remote-harness / _common.sh — shared helpers, SOURCED (not executed) on the local machine by
 # laptop-setup.sh, simple-laptop-setup.sh and simple-dispatch.sh, each from beside itself (or
 # $RH_COMMON). The bootstrap fetches THIS file next to them, so a laptop without an install still

@@ -39,6 +39,8 @@
 #                         lacks it), 'normal' (the agent asks), or 'yolo' (same as --yolo)
 #   --yolo                bypass approvals on the launched agent — claude/codex get their
 #                         bypass flag
+#   --project-timezone <IANA> optional project execution override; display uses center settings
+#   --session-timezone <IANA> rejected in v3 (legacy shared timezone); use --project-timezone
 #   --local-sshd <mode>   SSH server the tunnel reaches on this laptop: 'system' (default; the
 #                         sshd on :22 reading ~/.ssh/authorized_keys) or 'user' (a per-session sshd
 #                         run as you on a free loopback port, for sshds that ignore authorized_keys
@@ -80,6 +82,8 @@ while [ $# -gt 0 ]; do
     --remote-mountpoint) need_arg "$1" "${2-}"; REMOTE_MP="$2";  shift 2;;   # exact box dir to mount at (e.g. your invoking cwd)
     --project-dir)   need_arg "$1" "${2-}"; PROJ_DIR_ARG="$2";   shift 2;;   # laptop project dir (skip the interactive prompt)
     --local-sshd)    need_arg "$1" "${2-}"; LOCAL_SSHD_MODE="$2"; shift 2;;
+    --session-timezone) need_arg "$1" "${2-}"; export RH_SESSION_TZ="$2"; shift 2;;
+    --project-timezone) need_arg "$1" "${2-}"; export RH_PROJECT_TZ="$2"; shift 2;;
     --setup-only)    SETUP_ONLY=1;        shift;;
     --yes|-y)        ASSUME_YES=1;        shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
@@ -107,6 +111,7 @@ if [ -f "$RH_COMMON" ]; then
   . "$RH_COMMON"
 else printf 'error: missing _common.sh next to %s — re-copy the full command\n' "$0" >&2; exit 2; fi
 validate_launch_ui "$UI" "$LAUNCH" || exit 2
+validate_presentation_options || exit 2
 if [ "$UI" != terminal ] && [ "$SETUP_ONLY" = 1 ]; then
   printf '%s\n' "--ui $UI needs a full session (not --setup-only)" >&2
   exit 2
@@ -480,9 +485,12 @@ install_project_host_gateway() {
   if [ ! -f "$GATEWAY_PATH" ]; then
     (umask 077
       cp "$_ipg_scripts/project-host-gateway.sh" "$GATEWAY_PATH" \
-        && cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh") || return 1
+        && cp "$_ipg_scripts/run-on-project-host.sh" "$GATEWAY_DIR/run-on-project-host.sh" \
+        && cp "$_ipg_scripts/project-session-info.sh" "$GATEWAY_DIR/project-session-info.sh" \
+        && cp "$_ipg_scripts/_common.sh" "$GATEWAY_DIR/_common.sh") || return 1
   fi
-  chmod 700 "$GATEWAY_PATH" "$GATEWAY_DIR/run-on-project-host.sh" 2>/dev/null || return 1
+  [ -f "$GATEWAY_DIR/project-session-info.sh" ] && [ ! -L "$GATEWAY_DIR/project-session-info.sh" ] || return 1
+  chmod 700 "$GATEWAY_PATH" "$GATEWAY_DIR/run-on-project-host.sh" "$GATEWAY_DIR/project-session-info.sh" 2>/dev/null || return 1
 }
 
 register_gateway_project() (
@@ -498,6 +506,22 @@ register_gateway_project() (
   printf '%s' "$_rgp_root" > "$GATEWAY_SESSION_DIR/project-root.b64" \
     || return 1
   chmod 600 "$GATEWAY_SESSION_DIR/project-root.b64" || return 1
+  [ ! -e "$GATEWAY_SESSION_DIR/session-timezone" ] && [ ! -e "$GATEWAY_SESSION_DIR/project-identity.b64" ] || {
+    warn "legacy gateway key cannot be reused for v3; start a new session"
+    return 1
+  }
+  for _rgp_name in presentation-v3 project-timezone; do
+    _rgp_value=3
+    [ "$_rgp_name" != project-timezone ] || _rgp_value=${RH_PROJECT_TZ:-}
+    _rgp_file="$GATEWAY_SESSION_DIR/$_rgp_name"
+    [ ! -L "$_rgp_file" ] || return 1
+    if [ -e "$_rgp_file" ]; then
+      [ -f "$_rgp_file" ] && [ "$(cat "$_rgp_file")" = "$_rgp_value" ] || return 1
+    else
+      (set -C; printf '%s' "$_rgp_value" > "$_rgp_file") || return 1
+      chmod 600 "$_rgp_file" || return 1
+    fi
+  done
   # RH_SHELL_SNAPSHOT=off makes every routed command start a login shell instead of loading the
   # session's login shell snapshot (run-on-project-host.sh).
   case "${RH_SHELL_SNAPSHOT:-on}" in
@@ -1415,6 +1439,7 @@ register_gateway_project || { err "could not register the project with the force
 ORCA_CONTINUE=""
 TERMINAL_CONTINUE=""
 CONTINUE_RESUME=""
+PRESENTATION_REQUEST=new
 continue_ago() {  # epoch -> "N min ago"
   local _ago
   _ago=$(( $(date +%s) - $1 ))
@@ -1448,7 +1473,7 @@ choose_continue() {
   listing=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
     [ -d \"\$rh/.orca-identities\" ] || [ $(sq "$UI") = orca ] || exit 0
-    exec python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$UI")
+    exec env RH_REQUIRE_PRESENTATION_V3=1 python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$UI")
   " 2>/dev/null | grep -E '^RH_(ORCA|TERMINAL)_CHAT=')
   [ -n "$listing" ] || return 0
   items[0]="$(tr2 "Start a new conversation" "新建会话")"
@@ -1513,8 +1538,10 @@ if [ -n "$ORCA_CONTINUE" ]; then
   [ "$UI" = orca ] || _claim_ui=" terminal"
   _claim_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    exec python3 -EsB \"\$rh/scripts/orca-session.py\" claim \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$ORCA_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")$_claim_ui
+    exec env RH_REQUIRE_PRESENTATION_V3=1 python3 -EsB \"\$rh/scripts/orca-session.py\" claim \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$ORCA_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")$_claim_ui
   ")
+  PRESENTATION_REQUEST=$(printf '%s\n' "$_claim_out" | kv_value PRESENTATION_ID)
+  [ -n "$PRESENTATION_REQUEST" ] || { err "v3 cannot continue an unbound legacy conversation"; exit 1; }
   REMOTE_MOUNTPOINT=$(printf '%s\n' "$_claim_out" | kv_value MOUNTPOINT)
   if [ "$UI" = terminal ]; then
     CONTINUE_RESUME=$(printf '%s\n' "$_claim_out" | kv_value RESUME)
@@ -1531,10 +1558,13 @@ if [ -n "$ORCA_CONTINUE" ]; then
   fi
 elif [ -n "$TERMINAL_CONTINUE" ]; then
   # This launch's new Orca mount, registered to the terminal conversation that its new chat resumes.
-  REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
+  _adopt_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
-    exec python3 -EsB \"\$rh/scripts/orca-session.py\" adopt \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$TERMINAL_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")
-  " | kv_value MOUNTPOINT)
+    exec env RH_REQUIRE_PRESENTATION_V3=1 python3 -EsB \"\$rh/scripts/orca-session.py\" adopt \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$TERMINAL_CONTINUE") $(sq "$RULE_SESSION_ID") $(sq "$PROJ_DIR")
+  ")
+  REMOTE_MOUNTPOINT=$(printf '%s\n' "$_adopt_out" | kv_value MOUNTPOINT)
+  PRESENTATION_REQUEST=$(printf '%s\n' "$_adopt_out" | kv_value PRESENTATION_ID)
+  [ -n "$PRESENTATION_REQUEST" ] || { err "v3 cannot adopt an unbound legacy conversation"; exit 1; }
   if [ -z "$REMOTE_MOUNTPOINT" ]; then
     err "$(tr2 "Could not continue terminal conversation ${TERMINAL_CONTINUE}." "无法继续终端对话 ${TERMINAL_CONTINUE}。")"
     exit 1
@@ -1704,6 +1734,13 @@ if [ "$rh_status" = INJECTED ]; then
     _remote_key=$(printf '%s' "$REMOTE_MOUNTPOINT" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
     REMOTE_SESSION_DIR="$(dirname "$(dirname "$BOX_SSH_CONFIG")")/$_remote_key.$RULE_SESSION_ID"
   fi
+  presentation_python=$(printf '%s\n' "$rh_out" | kv_value RH_PRESENTATION_PYTHON)
+  presentation_script=$(printf '%s\n' "$rh_out" | kv_value RH_PRESENTATION_SCRIPT)
+  case "$presentation_python" in /*) ;; *) err "injector did not register its presentation Python runtime"; exit 1;; esac
+  [ "$presentation_script" = "$REMOTE_SESSION_DIR/impl/session_privacy.py" ] || {
+    err "injector did not register its frozen presentation implementation"; exit 1;
+  }
+  presentation_home=$(dirname "$(dirname "$REMOTE_SESSION_DIR")")
   if [ "$UI" != terminal ]; then
     case "$UI" in
       paseo) native_key=RH_PASEO_LAUNCH;;
@@ -1720,14 +1757,24 @@ if [ "$rh_status" = INJECTED ]; then
     # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
     rh_resume=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_AVAILABLE)
     rh_resume_args=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_ARGS)
+    resume_presentation=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_PRESENTATION_ID)
+    resume_conversation=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_CONVERSATION_ID)
     # The remote watcher cannot record a disconnect that the agent outran by exiting on SIGHUP; the
     # local marker from an interactive ssh that lost its connection covers that case.
     if [ -f "$LOCAL_RESUME_MARKER" ]; then
-      _local_resume_at=$(cat "$LOCAL_RESUME_MARKER" 2>/dev/null)
+      _local_record=$(read_local_resume_marker "$LOCAL_RESUME_MARKER" 2>/dev/null) || _local_record=""
       rm -f "$LOCAL_RESUME_MARKER"
+      _local_resume_at=$(printf '%s\n' "$_local_record" | kv_value TIME)
+      _remote_resume_at=${rh_resume#*,}
+      case "$_remote_resume_at" in ''|*[!0-9]*) _remote_resume_at=0;; esac
       case "$_local_resume_at" in ''|*[!0-9]*) ;; *)
-        [ -n "$rh_resume" ] || [ $(( $(date +%s) - _local_resume_at )) -gt 604800 ] \
-          || rh_resume="disconnected,$_local_resume_at" ;;
+        if [ $(( $(date +%s) - _local_resume_at )) -le 604800 ] && [ "$_local_resume_at" -ge "$_remote_resume_at" ]; then
+          rh_resume="disconnected,$_local_resume_at"
+          resume_presentation=$(printf '%s\n' "$_local_record" | kv_value PRESENTATION_ID)
+          resume_conversation=$(printf '%s\n' "$_local_record" | kv_value CONVERSATION_ID)
+          rh_resume_args=""
+          [ -z "$resume_conversation" ] || rh_resume_args="--resume $resume_conversation"
+        fi;;
       esac
     fi
     RESUME=0
@@ -1746,12 +1793,46 @@ if [ "$rh_status" = INJECTED ]; then
         fi
         ;;
     esac
+    if [ "$RESUME" = 1 ] && [ -z "$CONTINUE_RESUME" ]; then
+      if [ "$LAUNCH_BASE" = codex ]; then
+        err "v3 cannot verify the exact thread for terminal Codex resume; start a new conversation or continue a bound native Codex chat"
+        exit 1
+      fi
+      PRESENTATION_REQUEST=$resume_presentation
+      CONTINUE_RESUME=$resume_conversation
+      [ -n "$PRESENTATION_REQUEST" ] && [ -n "$CONTINUE_RESUME" ] || {
+        err "this older disconnect record has no exact v3 conversation binding; start a new conversation"
+        exit 1
+      }
+      rh_resume_args="--resume $CONTINUE_RESUME"
+    fi
     if [ "$RESUME" = 1 ] && [ -n "$rh_resume_args" ]; then
       EFF_LAUNCH="$LAUNCH_BASE $rh_resume_args${EFF_LAUNCH#"$LAUNCH_BASE"}"
       [ -n "$CONTINUE_RESUME" ] \
         || ok "$(tr2 "Continuing the last ${LAUNCH_BASE} conversation in this project" "将继续该项目上一次的 ${LAUNCH_BASE} 会话")"
     fi
     EFF_LAUNCH="${rh_env:+$rh_env }${rh_prefix:+$rh_prefix }${EFF_LAUNCH}${rh_flags:+ $rh_flags}"
+  fi
+  presentation_out=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
+    "$(presentation_command "$presentation_python" "$presentation_script" select "$REMOTE_SESSION_DIR/privacy.json" \
+      "$presentation_home" "$PRESENTATION_REQUEST" "$LAUNCH_BASE")") \
+    || { err "could not verify the center presentation identity for this conversation"; exit 1; }
+  PRESENTATION_ID=$(printf '%s\n' "$presentation_out" | kv_value PRESENTATION_ID)
+  CENTER_PROFILE_B64=$(printf '%s\n' "$presentation_out" | kv_value CENTER_PROFILE_B64)
+  [ -n "$PRESENTATION_ID" ] && [ -n "$CENTER_PROFILE_B64" ] || exit 1
+  PRESENTATION_SUMMARY=$(bash "$GATEWAY_DIR/project-session-info.sh" prepare "$GATEWAY_SESSION_DIR" \
+    "$HOME/.remote-harness/presentation-v3" "$PROJ_DIR" "$PRESENTATION_ID" "$CENTER_PROFILE_B64") \
+    || { err "could not freeze the project-owned presentation table"; exit 1; }
+  resume_binding=""
+  if [ "$UI" = terminal ] && [ "$LAUNCH_BASE" = claude ]; then
+    resume_binding=${CONTINUE_RESUME:-$PRESENTATION_ID}
+  fi
+  ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" \
+    "$(presentation_command "$presentation_python" "$presentation_script" bind "$REMOTE_SESSION_DIR/privacy.json" \
+      "$presentation_home" "$PRESENTATION_SUMMARY" "$resume_binding")" \
+    || { err "could not bind the project presentation table"; exit 1; }
+  if [ "$UI" = terminal ] && [ "$LAUNCH_BASE" = claude ] && [ "$RESUME" = 0 ]; then
+    EFF_LAUNCH="$EFF_LAUNCH --session-id $(sq "$PRESENTATION_ID")"
   fi
   ok "Injected session-scoped run-on-laptop rule for ${LAUNCH_BASE} (removed on exit)"
 else
@@ -1874,10 +1955,8 @@ CLAUDE_EXIT=$?
 stop_tunnel_supervisor
 record_launch_end
 if [ "$UI" = terminal ] && [ "$CLAUDE_EXIT" = 255 ]; then
-  (umask 077
-    private_local_dirs "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null \
-      && [ ! -L "$LOCAL_RESUME_MARKER" ] && date +%s > "$LOCAL_RESUME_MARKER" \
-      && chmod 600 "$LOCAL_RESUME_MARKER") || true
+  private_local_dirs "${LOCAL_RESUME_MARKER%/*}" 2>/dev/null \
+    && write_local_resume_marker "$LOCAL_RESUME_MARKER" "$(date +%s)" "$PRESENTATION_ID" "${resume_binding:-}" || true
 fi
 
 # ===========================================================================

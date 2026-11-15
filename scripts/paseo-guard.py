@@ -14,14 +14,18 @@ def lease_live(path, token):
             return False
         record = json.load(stream)
     pid = record["pid"]
-    if record["token"] != token or type(pid) is not int or pid <= 1:
+    if record["token"] != token or type(pid) is not int or pid <= 1 or not isinstance(record["identity"], str):
         return False
     # Bind to the bridge's start time and full, session-specific command line to reject PID reuse.
     observed = subprocess.check_output(
         ["/bin/ps", "-ww", "-p", str(pid), "-o", "stat=", "-o", "lstart=", "-o", "args="],
         text=True, timeout=2, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, TZ="UTC", TZDIR="/usr/share/zoneinfo", LC_ALL="C")
+            if record["identity"].startswith("UTC:") else None,
     )
     state, identity = observed.strip().split(maxsplit=1)
+    if record["identity"].startswith("UTC:"):
+        identity = "UTC:" + identity
     return state[0] not in "XZ" and identity == record["identity"]
 
 

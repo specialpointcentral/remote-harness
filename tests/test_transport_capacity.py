@@ -160,6 +160,8 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         sessions = list((self.home / 'rh' / '.sessions').glob('*/bin/rh-run'))
         self.assertEqual(len(sessions), 1)
+        from fixtures.privacy import bind_v3
+        bind_v3(sessions[0].parent.parent, self.home / 'rh', project=self.mount, agent='codex')
         return sessions[0].parent
 
     def test_generated_runner_background_uses_direct_ssh_and_old_calls_still_work(self):
@@ -496,6 +498,20 @@ class PoolTests(unittest.TestCase):
         self.assertIn('opening->ready', self.log())
         self.assertIn('ready->handed', self.log())
         self.assertNotIn('printf one', self.log())
+
+    def test_warm_guard_preserves_project_values_handshake_and_status(self):
+        from fixtures.privacy import policy
+        self.start()
+        self.ready()
+        command = "printf '203.0.113.45\\n'; printf 'agent-hk-private.example\\n' >&2; exit 17"
+        cold = self.root / 'unexpected-fallback'
+        result = subprocess.run(
+            ['python3', str(SCRIPTS / 'channel-guard.py'), '--privacy-policy', str(policy(self.root)),
+             '--warm', self.socket, '--warm-request', self.request(command), '--',
+             'touch', str(cold)], capture_output=True, timeout=8)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (17, b'203.0.113.45\n', b'agent-hk-private.example\n'))
+        self.assertFalse(cold.exists())
 
     def test_explicit_sixteen_pool_holds_sixteen_channels_and_refuses_seventeenth(self):
         self.start(RH_WARM_MAX='16')

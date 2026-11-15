@@ -4,7 +4,8 @@
 The project host treats EOF on that channel as "the caller is gone" and stops the command's whole
 process tree. Holding the pipe here (instead of passing the agent's own stdin, which is usually
 already at EOF) makes EOF mean exactly that: this guard was cancelled, killed, or its SSH connection
-dropped. stdout and stderr are inherited unchanged; the command's exit status is returned.
+dropped. A privacy policy validates the session, but project-host stdout/stderr retain their values:
+they already describe the actual project host. The command's exit status is returned unchanged.
 
 With `--warm SOCKET --warm-request LINE` it first sends LINE on a channel the session's warm pool
 opened ahead of time (warm_pool.py), which saves the round trips of opening one. A request that was
@@ -169,7 +170,7 @@ def main() -> int:
         elif argv[0] == "--request-from-env":
             from_env = True
             argv = argv[1:]
-        elif argv[0] in ("--warm", "--warm-request", "--slots-dir", "--diagnostics-dir") and len(argv) >= 2:
+        elif argv[0] in ("--warm", "--warm-request", "--slots-dir", "--diagnostics-dir", "--privacy-policy") and len(argv) >= 2:
             options[argv[0]] = argv[1]
             argv = argv[2:]
         else:
@@ -183,6 +184,9 @@ def main() -> int:
         return 2
     global child, diagnostics
     helpers = diagnostic_helpers()
+    if options.get("--privacy-policy"):
+        from session_privacy import Policy
+        Policy(options["--privacy-policy"])  # Validate before delivery; project streams are unchanged.
     if options.get("--diagnostics-dir"):
         try:
             diagnostics = helpers.Diagnostics(options["--diagnostics-dir"])
@@ -224,7 +228,6 @@ def main() -> int:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
-                break
             try:
                 child.wait(timeout=0.25)
             except subprocess.TimeoutExpired:

@@ -294,6 +294,20 @@ fi
         self.assertIn("RH_ORCA_LAUNCH", values)
         session = Path(values["RH_SESSION_DIR"]).resolve()
         log = self.home / (label + ".log")
+        from fixtures.privacy import bind_v3
+        requested = None
+        legacy_record = False
+        for record in list((self.rh / '.orca-identities').glob('*.json')) + list((self.rh / '.orca-codex-chats').glob('*.json')):
+            data = json.loads(record.read_text())
+            if data.get('session') == session.name:
+                requested = data.get('presentation_id')
+                legacy_record = requested is None
+        if legacy_record:
+            # Compatibility fixture: only explicitly legacy records keep their frozen v2 policy.
+            from fixtures.privacy import policy
+            policy(session)
+        else:
+            bind_v3(session, self.rh, project='/local/project', presentation_id=requested)
         command = ("export " + values["RH_LAUNCH_ENV"] + "; exec " + values["RH_LAUNCH_PREFIX"]
                    + " " + values["RH_ORCA_LAUNCH"])
         with log.open("w") as stream:
@@ -301,6 +315,27 @@ fi
                                       stdout=stream, stderr=stream)
         self.addCleanup(self.stop, bridge)
         return bridge, log, session, project
+
+    def test_live_pre_policy_orca_provider_keeps_legacy_daemon_environment(self):
+        from fixtures.privacy import pre_policy_snapshot
+        bridge, log, session, project = self.start_bridge('legacy-upgrade')
+        identity = self.ready(bridge, log)
+        pre_policy_snapshot(session)
+        lease = session / 'orca-lease.json'
+        data = json.loads(lease.read_text())
+        data.pop('presentation_policy', None)
+        data['env'].pop('TZ', None)
+        data['env'].pop('TZDIR', None)
+        lease.write_text(json.dumps(data))
+        env = dict(self.env, TZ='<+03>-3', TZDIR='/daemon/legacy-zones', HOSTNAME='legacy-daemon')
+        for _ in range(2):
+            result = self.wrapper_call(project, '--resume', provider_id(identity), env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            actual = json.loads(result.stdout)['env']
+            for key in ('TZ', 'TZDIR', 'HOSTNAME'):
+                self.assertEqual(actual[key], env[key])
+        bridge.terminate()
+        self.assertEqual(bridge.wait(timeout=8), 143, log.read_text())
 
     @staticmethod
     def stop(bridge):
@@ -470,6 +505,11 @@ fi
         record_path.write_text(json.dumps({key: record[key] for key in ("cwd", "session", "token")}))
         record_path.chmod(0o600)
         self.assertEqual(self.chats("/other/project"), [["killed", "1794500000", "0", "where were we? [2J"]])
+        self.env['RH_REQUIRE_PRESENTATION_V3'] = '1'
+        refused = self.claim('killed', 'next')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('legacy chat', refused.stderr)
+        self.env.pop('RH_REQUIRE_PRESENTATION_V3')
         claimed = self.claim("killed", "next")
         self.assertEqual(claimed.returncode, 0, claimed.stderr)
         record = json.loads(record_path.read_text())

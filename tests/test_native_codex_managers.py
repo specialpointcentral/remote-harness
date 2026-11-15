@@ -155,6 +155,17 @@ supports_websockets = false
         self.assertEqual(started.returncode, 0, started.stderr)
         values = dict(line.split("=", 1) for line in started.stdout.splitlines())
         self.session = Path(values["RH_SESSION_DIR"])
+        from fixtures.privacy import bind_v3
+        requested = None
+        if manager == 'orca':
+            for record in (self.rh / '.orca-codex-chats').glob('*.json'):
+                data = json.loads(record.read_text())
+                if data.get('session') == self.session.name and data.get('cwd') == str(self.mount):
+                    self.assertIsNone(requested, 'Multiple chats claimed this launch')
+                    requested = data.get('presentation_id')
+                    self.assertIsNotNone(requested, 'A v3 fixture cannot upgrade an unbound legacy chat')
+        self.presentation_id, _ = bind_v3(self.session, self.rh, project=self.project,
+                                         presentation_id=requested, agent='codex')
         # Substitute a runner for SSH. Distinct project and mount directories reveal wrong-host
         # execution while keeping the test independent of external hosts and credentials.
         (self.session / "bin/rh-run").write_text(
@@ -335,6 +346,7 @@ supports_websockets = false
                 "type": "command", "agent": "codex", "value": str(self.scripts / "native-codex.py"),
             })
             with self.bridge("orca") as (bridge, session_id):
+                presentation_id = self.presentation_id
                 page, send, pending, respond = self.orca_chat(orca, session_id)
                 send("remember the word heliotrope")
                 wait_for(self.backend_pid, 40, detail=lambda: json.dumps(page())[-3000:])
@@ -352,12 +364,17 @@ supports_websockets = false
             self.assertEqual([line.split("\t")[::3] for line in listed.stdout.splitlines()],
                              [["RH_ORCA_CHAT=native-v2", "remember the word heliotrope"]])
             claimed = subprocess.run([*tool, "claim", str(self.rh), "codex", "native-v2", "next",
-                                      str(self.project)], env=self.env, text=True, capture_output=True,
+                                      str(self.project)], env=dict(self.env, RH_REQUIRE_PRESENTATION_V3='1'),
+                                     text=True, capture_output=True,
                                      timeout=20)
-            self.assertEqual(claimed.stdout, f"MOUNTPOINT={self.mount}\n", claimed.stderr)
+            self.assertEqual(claimed.returncode, 0, claimed.stderr)
+            claimed_values = dict(line.split('=', 1) for line in claimed.stdout.splitlines())
+            self.assertEqual(claimed_values, {'MOUNTPOINT': str(self.mount),
+                                             'PRESENTATION_ID': presentation_id})
             before = len(self.server.requests)
             with self.bridge("orca", "next") as (bridge, resumed):
                 self.assertEqual(resumed, session_id)
+                self.assertEqual(self.presentation_id, presentation_id)
                 send("which word?")
                 wait_for(lambda: len(self.server.requests) > before, 40,
                          detail=lambda: json.dumps(page())[-3000:])

@@ -24,6 +24,9 @@
   `paseo-guard.py` / `orca-claude.py` 保护 Claude 工具调用。`native-codex.py` 将 Codex
   app server 绑定到会话的私有 lease，`codex-project-tools.py` 提供路由工具。
 - `scripts/channel-guard.py`：在路由 Bash 命令存续期间持有其 SSH 通道。
+- `scripts/session_privacy.py`：v3 真实中心 profile 与 presentation ID/绑定缓存，不保存项目原值映射，
+  也不进行结果二次替换。`project-session-info.sh` 在项目主机持有私有表，提供经正常审批的
+  `rh-session-info` 会话展示入口。
 - `scripts/warm_pool.py`：每会话一个、在 gateway 的 wait 动词上预先打开通道的通道池（`serve`），以及
   channel-guard 和工具垫片使用的客户端部分。
 - `reference/`、`docs/`：英文 Markdown 必须有 `.cn.md` 对应版本。
@@ -63,7 +66,9 @@
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。
 - Claude/Codex Bash 导向本机；Agent/Spawn 工具仍在远端执行。
-- 生成的 Claude 会话设置会保持 hooks 启用，即使项目设置了 `disableAllHooks`。
+- Claude 要求 2.1.295+，路由 hook 必须设置 `onFailure: "block"`；hook 被取消或失败时，绝不能让
+  原始 Bash 命令在 Agent 主机执行。生成的会话设置会保持 hooks 启用，即使项目设置了
+  `disableAllHooks`。路由 hook 的超时预算必须大于内部命令策略检查的超时；新设置需要新建 harness 会话。
 - Claude 的 hook 对路由调用绝不返回审批决定：`allow` 会跳过 Claude 的审批提示和 auto 模式自动审核。它改写成
   可读的 `rh-run --cwd <目录> -- <命令>`，由用户选择的审批模式判断原始命令。Codex 的 hook 写同样的格式；Codex 只接受与 `allow` 一起返回的 `updatedInput`，这不会跳过它自己的审批。
   会话设置加一条 `autoMode.environment`，写明 runner，要求自动审核判断引号里的命令，而不是包装本身。
@@ -74,9 +79,20 @@
   找到的任意一条简单命令生效，allow 只在 default/acceptEdits/dontAsk 模式（绝不包括 auto）下对单条普通命令
   生效。规则文件只在标识变化时重读。Codex 自己检查原命令：改写后在 `exit` 之后另起一行附上原命令，
   shell 不会解析这一行，Codex 的执行策略（`.rules` 规则、带 `-f` 的 `rm`）会读它。
-- Claude 会话禁止 Read/Edit 访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc`。`rh-session` 清除
-  `SSH_CONNECTION`/`SSH_CLIENT` 中笔记本的地址和端口。Linux 上的 sshfs 挂载使用 `fsname=remote-harness`，
-  挂载来源保存在挂载记录里；`mounts` 目录仅本人可访问。垫片的 stderr 把项目根路径映射回挂载点。
+- Claude 会话禁止 Read/Edit 访问 `$RH_HOME/.sessions`，禁止 Read 访问 `/proc` 和主机元数据文件
+  （包括 timezone/localtime 及其解析目标）。`rh-session` 清除 `SSH_CONNECTION`/`SSH_CLIENT` 中所有
+  地址和端口。v3 展示已认证中心的真实主机名、机器 ID、有效 TZ/TZDIR 和已验证的身份地址；私有固定表
+  只在项目侧持有和执行，中心只缓存目标 profile、presentation UUID 和绑定摘要。`rh-session-info`
+  经正常审批的 exec 返回 `view=session`，正文不能自行声明可信。命令、路径、目的地址、业务数据、
+  诊断、项目 HOSTNAME/HOST/TZ 和 SSHFS/SFTP 字节保持原值。`--project-timezone` / `RH_PROJECT_TZ`
+  仅显式覆盖项目执行，v3 拒绝旧 `--session-timezone` / `RH_SESSION_TZ`，已冻结 v2 保留原语义。
+  native claim/adopt 保留展示身份，Claude 断线恢复指定确切 UUID；终端 Codex 通用 `resume --last`
+  无法证明绑定而被拒绝，native Codex 保留已登记 thread。不虚构可选字段。首版报告
+  timestamp_conversion=false，保留完整时间组。新 native lease 明确记录策略版本，不能因策略缺失而
+  降级；pre-policy 活会话需要已知的私有只读 injector 快照，保留原环境和冻结 MCP 实现。
+  select/bind 使用 injector 返回的绝对 Python 和冻结脚本路径。完整保留 POSIX TZ 字符串及安全
+  自定义时区文件名，TZDIR 单独校验。Linux sshfs 使用 fsname=remote-harness，挂载来源保存在仅本人
+  可读的挂载记录里；垫片 stderr 把项目根路径映射回挂载点。
 
 ## Gateway 安全
 
@@ -161,3 +177,8 @@ git diff --check
 `tests/verify-orca-version.sh <orcad 包或 CLI> [<上一版本的包或 CLI>]`；设置 `RH_TEST_CODEX_CLI`
 可同时测试原生 Codex 聊天。它只使用临时 profile。启动测试报告的 Claude 参数需先审查，再加入
 `KNOWN_FLAGS`。
+
+Agent 主机上装有 Claude 时，还需运行
+`RH_TEST_CLAUDE_CLI=/absolute/path/to/claude python3 tests/test_claude_hooks.py -v`。
+它使用临时 HOME、虚拟 API key 和回环模型 fixture，验证真实 CLI 的 hook 取消、无效输出及启动失败。
+未保护的对照必须复现 Agent 主机上的执行；受保护的失败场景必须不生成两端执行标记。不调用真实模型。

@@ -59,7 +59,7 @@ resource_lock() {
       ''|*[!0-9]*) ;;
       *)
         _rl_start=$(kv_b64 "$RESOURCE_LOCK/owner" START)
-        _rl_observed=$(process_start "$_rl_pid")
+        _rl_observed=$(process_start "$_rl_pid" "$_rl_start")
         if ! kill -0 "$_rl_pid" 2>/dev/null || { [ -n "$_rl_start" ] && [ -n "$_rl_observed" ] && [ "$_rl_observed" != "$_rl_start" ]; }; then
           rm -f "$RESOURCE_LOCK/owner" 2>/dev/null
           rmdir "$RESOURCE_LOCK" 2>/dev/null || true
@@ -159,7 +159,14 @@ ssh_config_ok() {  # per-launch session SSH config: $RH_HOME/.sessions/<dir>/ssh
   return 0
 }
 
-process_start() { trim "$(ps -p "$1" -o lstart= 2>/dev/null)"; }
+process_start() {
+  # New records are independent of session TZ/locale; old records retain their original format.
+  case "${2-UTC:}" in
+    UTC:*) _ps_start=$(TZ=UTC TZDIR=/usr/share/zoneinfo LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null)
+      [ -z "$_ps_start" ] || printf 'UTC:%s' "$(trim "$_ps_start")";;
+    *) trim "$(ps -p "$1" -o lstart= 2>/dev/null)";;
+  esac
+}
 
 # The launcher writes owner.env once, so the watcher's polls read it only once per session dir.
 owner_record() {  # $1=session dir -> or_pid / or_start / or_tty
@@ -177,7 +184,7 @@ owner_state() {
   owner_record "$1"
   case "$or_pid" in ""|*[!0-9]*) return 0 ;; esac
   kill -0 "$or_pid" 2>/dev/null || return 1
-  _os_observed=$(process_start "$or_pid")
+  _os_observed=$(process_start "$or_pid" "$or_start")
   [ -n "$_os_observed" ] || return 0
   if [ -n "$or_start" ] && [ "$_os_observed" != "$or_start" ]; then
     return 1  # pid reused by an unrelated process
@@ -243,8 +250,15 @@ mark_disconnected() (  # $1=session dir $2=reason
   umask 077
   _md_file=$(resume_marker "$1") || return 0
   private_session_dirs "$SESSIONS/.resume" 2>/dev/null || return 1
-  [ ! -L "$_md_file.tmp" ] && [ ! -L "$_md_file" ] || return 1
-  printf 'REASON=%s\nTIME=%s\n' "$2" "$(date +%s)" > "$_md_file.tmp" && chmod 600 "$_md_file.tmp" && mv "$_md_file.tmp" "$_md_file"
+  [ ! -L "$_md_file" ] || return 1
+  _md_temp=$(mktemp "$SESSIONS/.resume/.marker.XXXXXX") || return 1
+  trap 'rm -f "$_md_temp"' EXIT
+  {
+    printf 'REASON=%s\nTIME=%s\n' "$2" "$(date +%s)"
+    if [ -f "$1/presentation-resume.env" ] && [ ! -L "$1/presentation-resume.env" ]; then
+      sed -n -E '/^(PRESENTATION_ID|CONVERSATION_ID)=[0-9a-f-]{36}$/p' "$1/presentation-resume.env"
+    fi
+  } > "$_md_temp" && chmod 600 "$_md_temp" && mv "$_md_temp" "$_md_file"
 )
 
 terminate_owner() {
@@ -558,6 +572,7 @@ case "${1:-}" in
     [ -n "${2:-}" ] || exit 2
     _rt_file=$(resume_marker "$2") && [ -f "$_rt_file" ] || exit 0
     printf 'RESUME=%s,%s\n' "$(sed -n 's/^REASON=\([a-z]*\)$/\1/p' "$_rt_file")" "$(sed -n 's/^TIME=\([0-9]*\)$/\1/p' "$_rt_file")"
+    sed -n -E '/^(PRESENTATION_ID|CONVERSATION_ID)=[0-9a-f-]{36}$/p' "$_rt_file"
     rm -f "$_rt_file"
     ;;
   reap|release) [ -n "${2:-}" ] || exit 2; release_session "$2" "${3:-}" ;;

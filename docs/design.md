@@ -138,9 +138,74 @@ host; `inject-rule.sh` reports when other users have accounts or processes there
 warns once. Linux sshfs mounts show the fixed fsname `remote-harness` in the world-readable mount
 table, and sessions read the mount's source from its private record instead. Default mountpoints sit
 in an owner-only `mounts` directory. Claude sessions deny Read/Edit (which covers Grep and Glob) on
-`$RH_HOME/.sessions` and Read on `/proc`, and `rh-session` blanks the laptop's address and port in
-`SSH_CONNECTION`/`SSH_CLIENT`. Bash output itself names the project-host path and user, and reaches
-the model like any tool output.
+`$RH_HOME/.sessions`, `/proc` and host metadata files, including `/etc/timezone`, `/etc/localtime`
+and its resolved target, `/etc/hostname`, `/etc/hosts`, machine identity and DMI paths. `rh-session`
+blanks every address and port in `SSH_CONNECTION`/`SSH_CLIENT`. Native wrappers reapply the
+center snapshot after overlaying their daemon environment.
+
+New sessions use presentation policy v3. The authenticated center's login environment supplies its
+real hostname, machine ID when available, effective `TZ`/`TZDIR`, and the verified SSH server address.
+Optional fields are unavailable when not verified; country and cloud region are never inferred.
+When `TZ` is unset, execution uses the center's real `/etc/localtime`; an IANA name is displayed only
+when a zoneinfo link or identical zone data verifies it. Custom timezone directories remain bound
+to the effective timezone. This changes neither the OS hostname nor machine ID.
+
+`project-session-info.sh` generates the authoritative source/target table on the project host,
+under `~/.remote-harness/presentation-v3`, outside the project worktree. Directories are 0700 and
+files 0600; parsing is a fixed ordered record protocol, never shell evaluation. Atomic creation,
+strict permissions, hashes and project/logical-session bindings reject corrupt, symlinked or changed
+state. Each gateway key keeps one immutable view. A new logical conversation has its own presentation
+UUID. Orca claim/adopt retains that UUID across mounts; old unbound conversations require a new v3
+conversation. The center persists only the target profile, presentation ID and version/binding hashes.
+It never receives project source fields or runs a second replacement pass.
+
+Use the ordinary approved routed command `rh-session-info` for structured `view=session` identity
+metadata. This trusted project adapter serializes the center view before returning it. Its address
+is conversation identity, not a project service endpoint. Ordinary `hostname`, `date`, `ip`, `curl`,
+stdout/stderr, diagnostics, business logs, source files, Git/rg records and SSHFS/SFTP bytes retain
+real project values. Command text, arguments, paths and destinations are unchanged. A body claiming
+`view=session` does not activate a parser or confer trust. v3 installs no result-replacement hook.
+
+The initial project adapter reports `timestamp_conversion=false` and emits no converted clock
+records. Unknown, historical, naive, offset-bearing and business timestamps therefore remain
+unchanged as complete groups. No fixed-hour offset substitution or binary TZif replacement occurs.
+
+Project execution keeps its own login environment, including `HOSTNAME`/`HOST` and user `TZ`.
+`--project-timezone IANA` / `RH_PROJECT_TZ` is an explicit project-only override, applied after
+profiles/snapshots and to internal Git/rg; `TZ=UTC date` still overrides it. It never sets center
+display time. v3 rejects `--session-timezone` / `RH_SESSION_TZ` with migration guidance rather than
+silently changing their old shared meaning. Existing frozen v2 sessions retain their old project
+presentation policy and shared timezone; v2 inventories are never reversed in place.
+
+Native provider restarts also support pre-policy sessions. A missing policy alone never enables
+compatibility: the private, read-only frozen injector must match one of the eight released snapshots
+from native Paseo support (63812a7) through 65a8567. Those sessions retain their original daemon
+TZ/TZDIR/HOSTNAME behavior and private frozen Codex MCP implementation. New sessions record their
+presentation policy version in a private manifest and lease; missing, corrupt or conflicting policy
+state is rejected. An unrecognized old snapshot requires a new session.
+
+Presentation finalization uses `RH_PRESENTATION_PYTHON` and `RH_PRESENTATION_SCRIPT`, returned by
+the injector: the absolute interpreter selected in its login environment and its private frozen
+implementation. Follow-up SSH calls quote those paths and every argument, and do not rediscover
+Python in the ordinary SSH PATH or run a mutable global helper.
+
+Effective TZ strings preserve POSIX quoted abbreviations (`<+03>-3`), DST rules, optional leading
+colons and safe timezone file names such as `custom.v1` in the recorded TZDIR. Explicit POSIX
+expressions are syntax-checked on both hosts; controls and shell metacharacters are rejected.
+Safe bare names can be custom files and are not asserted to be valid IANA names. The project never
+needs the center's zone files to parse the record, and TZDIR validation remains separate.
+
+Terminal Claude starts with an explicit conversation UUID. Disconnect markers carry its exact
+conversation and presentation UUIDs, and reconnect uses `--resume <UUID>` rather than guessing the
+most recently updated conversation. Native Codex continues its registered private thread. Generic
+terminal Codex `resume --last` cannot prove a thread binding and v3 refuses that recovery path with
+an explicit explanation; use a new conversation or a bound native Codex chat. Manual history switches
+inside a terminal CLI are outside the Harness automatic-resume guarantee. Legacy disconnect markers
+without exact identity cannot be mixed into v3. Lease/owner process identities remain UTC/C-locale.
+
+This is a presentation boundary, not an OS sandbox. It does not alter network egress, geolocation,
+latency, previous messages or external telemetry. A same-user arbitrary shell can read private
+Harness state; the table is not an isolation boundary against that user.
 
 This prevents the direct and common indirect local-agent paths. Arbitrary project shell is still
 Turing-complete, and gateway SFTP is not chrooted to the registered project. An absolute security

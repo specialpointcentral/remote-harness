@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import shutil
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -168,12 +169,22 @@ pathlib.Path(str(key) + '.pub').write_text('public key')
         reaper = session / 'impl' / 'session-reaper.sh'
         reaper.chmod(0o700)
         reaper.write_text('#!/bin/sh\nexit 0\n')
+        sys.path.insert(0, str(SCRIPTS))
+        from session_privacy import Policy, profile_lines, private_json, bind_presentation
+        cache = session / 'privacy.json'
+        gateway = self.home / 'gateway'
+        gateway.mkdir(mode=0o700)
+        summary = subprocess.check_output(['bash', str(SCRIPTS / 'project-session-info.sh'), 'prepare',
+            str(gateway), str(self.home / 'tables'), str(self.project), private_json(cache)['presentation_id'],
+            encoded(profile_lines(Policy(cache).project))], text=True, env=self.env).strip()
+        bind_presentation(cache, self.rh, summary)
         artifact = self.project / 'normal-project-file'
         agent = ('import json,os,pathlib,subprocess; '
                  'mask=os.umask(0); os.umask(mask); '
                  f'pathlib.Path({str(artifact)!r}).write_text("normal"); '
                  'print(json.dumps({"pid":os.getpid(), "mask":mask, '
-                 '"start":subprocess.check_output(["ps","-p",str(os.getpid()),"-o","lstart="],text=True).strip()}))')
+                 '"start":"UTC:"+subprocess.check_output(["ps","-p",str(os.getpid()),"-o","lstart="],'
+                 'env=dict(os.environ,TZ="UTC",TZDIR="/usr/share/zoneinfo",LC_ALL="C"),text=True).strip()}))')
         launched = self.run_shell(shlex.join([str(session / 'bin' / 'rh-session'), sys.executable, '-c', agent]))
         observed = json.loads(launched.stdout)
         owner = dict(line.split('=', 1) for line in (session / 'owner.env').read_text().splitlines())
@@ -289,6 +300,61 @@ pathlib.Path(str(key) + '.pub').write_text('public key')
         self.reaper('gc')
         self.assertFalse(session.exists())
         self.assertFalse(cfg.exists())
+
+    def test_presentation_followups_use_login_python_and_frozen_script_with_quoted_paths(self):
+        plain = self.home / 'ordinary-path'
+        plain.mkdir()
+        for name in ('bash', 'sh', 'env', 'dirname', 'basename', 'base64', 'mkdir', 'chmod', 'cp', 'cat', 'ln',
+                     'sed', 'tr', 'awk', 'grep', 'tail', 'head', 'ps', 'id', 'date', 'uname',
+                     'readlink', 'git', 'mktemp', 'rm', 'find', 'sleep', 'nohup', 'setsid',
+                     'ssh', 'wc', 'sort'):
+            if path := shutil.which(name):
+                (plain / name).symlink_to(path)
+        login = self.home / "login tools 'only"
+        login.mkdir()
+        runtime = login / 'python3'
+        runtime.symlink_to(sys.executable)
+        state = self.home / "center state 'quoted"
+        cfg = self.home / 'transport-config'
+        cfg.write_text('Host fixture\n')
+        profile = self.home / 'login-initialization'
+        profile.write_text('export PATH=' + shlex.quote(str(login) + ':' + str(plain)) + '\n')
+        ordinary = dict(self.env, PATH=str(plain), RH_HOME=str(state))
+        missing = subprocess.run([str(plain / 'bash'), '-c', 'command -v python3'], env=ordinary,
+                                 capture_output=True)
+        self.assertNotEqual(missing.returncode, 0)
+        args = [str(SCRIPTS / 'inject-rule.sh'), 'on', 'codex', str(self.project), 'fixture',
+                str(self.project), 'normal', str(cfg), 'login-python']
+        result = subprocess.run([str(plain / 'bash'), '--noprofile', '--norc', '-ic',
+            '. "$1"; shift; exec "$@"', 'fixture', str(profile), *args], env=ordinary,
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+        session = Path(values['RH_SESSION_DIR'])
+        self.assertEqual(values['RH_PRESENTATION_PYTHON'], str(runtime))
+        self.assertEqual(values['RH_PRESENTATION_SCRIPT'], str(session / 'impl/session_privacy.py'))
+        # Replacing a global helper must not affect this session's already frozen implementation.
+        (state / 'scripts').mkdir()
+        (state / 'scripts/session_privacy.py').write_text('raise RuntimeError("mutable global helper")')
+        def followup(*arguments):
+            command = subprocess.check_output([str(plain / 'bash'), '-uc',
+                '. "$1"; shift; presentation_command "$@"', 'fixture', str(SCRIPTS / '_common.sh'),
+                values['RH_PRESENTATION_PYTHON'], values['RH_PRESENTATION_SCRIPT'], *arguments],
+                env=ordinary, text=True)
+            self.assertEqual(shlex.split(command)[1:4], [str(runtime), '-EsB', values['RH_PRESENTATION_SCRIPT']])
+            output = subprocess.run([str(plain / 'bash'), '-c', command], env=ordinary,
+                                    text=True, capture_output=True)
+            self.assertEqual(output.returncode, 0, output.stderr)
+            return output.stdout
+        selected = dict(line.split('=', 1) for line in followup('select', str(session / 'privacy.json'),
+            str(state), 'new', 'codex').splitlines())
+        gateway = self.home / 'project-gateway'
+        gateway.mkdir(mode=0o700)
+        summary = subprocess.check_output(['bash', str(SCRIPTS / 'project-session-info.sh'), 'prepare',
+            str(gateway), str(self.home / 'project-tables'), str(self.project), selected['PRESENTATION_ID'],
+            selected['CENTER_PROFILE_B64']], env=self.env, text=True).strip()
+        followup('bind', str(session / 'privacy.json'), str(state), summary)
+        self.assertTrue(json.loads((session / 'privacy.json').read_text())['binding'])
 
     def test_local_records_and_resume_sweep_respect_live_and_shared_sessions(self):
         library = self.local_library()

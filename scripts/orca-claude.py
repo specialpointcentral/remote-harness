@@ -131,9 +131,13 @@ def main():
     rule = (session / "rule.md").read_text(encoding="utf8")
     env = os.environ.copy()
     env.update(lease["env"])
-    for key in ("SSH_CONNECTION", "SSH_CLIENT"):
+    from orca_native import session_presentation
+    presentation = session_presentation(session, lease)
+    keys = ("SSH_CONNECTION", "SSH_CLIENT") + (("TZ", "TZDIR") if presentation.version else ())
+    for key in keys:
         if key not in lease["env"]:
             env.pop(key, None)
+    presentation.environment(env)
     os.execve(command, [str(command), *argv, "--settings", settings_json,
                         "--append-system-prompt", rule], env)
 

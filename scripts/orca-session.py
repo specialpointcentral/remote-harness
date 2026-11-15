@@ -248,7 +248,7 @@ def lease_environment(session, agent):
     shim, _, rest = os.environ.get("PATH", "").partition(os.pathsep)
     if not shim or Path(shim).resolve() != session / "bin":
         raise OrcaError("Orca cannot start without the Harness PATH shims.")
-    keys = ["SSH_CONNECTION", "SSH_CLIENT"]
+    keys = ["SSH_CONNECTION", "SSH_CLIENT", "TZ", "TZDIR"]
     if agent == "claude":
         keys.extend(("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "CLAUDE_CODE_BASH_EDIT_DIFF",
                      "USE_BUILTIN_RIPGREP"))
@@ -543,6 +543,12 @@ def claim_chat(home, agent, label, sid, project, ui="orca"):
             raise OrcaError(f"Orca chat {label} cannot be continued here. It may belong to another "
                             "project, its earlier launch may still be running, or Orca no longer has it.")
         cwd = Path(chat["record"]["cwd"])
+        if os.environ.get("RH_REQUIRE_PRESENTATION_V3") == "1":
+            from session_privacy import validate_presentation_id
+            try:
+                validate_presentation_id(chat["record"]["presentation_id"])
+            except (ValueError, KeyError) as error:
+                raise OrcaError("This legacy chat has no v3 presentation binding. Start a new conversation.") from error
         # The launch's bridge sets a new token; until then the chat has no tool lease.
         record = {**chat["record"], "session": f"{session_key(cwd)}.{sid}", "token": "",
                   "agent": agent, "project": project}
@@ -568,12 +574,22 @@ def adopt_conversation(home, agent, conversation, sid, project):
                             "project, a terminal launch may still use the project, or an Orca chat "
                             "already continues it.")
         source = claude_project_dir(os.path.realpath(home / "mounts" / project.rstrip("/").rpartition("/")[2]))
+        presentation = {}
+        if os.environ.get("RH_REQUIRE_PRESENTATION_V3") == "1":
+            from session_privacy import presentation_for_conversation, alias_presentation
+            try:
+                presentation["presentation_id"] = presentation_for_conversation(home, conversation)
+            except (OSError, ValueError, KeyError) as error:
+                raise OrcaError("This legacy conversation has no v3 presentation binding. Start a new conversation.") from error
         cwd = reserve(home, sid)
         provider = fork_conversation(source / f"{conversation}.jsonl", cwd)
+        if presentation:
+            alias_presentation(home, provider, presentation["presentation_id"])
         registry = private_dir(home / IDENTITIES, create=True)
         write_once(registry / f"{provider}.json", {
             "cwd": str(cwd), "session": f"{session_key(cwd)}.{sid}", "token": "", "agent": agent,
             "project": project, "created": int(time.time()), "from": conversation,
+            **presentation,
         })
     return cwd
 
@@ -613,6 +629,16 @@ def main():
         raise OrcaError("Install the Orca Harness command wrapper on the agent host.")
     # A launch either continues the chat it claimed for this mount or creates a new chat.
     record_path, resumed = claimed_chat(home, agent, cwd, session)
+    presentation = {}
+    try:
+        from session_privacy import private_json as presentation_json
+        cache = presentation_json(session / "privacy.json")
+        if cache.get("version") == 3:
+            presentation["presentation_id"] = cache["presentation_id"]
+            if resumed and resumed.get("presentation_id") != cache["presentation_id"]:
+                raise OrcaError("The resumed chat has a different presentation binding.")
+    except FileNotFoundError:
+        pass  # Older frozen sessions have no v3 cache.
     client = OrcaClient(configuration)
     status = client.call("status.get")
     require_server_version(status)
@@ -656,6 +682,8 @@ def main():
             "token": token, "pid": os.getpid(), "identity": process_identity(os.getpid()),
             "python": python, "approval": approval, "cwd": str(cwd), **launch_settings,
             "env": lease_environment(session, agent),
+            **({"presentation_policy": private_json(session / "presentation-policy.json")["presentation_policy"]}
+               if os.path.lexists(session / "presentation-policy.json") else {}),
         })
         leased = True
 
@@ -736,7 +764,11 @@ def main():
                 write_once(registry / f"{provider_id}.json", {
                     "cwd": str(cwd), "session": session.name, "token": token, "chat": session_id,
                     "agent": agent, "project": project, "created": int(time.time()),
+                    **presentation,
                 })
+                if presentation and agent == "claude":
+                    from session_privacy import alias_presentation
+                    alias_presentation(home, provider_id, presentation["presentation_id"])
             grant()
             if stopped:
                 return
@@ -803,12 +835,23 @@ if __name__ == "__main__":
         if sys.argv[1:2] == ["chats"] and len(sys.argv) in (5, 6):
             list_chats(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])
         elif sys.argv[1:2] == ["claim"] and len(sys.argv) in (7, 8):
-            mountpoint, conversation = claim_chat(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])
+            home = Path(sys.argv[2]).resolve(strict=True)
+            mountpoint, conversation = claim_chat(home, *sys.argv[3:])
             print(f"MOUNTPOINT={mountpoint}")
+            if os.environ.get("RH_REQUIRE_PRESENTATION_V3") == "1":
+                from session_privacy import alias_presentation
+                registry = CODEX_CHATS if sys.argv[3] == "codex" else IDENTITIES
+                identity = private_json(home / registry / f"{conversation}.json")["presentation_id"]
+                print(f"PRESENTATION_ID={identity}")
+                if sys.argv[3] == "claude":
+                    alias_presentation(home, conversation, identity)
             if sys.argv[7:] == ["terminal"]:
                 print(f"RESUME={conversation}")
         elif sys.argv[1:2] == ["adopt"] and len(sys.argv) == 7:
             print(f"MOUNTPOINT={adopt_conversation(Path(sys.argv[2]).resolve(strict=True), *sys.argv[3:])}")
+            if os.environ.get("RH_REQUIRE_PRESENTATION_V3") == "1":
+                from session_privacy import presentation_for_conversation
+                print("PRESENTATION_ID=" + presentation_for_conversation(Path(sys.argv[2]), sys.argv[4]))
         else:
             main()
     except OrcaLost as error:

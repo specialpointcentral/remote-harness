@@ -35,6 +35,8 @@ while [ $# -gt 0 ]; do
     --launch)     need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
     --ui)         need_arg "$1" "${2-}"; UI="$2"; shift 2;;
     --approval)   need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
+    --session-timezone) need_arg "$1" "${2-}"; export RH_SESSION_TZ="$2"; shift 2;;
+    --project-timezone) need_arg "$1" "${2-}"; export RH_PROJECT_TZ="$2"; shift 2;;
     --yolo)       APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
@@ -46,6 +48,7 @@ case "$LAUNCH" in
 esac
 
 validate_launch_ui "$UI" "$LAUNCH" || exit 2
+validate_presentation_options || exit 2
 
 if [ -n "$MODE" ]; then
   MODE="$(normalize_mode "$MODE")" || { printf 'unsupported --mode %s\n' "$MODE" >&2; exit 2; }

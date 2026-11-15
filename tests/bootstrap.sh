@@ -7,7 +7,7 @@ trap 'rm -rf "$fixture"' EXIT
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 mkdir -p "$fixture/bin" "$fixture/source/scripts" "$fixture/home"
 cp "$ROOT/scripts/simple-bootstrap.sh" "$fixture/source/scripts/"
-for helper in _common.sh simple-laptop-setup.sh laptop-setup.sh mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh; do
+for helper in _common.sh simple-laptop-setup.sh laptop-setup.sh mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh project-session-info.sh; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/source/scripts/$helper"
 done
 cat > "$fixture/source/scripts/simple-dispatch.sh" <<'SH'

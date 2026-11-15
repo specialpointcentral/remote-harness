@@ -307,7 +307,7 @@ def rg_config_args() -> list[str]:
     return [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
 
 
-def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
+def rg_plan(ctx: Context, argv: list[str], cwd: str, *, local_policy=False) -> tuple[str, list[str]]:
     if not ctx.inside(cwd):
         raise StayLocal()
     ctx.touches_mount = True
@@ -352,6 +352,8 @@ def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
 
     def option(name: str, index: int, prefix: str = "") -> None:
         nonlocal explicit_pattern, mode
+        if local_policy and name == "follow":
+            raise StayLocal()  # Recursive symlinks could lead into remote metadata trees.
         if name in ("regexp", "file"):
             explicit_pattern = True
         if name in ("file", "ignore-file"):
@@ -410,6 +412,8 @@ def rg_plan(ctx: Context, argv: list[str], cwd: str) -> tuple[str, list[str]]:
     # -e/-f can occur after a positional: then *all* positionals name search paths.
     if not explicit_pattern and mode not in ("files", "type-list") and paths:
         paths.pop(0)
+    if local_policy and not paths:
+        ctx.translate_path(".", cwd)
     for index in paths:
         if args[index] == "-":
             raise StayLocal()
@@ -826,7 +830,45 @@ def missing_marker(args: Args) -> str:
     return os.path.join(os.path.dirname(args.slots_dir.rstrip("/")), f"tool-missing.{args.tool}")
 
 
+def local_rg_allowed(policy, argv, cwd):
+    if argv in (["--version"], ["-V"], ["--help"], ["-h"], ["--type-list"]):
+        return True
+
+    class Paths:
+        checked = 0
+
+        def inside(self, path):
+            return True
+
+        def translate_path(self, path, base):
+            if not policy.path_allowed(path, base):
+                raise StayLocal()
+            self.checked += 1
+            return path
+
+    paths = Paths()
+    try:
+        # Use the same option roles as routing, including -nfFILE and positional names with '='.
+        # Unknown options and executable helpers fail closed on the agent host.
+        rg_plan(paths, argv, cwd, local_policy=True)
+        return bool(paths.checked) or policy.path_allowed(cwd, cwd)
+    except StayLocal:
+        return False
+
+
 def run_local(ctx: Context, argv: list[str]) -> int:
+    if ctx.args.privacy_policy:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from session_privacy import Policy
+            policy = Policy(ctx.args.privacy_policy)
+            allowed = (local_rg_allowed(policy, argv, os.getcwd()) if ctx.args.tool == "rg"
+                       else policy.local_search_allowed(argv, os.getcwd()))
+            if not allowed:
+                raise ValueError("metadata search")
+        except (OSError, ValueError, KeyError, TypeError):
+            sys.stderr.write("remote-harness: remote metadata search unavailable\n")
+            return 2
     real = ctx.args.real
     if not real:
         sys.stderr.write("remote-harness: category=tool exit=127 session=unknown\n")
@@ -869,11 +911,12 @@ class Args:
 
     OPTIONS = ("--tool", "--real", "--real-argv0", "--runner", "--ssh-config", "--alias",
                "--project-root", "--mount-root", "--control-path", "--slots-dir", "--concurrency",
-               "--warm-socket")
+               "--warm-socket", "--privacy-policy")
     REQUIRED = ("tool", "runner", "ssh_config", "alias", "project_root", "mount_root", "slots_dir")
 
     def __init__(self, argv: list[str]) -> None:
         self.real = ""
+        self.privacy_policy = ""
         self.real_argv0 = ""  # e.g. a native Claude binary serving `rg`
         self.control_path = ""
         self.concurrency = "6"
@@ -904,6 +947,19 @@ def main() -> int:
         return 2
     argv = raw[split + 1:]
     ctx = Context(args)
+    if args.privacy_policy and args.tool == "rg" and "--no-config" not in argv:
+        # rg_plan itself reads this agent-side configuration before choosing a route.
+        config = os.environ.get("RIPGREP_CONFIG_PATH")
+        if config:
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                from session_privacy import Policy
+                privacy = Policy(args.privacy_policy)
+                if not privacy.path_allowed(config, os.getcwd()):
+                    raise ValueError("metadata config")
+            except (OSError, ValueError, KeyError, TypeError):
+                sys.stderr.write("remote-harness: remote metadata search unavailable\n")
+                return 2
 
     try:
         cwd = os.getcwd()

@@ -1,5 +1,12 @@
 # Helper Scripts
 
+- `session_privacy.py`: v3 real center profile and presentation-ID/binding cache; frozen v2 policies
+  remain readable. The center has no project source mapping or result replacement pass.
+- `project-session-info.sh`: project-owned private table and approved `rh-session-info` adapter for
+  `view=session`; ordinary diagnostics and files remain unchanged. It reports
+  `timestamp_conversion=false`. `--project-timezone` / `RH_PROJECT_TZ` overrides project execution
+  only; v3 rejects legacy `--session-timezone` / `RH_SESSION_TZ`. See [boundaries](../docs/design.md).
+
 - `simple-bootstrap.sh`: public local entry; fetches reverse helpers when the skill exists only remotely.
 - `simple-dispatch.sh`: reverse-only dispatcher; rejects forward.
 - `simple-laptop-setup.sh`: local reverse wizard. A remembered remote mountpoint is offered only for the
@@ -104,7 +111,7 @@
   login shell. A snapshot that fails to load at run time refuses that one command (status 125) and is
   discarded. `RH_SHELL_SNAPSHOT=off` at launch disables it. Both dispatch verbs remove common AI
   credentials, `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`, `SSH_ORIGINAL_COMMAND`,
-  `RH_GATEWAY_SESSION_DIR`, `HOSTNAME` and `HOST` from the command environment. Shell commands repeat
+  `RH_GATEWAY_SESSION_DIR` from the command environment, preserving project `HOSTNAME`/`HOST`. Shell commands repeat
   the cleanup after the profile or snapshot; a readonly variable that prevents cleanup refuses the
   command with status 125. Not carried over: non-exported shell variables and zsh aliases (bash does
   not expand aliases in commands anyway).

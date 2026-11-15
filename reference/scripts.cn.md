@@ -2,6 +2,13 @@
 
 # 辅助脚本
 
+- `session_privacy.py`：v3 真实中心 profile 与 presentation ID/绑定缓存；兼容读取已冻结 v2。
+  中心不保存项目原值映射，也不进行结果二次替换。
+- `project-session-info.sh`：项目侧私有表和经正常审批的 `rh-session-info` 展示入口，输出
+  `view=session`，普通诊断和文件保持真实值。首版报告 `timestamp_conversion=false`。
+  `--project-timezone` / `RH_PROJECT_TZ` 只覆盖项目执行；v3 拒绝旧
+  `--session-timezone` / `RH_SESSION_TZ`。参见[边界说明](../docs/design.cn.md)。
+
 - `simple-bootstrap.sh`：公开本地入口；skill 只在远端时 fetch reverse helper。
 - `simple-dispatch.sh`：reverse-only dispatcher，拒绝 forward。
 - `simple-laptop-setup.sh`：本地 reverse 向导。记住的远端挂载点只在对应的项目目录下作为默认值；

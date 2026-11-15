@@ -438,10 +438,13 @@ def serve(command, binding):
     mount = Path(lease["cwd"]).resolve(strict=True)
     env = os.environ.copy()
     env.update(lease["env"])
+    from orca_native import session_presentation
+    presentation = session_presentation(session, lease)
     for key in ("SSH_CONNECTION", "SSH_CLIENT", PASEO_SESSION_ENV, PASEO_TOKEN_ENV,
-                "BASH_ENV", "ENV", "CODEX_SQLITE_HOME"):
+                "BASH_ENV", "ENV", "CODEX_SQLITE_HOME") + (("TZ", "TZDIR") if presentation.version else ()):
         if key not in lease["env"]:
             env.pop(key, None)
+    presentation.environment(env)
     if Path(env["PATH"].split(os.pathsep)[0]).resolve() != session / "bin":
         raise OrcaError("Codex cannot start without the Harness PATH shims.")
     approval, reviewer = MODES[lease["approval"]]

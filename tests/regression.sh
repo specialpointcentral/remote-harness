@@ -360,7 +360,8 @@ assert_eq "gateway tool argument fidelity" "$tool_quote" "$(git rev-parse --sq-q
 # authentication settings, user output, stderr and exit status while dropping SSH session metadata.
 tool_env_alias='!f() {
   printf "ssh=%s|%s|%s|%s\n" "${SSH_CLIENT-unset}" "${SSH_CONNECTION-unset}" "${SSH_TTY-unset}" "${SSH_ORIGINAL_COMMAND-unset}"
-  env | grep -E "^(HOSTNAME|HOST|RH_GATEWAY_SESSION_DIR)=" >/dev/null && exit 9
+  env | grep -E "^RH_GATEWAY_SESSION_DIR=" >/dev/null && exit 9
+  [ "$HOSTNAME" = fixture-host ] && [ "$HOST" = fixture-host ] || exit 10
   printf "keep=%s|%s|%s\n" "$CPPFLAGS" "$SSH_AUTH_SOCK" "$GIT_SSH_COMMAND"
   printf "user=%s|%s\nhome=%s\n" "$USER" "$LOGNAME" "$HOME"
   [ -n "$PATH" ] && command -v git >/dev/null || exit 8
@@ -769,7 +770,7 @@ pid_gone() { ! kill -0 "$1" 2>/dev/null; }
 wait_gone() { wait_until "${2:-200}" pid_gone "$1"; }  # pid [tenths of a second]
 hb_inject on hb.1 > "$tmp/inject-hb1.out"
 assert_grep "$tmp/inject-hb1.out" "RH_RESUME_AVAILABLE=" "inject reports resume availability"
-assert_grep "$tmp/inject-hb1.out" "RH_RESUME_ARGS=--continue" "inject reports how claude continues"
+assert_grep "$tmp/inject-hb1.out" "RH_RESUME_ARGS=" "fresh v3 injection does not guess a conversation"
 refute_grep "$tmp/inject-hb1.out" "RH_RESUME_AVAILABLE=heartbeat" "a fresh mountpoint offers no resume"
 hb_sd=$(sed -n 's/^RH_SESSION_DIR=//p' "$tmp/inject-hb1.out")
 hb_watch() {  # runs the watcher on a sleeping stand-in agent
@@ -1037,8 +1038,10 @@ assert hook["hooks"][0]["command"].endswith(" --agent claude")
 assert hook["hooks"][0]["onFailure"] == "block"
 assert hook["hooks"][0]["timeout"] > 10  # the shell policy subprocess has a 10-second limit
 # Session files (gateway key, SSH config, runner, private logs) stay out of Claude's file tools.
-assert settings["permissions"]["deny"] == ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
-                                           f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)"], settings
+for rule in ["EnterWorktree", "ExitWorktree", f"Read(/{sys.argv[2]}/**)",
+             f"Edit(/{sys.argv[2]}/**)", "Read(//proc/**)", "Read(//etc/timezone)", "Read(//etc/localtime)"]:
+    assert rule in settings["permissions"]["deny"], rule
+assert "PostToolUse" not in settings["hooks"]  # v3 does no center result replacement
 # Auto mode's classifier learns what the rewritten runner form is. The user has no environment of
 # their own here, so the shipped one stays in effect (a host's managed settings may hold one).
 words = shlex.split(hook["hooks"][0]["command"])
@@ -1100,10 +1103,14 @@ PY
     "$ROOT/scripts/inject-rule.sh" off claude "$am_mount" >/dev/null
 done
 rmdir "$rh_home/mounts/code" 2>/dev/null || true
-# Without its session directory the launcher starts no watcher; it only prepares the agent's environment.
-assert_eq "the agent sees no laptop address in SSH_CONNECTION/SSH_CLIENT" \
-  "$(SSH_CONNECTION='192.0.2.7 51234 10.0.0.5 22' SSH_CLIENT='192.0.2.7 51234 22' \
-     "$tmp/claude-rh-session" sh -c 'printf "%s|%s" "$SSH_CONNECTION" "$SSH_CLIENT"')" "0.0.0.0 0 10.0.0.5 22|0.0.0.0 0 22"
+# A copied launcher cannot run after its private policy/implementation was removed.
+stale_marker="$tmp/stale-launcher-executed"
+stale_status=0
+SSH_CONNECTION='192.0.2.7 51234 10.0.0.5 22' SSH_CLIENT='192.0.2.7 51234 22' \
+  "$tmp/claude-rh-session" sh -c 'touch "$1"' fixture "$stale_marker" \
+  > "$tmp/stale-launcher.out" 2> "$tmp/stale-launcher.err" || stale_status=$?
+[ "$stale_status" -ne 0 ] || fail "a stale launcher ran without its policy"
+[ ! -e "$stale_marker" ] || fail "a stale launcher executed the agent command"
 missing_cfg_out=$(RH_HOME="$rh_home" HOME="$home_dir" \
   "$ROOT/scripts/inject-rule.sh" on codex "$tmp/code" laptop "$tmp/mount-no-config" 0 || true)
 assert_grep <(printf '%s\n' "$missing_cfg_out") "RH_STATUS=ERROR" "strict codex inject requires ssh config"
@@ -1562,19 +1569,24 @@ PY
       printf 'STATUS=mounted\nMOUNTPOINT=/tmp/rh-remote\n'
       [ -z "${MOUNT_FOLLOW_SYMLINKS:-}" ] || printf 'FOLLOW_SYMLINKS=%s\n' "$MOUNT_FOLLOW_SYMLINKS"
       exit 0;;
+    *'session_privacy.py'*" 'select' "*)
+      printf 'PRESENTATION_ID=22222222-2222-4222-8222-222222222222\nCENTER_PROFILE_B64=%s\n' "$RH_TEST_CENTER_PROFILE_B64"; exit 0;;
+    *'session_privacy.py'*" 'bind' "*) exit 0;;
     *'orca-session.py'*' claim '*' terminal'*)
-      printf 'MOUNTPOINT=/tmp/rh-remote-orca\nRESUME=1b4e28ba-2fa1-41d2-883f-0016d3cca427\n'; exit 0;;
-    *'orca-session.py'*' claim '*) printf 'MOUNTPOINT=/tmp/rh-remote-orca\n'; exit 0;;
-    *'orca-session.py'*' adopt '*) printf 'MOUNTPOINT=/tmp/rh-remote-adopt\n'; exit 0;;
+      printf 'MOUNTPOINT=/tmp/rh-remote-orca\nRESUME=1b4e28ba-2fa1-41d2-883f-0016d3cca427\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
+    *'orca-session.py'*' claim '*) printf 'MOUNTPOINT=/tmp/rh-remote-orca\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
+    *'orca-session.py'*' adopt '*) printf 'MOUNTPOINT=/tmp/rh-remote-adopt\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
     *'orca-session.py'*' chats '*) printf 'RH_ORCA_CHAT=rev.old\t1\t1\tfixture\n'; exit 0;;
     *'inject-rule.sh'*"'orca'"*)
-      printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_LAUNCH_PREFIX=rh-session\nRH_ORCA_LAUNCH=orca-bridge\n'; exit 0;;
-    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=--continue\nRH_APPROVAL=auto\n'; exit 0;;
+      printf 'RH_STATUS=INJECTED\nRH_SESSION_DIR=/remote/.sessions/fixture session\nRH_PRESENTATION_PYTHON=/remote/login bin/python3\nRH_PRESENTATION_SCRIPT=/remote/.sessions/fixture session/impl/session_privacy.py\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_LAUNCH_PREFIX=rh-session\nRH_ORCA_LAUNCH=orca-bridge\n'; exit 0;;
+    *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_SESSION_DIR=/remote/.sessions/fixture session\nRH_PRESENTATION_PYTHON=/remote/login bin/python3\nRH_PRESENTATION_SCRIPT=/remote/.sessions/fixture session/impl/session_privacy.py\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=\nRH_APPROVAL=auto\n'; exit 0;;
   esac
 done
 exit 0
 EOS
 chmod +x "$tmp/bin/ssh"
+RH_TEST_CENTER_PROFILE_B64=$(printf 'HOSTNAME=fixture-center\nIPV4=203.0.113.11\nIPV6=\nMACHINE_ID=cccccccccccccccccccccccccccccccc\nTIMEZONE=Asia/Seoul\nEFFECTIVE_TZ=Asia/Seoul\nEFFECTIVE_TZDIR=\nCOUNTRY=\nREGION=\n' | base64 | tr -d '\n')
+export RH_TEST_CENTER_PROFILE_B64
 proj_home="$tmp/project dir 'home"
 valid_project="$tmp/valid project"
 created_project="$tmp/created project"
@@ -1688,15 +1700,18 @@ assert_eq "the launch history is owner-only" \
   "$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$launch_history")" 0o600
 assert_grep_e "$launch_history" "	END	rev\.[A-Za-z0-9]+	codex/terminal	$valid_project	[0-9]+:[^	]*	connection-lost	exit=255" \
   "the launch history records a dropped connection"
-project_launch "$tmp/resume-next.out"
+resume_next_status=0
+project_launch "$tmp/resume-next.out" 2> "$tmp/resume-next.err" || resume_next_status=$?
+[ "$resume_next_status" -ne 0 ] || fail "terminal Codex resumed without an exact thread binding"
 assert_grep "$tmp/resume-next.out" "ended on a lost connection" "the launch after a dropped ssh offers resume"
 assert_grep "$tmp/resume-next.out" "ended: the interactive SSH connection to the remote dropped (exit code 255)." \
   "the next launch of the project says why the previous one ended"
-assert_grep "$launch_dir.out" "-lic codex --continue" "an accepted resume continues the conversation"
+assert_grep "$tmp/resume-next.err" "v3 cannot verify the exact thread for terminal Codex resume" "terminal Codex recovery refuses to guess a thread"
 [ -z "$(find "$proj_home/.remote-harness/.sessions/.resume" -type f 2>/dev/null)" ] \
   || fail "a local resume marker was not consumed by the launch that offered it"
 project_launch "$tmp/history-ok.out"
-refute_grep "$tmp/history-ok.out" "The previous launch of this project" "an agent that exited normally is not reported"
+project_launch "$tmp/history-after-ok.out"
+refute_grep "$tmp/history-after-ok.out" "The previous launch of this project" "an agent that exited normally is not reported"
 # A launcher that never recorded its end is reported, with how its session went otherwise.
 printf '2026-01-01 00:00:00\tSTART\trev.dead00\tcodex/terminal\t%s\t999999:Thu Jan  1 00:00:00 1970\tstarted\t\n' \
   "$valid_project" >> "$launch_history"
@@ -2052,6 +2067,14 @@ rp_key="$(printf '%s' "$tmp/rp-mount" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
 rp_sd="$rp_rh/.sessions/$rp_key.rev.rp1"
 assert_grep "$tmp/rp-inject.out" "RH_LAUNCH_PREFIX='$rp_sd/bin/rh-session'" "inject exposes the session launcher"
 [ -x "$rp_sd/bin/git" ] || fail "inject did not install the git shim"
+python3 - "$ROOT" "$rp_sd" "$rp_rh" "$tmp/rp-code" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / 'tests'))
+from fixtures.privacy import bind_v3
+bind_v3(Path(sys.argv[2]), Path(sys.argv[3]), project=sys.argv[4])
+PY
 
 # Agent exits without any local cleanup: the watcher removes leftovers server-side.
 python3 -c 'import sys, time; time.sleep(300)' "$rp_sd/bin/rh-run" &
@@ -2106,6 +2129,7 @@ python3 "$ROOT/tests/test_dispatch_lifecycle.py" -v
 python3 "$ROOT/tests/test_project_host_tool.py" -v
 python3 "$ROOT/tests/test_shell_snapshot.py" -v
 python3 "$ROOT/tests/test_rule_privacy.py" -v
+python3 "$ROOT/tests/test_session_privacy.py" -v
 python3 "$ROOT/tests/test_session_files.py" -v
 python3 "$ROOT/tests/test_diagnostics.py" -v
 python3 "$ROOT/tests/test_shell_policy.py" -v

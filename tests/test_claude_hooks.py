@@ -6,6 +6,7 @@ The CLI uses a temporary home, a dummy API key and a scripted local Messages end
 or user credentials are used. Run this on the agent host, never on a user's project host.
 """
 import json
+import base64
 import os
 from pathlib import Path
 import shlex
@@ -108,8 +109,10 @@ class ModelFixture(BaseHTTPRequestHandler):
                    if block.get('type') == 'tool_result' and block.get('tool_use_id', '').startswith('toolu_rh_')]
         self.server.results.extend(results)
         blocks = ([{'type': 'text', 'text': 'Fixture finished.'}] if results else
-                  [{'type': 'tool_use', 'id': 'toolu_rh_1', 'name': 'Bash',
-                    'input': {'command': 'printf executed > execution-marker', 'description': 'Test routing'}}])
+                  [{'type': 'tool_use', 'id': 'toolu_rh_1', 'name': getattr(self.server, 'tool_name', 'Bash'),
+                    'input': getattr(self.server, 'tool_input', None) or {
+                        'command': getattr(self.server, 'command', 'printf executed > execution-marker'),
+                        'description': 'Test routing'}}])
         reason = 'end_turn' if results else 'tool_use'
         message = {'id': 'msg_rh_fixture', 'type': 'message', 'role': 'assistant',
                    'model': request['model'], 'content': [], 'stop_reason': None, 'stop_sequence': None,
@@ -138,8 +141,20 @@ class ModelFixture(BaseHTTPRequestHandler):
 
 @unittest.skipUnless(CLAUDE, 'set RH_TEST_CLAUDE_CLI to test an installed Claude on the agent host')
 class ClaudeHookRuntimeTests(ClaudeSessionFixture):
-    def run_cli(self, failure=None, protect=True, project_disables_hooks=False):
+    def run_cli(self, failure=None, protect=True, project_disables_hooks=False,
+                command='printf executed > execution-marker', tool_name='Bash', tool_input=None,
+                metadata_path=None, session_view=False):
         settings = self.settings()
+        if session_view:
+            from fixtures.privacy import bind_v3
+            _, gateway = bind_v3(self.session, Path(self.env['RH_HOME']), project=self.project)
+            import shutil
+            shutil.copy2(gateway / 'session-info', self.project / 'rh-session-info')
+        if metadata_path:
+            path = self.session / 'privacy.json'
+            privacy = json.loads(path.read_text())
+            privacy['metadata_paths'].append(str(metadata_path))
+            path.write_text(json.dumps(privacy))
         if project_disables_hooks:
             project_settings = self.mount / '.claude'
             project_settings.mkdir()
@@ -163,6 +178,8 @@ class ClaudeHookRuntimeTests(ClaudeSessionFixture):
         path.write_text(json.dumps(settings))
         server = ThreadingHTTPServer(('127.0.0.1', 0), ModelFixture)
         server.results = []
+        server.command = command
+        server.tool_name, server.tool_input = tool_name, tool_input
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -177,7 +194,7 @@ class ClaudeHookRuntimeTests(ClaudeSessionFixture):
         command = [CLAUDE, '-p', 'Run the fixture command once.', '--model', 'claude-sonnet-4-6',
                    '--permission-mode', 'bypassPermissions', '--setting-sources',
                    'user,project,local' if project_disables_hooks else '', '--settings', str(path), '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
-                   '--tools', 'Bash', '--output-format', 'json', '--max-turns', '3']
+                   '--tools', 'Bash,Read', '--output-format', 'json', '--max-turns', '3']
         process = subprocess.Popen(command, cwd=self.mount, env=env, text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
@@ -197,6 +214,64 @@ class ClaudeHookRuntimeTests(ClaudeSessionFixture):
         self.run_cli()
         self.assertFalse((self.mount / 'execution-marker').exists())
         self.assertEqual((self.project / 'execution-marker').read_text(), 'executed')
+
+    def test_project_command_output_reaches_model_without_identity_substitution(self):
+        self.env.update(SSH_CONNECTION='192.0.2.7 51234 203.0.113.45 22',
+                        HOSTNAME='agent-hk-private.example')
+        payload = '203.0.113.45 agent-hk-private.example Asia/Hong_Kong HK +08:00'
+        results = self.run_cli(command='printf %s ' + shlex.quote(payload) + ' | tee original.txt')
+        returned = json.dumps(results)
+        self.assertIn('203.0.113.45', returned)
+        self.assertIn('agent-hk-private.example', returned)
+        self.assertIn('Asia/Hong_Kong HK +08:00', returned)
+        self.assertEqual((self.project / 'original.txt').read_text(), payload)
+
+    def test_project_read_keeps_business_addresses_and_regions(self):
+        self.env['SSH_CONNECTION'] = '192.0.2.7 51234 203.0.113.45 22'
+        path = self.mount / 'project-config.txt'
+        path.write_text('address=203.0.113.45:443\nregion=HK\n')
+        results = self.run_cli(tool_name='Read', tool_input={'file_path': str(path)})
+        self.assertIn('203.0.113.45:443', str(results))
+        self.assertIn('region=HK', str(results))
+        self.assertIn('203.0.113.45', path.read_text())
+
+    def test_v3_project_adapter_returns_real_center_session_view_to_model(self):
+        import socket
+        results = self.run_cli(command='./rh-session-info', session_view=True)
+        output = json.dumps(results)
+        self.assertIn(socket.gethostname(), output)
+        self.assertIn('agent_center', output)
+        self.assertIn('timestamp_conversion', output)
+        self.assertNotIn('SOURCE_', output)
+        self.assertNotIn('project host', output)
+
+    def test_metadata_file_alias_is_denied_in_actual_cli(self):
+        alias = self.mount / 'project-clock'
+        alias.symlink_to('/etc/localtime')
+        results = self.run_cli(tool_name='Read', tool_input={'file_path': str(alias)})
+        self.assertTrue(results[-1].get('is_error'), results)
+        self.assertIn('denied', str(results).lower())
+
+    def test_registered_metadata_read_uses_project_identity_and_converts_instant(self):
+        self.env['RH_PRESENTATION_POLICY'] = '2'
+        project = {'hostname': 'project-kr.example', 'ipv4': '192.0.2.80', 'timezone': 'Asia/Seoul'}
+        self.env.update(SSH_CONNECTION='192.0.2.7 51234 203.0.113.45 22',
+                        HOSTNAME='agent-hk-private.example', RH_SESSION_TZ='Asia/Seoul',
+                        RH_PROJECT_IDENTITY_B64=base64.b64encode(json.dumps(project).encode()).decode())
+        path = self.root / 'fixture-agent-metadata'
+        original = ('hostname=agent-hk-private.example\nserver_ip=203.0.113.45\n'
+                    'host_time=2026-11-14T23:30:00+08:00\ntimezone=Asia/Hong_Kong\n')
+        path.write_text(original)
+        results = self.run_cli(tool_name='Read', tool_input={'file_path': str(path)}, metadata_path=path)
+        output = str(results)
+        self.assertIn('project-kr.example', output)
+        self.assertIn('192.0.2.80', output)
+        self.assertIn('2026-11-15T00:30:00+09:00', output)
+        self.assertIn('Asia/Seoul', output)
+        self.assertNotIn('203.0.113.45', output)
+        self.assertNotIn('agent-hk-private.example', output)
+        self.assertNotIn('[remote-host-', output)
+        self.assertEqual(path.read_text(), original)
 
     def test_project_settings_cannot_disable_harness_routing_hooks(self):
         self.run_cli(project_disables_hooks=True)

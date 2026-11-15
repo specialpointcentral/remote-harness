@@ -54,7 +54,7 @@ class ToolTests(unittest.TestCase):
         self.mount = Path(self.tmp.name) / 'mount'
         self.mount.mkdir()
         self.args = types.SimpleNamespace(mount_root=str(self.mount), project_root='/project/root',
-            tool='rg', warm_socket='', control_path='', concurrency='6',
+            tool='rg', warm_socket='', control_path='', concurrency='6', privacy_policy='',
             slots_dir=str(Path(self.tmp.name) / 'slots'), runner='unused-runner', ssh_config=str(Path(self.tmp.name) / 'ssh_config'),
             alias='project')
         self.ctx = tool.Context(self.args)
@@ -363,6 +363,20 @@ class ToolTests(unittest.TestCase):
         with mock.patch.object(tool.sys, 'stderr', stream):
             self.assertEqual(tool.run_local(self.ctx, ['pattern']), 127)
         self.assertEqual(stream.buffer.getvalue(), b'remote-harness: category=tool exit=127 session=unknown\n')
+
+    def test_local_metadata_guard_uses_option_roles_and_preserves_equals_paths(self):
+        from fixtures.privacy import policy
+        from session_privacy import Policy
+        config = Policy(policy(Path(self.tmp.name)))
+        alias = self.mount / 'ordinary=name'
+        alias.symlink_to('/etc/localtime')
+        with mock.patch.dict(os.environ, {'RIPGREP_CONFIG_PATH': ''}):
+            for argv in (['x', str(alias)], ['-nf/etc/localtime', '.'], ['-nL', 'x'],
+                         ['--unknown-flag', 'x'], ['--pre=cat', 'x']):
+                self.assertFalse(tool.local_rg_allowed(config, argv, str(self.mount)), argv)
+            for argv in (['-n', 'x', '.'], ['--regexp=ordinary=name', '.'], ['--version'],
+                         ['--pretty', 'x', '.']):
+                self.assertTrue(tool.local_rg_allowed(config, argv, str(self.mount)), argv)
 
     def test_cold_attempt_streams_both_outputs_and_keeps_error_status(self):
         stdout, stderr = CountingStream(), CountingStream()

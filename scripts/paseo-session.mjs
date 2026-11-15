@@ -1,7 +1,7 @@
 // Agent-host bridge. The Harness PTY owns this process, while Paseo owns the agent.
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { constants as osConstants } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
@@ -144,7 +144,7 @@ async function permissionMode(client, approval, provider) {
 
 function agentEnvironment(provider) {
   const env = {};
-  const keys = ["PATH", "SSH_CONNECTION", "SSH_CLIENT"];
+  const keys = ["PATH", "SSH_CONNECTION", "SSH_CLIENT", "TZ", "TZDIR"];
   if (provider === "claude") keys.push("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
     "CLAUDE_CODE_BASH_EDIT_DIFF", "USE_BUILTIN_RIPGREP");
   for (const key of keys) {
@@ -176,10 +176,11 @@ function agentSettings(python, token) {
 function publishLease(token, config) {
   const result = execFileSync("/bin/ps",
     ["-ww", "-p", String(process.pid), "-o", "stat=", "-o", "lstart=", "-o", "args="],
-    { encoding: "utf8", timeout: 2000 }).trim();
+    { encoding: "utf8", timeout: 2000,
+      env: { ...process.env, TZ: "UTC", TZDIR: "/usr/share/zoneinfo", LC_ALL: "C" } }).trim();
   const identity = result.replace(/^\S+\s+/, "");
   if (!identity || identity === result) throw new BridgeError("Could not identify the Paseo bridge process.");
-  writeFileSync(lease, JSON.stringify({ pid: process.pid, identity, token, ...config }),
+  writeFileSync(lease, JSON.stringify({ pid: process.pid, identity: "UTC:" + identity, token, ...config }),
     { flag: "wx", mode: 0o600 });
 }
 
@@ -239,7 +240,9 @@ async function main() {
       { stdio: ["ignore", "ignore", "ignore"], timeout: 5000 });
     if (settings) writeFileSync(join(session, "paseo-claude-settings.json"), settings,
       { flag: "wx", mode: 0o600 });
-    publishLease(token, { provider, approval, python, cwd, env });
+    publishLease(token, { provider, approval, python, cwd, env,
+      ...(existsSync(join(session, "presentation-policy.json"))
+        ? { presentation_policy: json(join(session, "presentation-policy.json")).presentation_policy } : {}) });
     leased = true;
     createAttempted = true;
     const model = process.env.RH_PASEO_MODEL?.trim();

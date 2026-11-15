@@ -81,6 +81,8 @@ while [ $# -gt 0 ]; do
     --launch) need_arg "$1" "${2-}"; LAUNCH="$2"; shift 2;;
     --ui)     need_arg "$1" "${2-}"; UI="$2"; shift 2;;
     --approval) need_arg "$1" "${2-}"; APPROVAL="$2"; shift 2;;
+    --session-timezone) need_arg "$1" "${2-}"; export RH_SESSION_TZ="$2"; shift 2;;
+    --project-timezone) need_arg "$1" "${2-}"; export RH_PROJECT_TZ="$2"; shift 2;;
     --yolo)   APPROVAL=yolo; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
@@ -146,7 +148,7 @@ else
   printf 'Fetching remote-harness simple setup from the remote source...\n'
 fi
 helpers=(_common.sh simple-dispatch.sh simple-laptop-setup.sh laptop-setup.sh
-         mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh)
+         mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh project-session-info.sh)
 bundle_files=(simple-bootstrap.sh "${helpers[@]}")
 sha256_manifest() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
@@ -164,7 +166,7 @@ rh="${RH_HOME:-$HOME/.remote-harness}"
 mkdir -p "$rh/.sessions"
 stage=$(mktemp -d "$rh/.sessions/helpers.XXXXXX") || exit 1
 trap 'rm -rf "$stage"' EXIT
-set -- simple-bootstrap.sh _common.sh simple-dispatch.sh simple-laptop-setup.sh laptop-setup.sh mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh
+set -- simple-bootstrap.sh _common.sh simple-dispatch.sh simple-laptop-setup.sh laptop-setup.sh mount-project.sh inject-rule.sh run-on-project-host.sh project-host-gateway.sh project-session-info.sh
 cd "$rh/scripts"
 cp "$@" "$stage/"
 cd "$stage"

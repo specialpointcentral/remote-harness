@@ -192,6 +192,8 @@ while [ $# -gt 0 ]; do
     --project-dir)       need_arg "$1" "${2-}"; PROJECT_DIR="$2"; shift 2;;
     --remote-mountpoint) need_arg "$1" "${2-}"; REMOTE_MP="$2"; shift 2;;
     --local-sshd)        need_arg "$1" "${2-}"; LOCAL_SSHD="$2"; shift 2;;
+    --session-timezone)  need_arg "$1" "${2-}"; export RH_SESSION_TZ="$2"; shift 2;;
+    --project-timezone) need_arg "$1" "${2-}"; export RH_PROJECT_TZ="$2"; shift 2;;
     --yes|-y)            ASSUME_YES=1; shift;;
     *) printf 'unknown arg: %s\n' "$1" >&2; exit 2;;
   esac
@@ -202,6 +204,7 @@ case "$LAUNCH" in
   *) printf 'unsupported --launch %s (expected claude|codex)\n' "$LAUNCH" >&2; exit 2;;
 esac
 validate_launch_ui "$UI" "$LAUNCH" || exit 2
+validate_presentation_options || exit 2
 if [ "$UI" = orca ] && [ -n "$REMOTE_MP" ]; then
   printf '%s\n' '--ui orca reserves a unique mount and cannot use --remote-mountpoint' >&2
   exit 2
