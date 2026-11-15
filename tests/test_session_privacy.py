@@ -14,6 +14,7 @@ import io
 import contextlib
 import uuid
 import hashlib
+import platform
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -472,6 +473,9 @@ class CenterPresentationTests(unittest.TestCase):
                  'EST5EDT,M3.2.0/2:3,M11.1.0/2', 'EST5EDT,M3.2.0/2,M11.1.0/2',
                  'CET-1CEST,M3.5.0/2,M10.5.0/3', 'NZ-CHAT', 'GB-Eire', 'W-SU')
         script = 'import time; print(time.strftime("%z",time.localtime(1704067200)),time.strftime("%z",time.localtime(1719792000)))'
+        glibc = platform.libc_ver()[0] == 'glibc'
+        base = dict(os.environ)
+        base.pop('TZDIR', None)
         for index, value in enumerate(valid):
             with self.subTest(value=value):
                 validate_effective_timezone(value)
@@ -485,11 +489,15 @@ class CenterPresentationTests(unittest.TestCase):
                     capture(cache, '')
                 after = Policy(cache).environment({'TZ': 'UTC0', 'TZDIR': '/daemon/wrong'})
                 self.assertEqual(after['TZ'], value)
-                before = subprocess.check_output([sys.executable, '-c', script], env=dict(os.environ, TZ=value))
-                actual = subprocess.check_output([sys.executable, '-c', script], env=dict(os.environ, **after))
+                self.assertNotIn('TZDIR', after)
+                before = subprocess.check_output([sys.executable, '-c', script], env=dict(base, TZ=value))
+                actual = subprocess.check_output([sys.executable, '-c', script], env=dict(base, **after))
                 self.assertEqual(actual, before)
-                if value in ('<+03>-3', ':<+03>-3'):
+                if value == '<+03>-3' or (value == ':<+03>-3' and glibc):
                     self.assertEqual(actual.strip(), b'+0300 +0300')
+                elif value == ':<+03>-3' and sys.platform == 'darwin':
+                    # Darwin tzset(3) treats a leading colon as a filename, with UTC fallback.
+                    self.assertEqual(actual.strip(), b'+0000 +0000')
                 if value.startswith('EST5EDT,'):
                     self.assertEqual(actual.strip(), b'-0500 -0400')
                 self.gateway = self.root / f'posix-gateway-{index}'
@@ -528,24 +536,36 @@ class CenterPresentationTests(unittest.TestCase):
         zones = self.root / 'zones'
         zones.mkdir()
         shutil.copyfile('/usr/share/zoneinfo/Etc/GMT-3', zones / 'custom.v1')
-        with patch.dict(os.environ, {'TZ': 'custom.v1', 'TZDIR': str(zones)}, clear=True):
-            target = center_profile()
-        self.assertEqual(target['timezone'], '')
-        self.assertEqual(target['effective_tz'], 'custom.v1')
-        self.assertEqual(target['effective_tzdir'], str(zones))
-        encoded = base64.b64encode(profile_lines(target).encode()).decode()
-        with patch.dict(os.environ, {'RH_CENTER_PROFILE_B64': encoded}, clear=True):
-            capture(self.home / 'single-custom.json', '')
-        after = Policy(self.home / 'single-custom.json').environment({'TZ': 'UTC0', 'TZDIR': '/wrong'})
-        output = subprocess.check_output([sys.executable, '-c', 'import time; print(time.strftime("%z"))'],
-                                         env=dict(os.environ, **after))
-        self.assertEqual(output.strip(), b'+0300')
-        self.env.update(TZ='custom.v1', TZDIR=str(zones))
-        result = self.prepare(str(uuid.uuid4()), encoded)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        view = json.loads(subprocess.check_output([str(self.gateway / 'session-info')]))
-        self.assertEqual(view['identity']['effective_tz'], 'custom.v1')
-        self.assertEqual(view['identity']['effective_tzdir'], str(zones))
+        script = 'import time; print(time.strftime("%z",time.localtime(1704067200)),time.strftime("%z",time.localtime(1719792000)))'
+        # glibc honors TZDIR; Darwin uses its compiled-in directory. An absolute TZif path
+        # must load this real fixture on both, independently of relative-name fallback behavior.
+        for index, value in enumerate(('custom.v1', ':' + str(zones / 'custom.v1'))):
+            with self.subTest(value=value):
+                native = dict(os.environ, TZ=value, TZDIR=str(zones))
+                control = subprocess.check_output([sys.executable, '-c', script], env=native)
+                with patch.dict(os.environ, {'TZ': value, 'TZDIR': str(zones)}, clear=True):
+                    target = center_profile()
+                self.assertEqual(target['timezone'], '')
+                self.assertEqual(target['effective_tz'], value)
+                self.assertEqual(target['effective_tzdir'], str(zones))
+                encoded = base64.b64encode(profile_lines(target).encode()).decode()
+                cache = self.home / f'single-custom-{index}.json'
+                with patch.dict(os.environ, {'RH_CENTER_PROFILE_B64': encoded}, clear=True):
+                    capture(cache, '')
+                after = Policy(cache).environment({'TZ': 'UTC0', 'TZDIR': '/wrong'})
+                self.assertEqual((after['TZ'], after['TZDIR']), (value, str(zones)))
+                output = subprocess.check_output([sys.executable, '-c', script], env=dict(os.environ, **after))
+                self.assertEqual(output, control)
+                if value.startswith(':') or platform.libc_ver()[0] == 'glibc':
+                    self.assertEqual(output.strip(), b'+0300 +0300')
+                self.gateway = self.root / f'custom-gateway-{index}'
+                self.gateway.mkdir(mode=0o700)
+                self.env.update(TZ=value, TZDIR=str(zones))
+                result = self.prepare(str(uuid.uuid4()), encoded)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                view = json.loads(subprocess.check_output([str(self.gateway / 'session-info')]))
+                self.assertEqual(view['identity']['effective_tz'], value)
+                self.assertEqual(view['identity']['effective_tzdir'], str(zones))
 
     def test_native_legacy_requires_known_frozen_evidence_and_v3_never_downgrades(self):
         from fixtures.privacy import pre_policy_snapshot
