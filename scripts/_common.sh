@@ -306,10 +306,11 @@ ask() {  # question [y]   (y: default yes)
 # Arrow-key menu on the tty: question, then the options; prints the chosen option's index (0 is the
 # first). Up/Down (or k/j) move and Enter picks; Esc or q picks the first option. Each option is cut
 # to one terminal line, counting text with non-ASCII characters as double width. Bash 3.2 compatible.
-pick_menu() {
+pick_menu() {  # PICK_MENU_START=<index> starts on that item; Esc, q and end of input pick item 0
   local _pm_question="$1" _pm_cur=0 _pm_done=0 _pm_key _pm_rest _pm_i _pm_cols _pm_max _pm_item
   shift
   local _pm_n=$#
+  case "${PICK_MENU_START:-}" in ''|*[!0-9]*) ;; *) [ "$PICK_MENU_START" -ge "$_pm_n" ] || _pm_cur=$PICK_MENU_START;; esac
   local -a _pm_items=()
   _pm_cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
   case "$_pm_cols" in ''|*[!0-9]*) _pm_cols=80;; esac

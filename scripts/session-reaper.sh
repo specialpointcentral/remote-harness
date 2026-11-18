@@ -9,6 +9,7 @@
 #   session-reaper.sh release-config <ssh-config>   USED=0 only after all references are gone
 #   session-reaper.sh gc                    reap every dead session under $RH_HOME/.sessions
 #   session-reaper.sh resume-take <session-dir>   RESUME=<reason>,<epoch> once, after a disconnect
+#   session-reaper.sh resume-peek <mountpoint> <agent>   MOUNTPOINT=<canonical> and that record, kept
 #
 # A session is alive while its recorded agent process (pid + start time) exists. When it dies, when
 # its terminal was hung up but the agent lingers, or when the project host has been unreachable
@@ -243,7 +244,10 @@ resume_marker() {  # $1=session dir
   _rm_agent=$(kv_b64 "$1/session.env" AGENT)
   case "$_rm_agent" in claude|codex) ;; *) return 1 ;; esac
   [ -n "$_rm_mp" ] || return 1
-  printf '%s/.resume/%s.%s' "$SESSIONS" "$(printf '%s' "$_rm_mp" | tr '/+=' '_.-')" "$_rm_agent"
+  resume_marker_at "$_rm_mp" "$_rm_agent"
+}
+resume_marker_at() {  # $1=mountpoint $2=agent
+  printf '%s/.resume/%s.%s' "$SESSIONS" "$(printf '%s' "$1" | tr '/+=' '_.-')" "$2"
 }
 
 mark_disconnected() (  # $1=session dir $2=reason
@@ -575,6 +579,19 @@ case "${1:-}" in
     sed -n -E '/^(PRESENTATION_ID|CONVERSATION_ID)=[0-9a-f-]{36}$/p' "$_rt_file"
     rm -f "$_rt_file"
     ;;
+  resume-peek)
+    # The launcher's menu: the mountpoint as mount-project.sh canonicalizes it, and the record that
+    # resume-take later uses up there.
+    [ -n "${2:-}" ] || exit 2
+    case "${3:-}" in claude|codex) ;; *) exit 2 ;; esac
+    _rp_mp=$2
+    _rp_dir=$(cd "$(dirname "$_rp_mp")" 2>/dev/null && pwd -P) && _rp_mp="$_rp_dir/$(basename "$_rp_mp")"
+    printf 'MOUNTPOINT=%s\n' "$_rp_mp"
+    _rp_file=$(resume_marker_at "$_rp_mp" "$3")
+    [ -f "$_rp_file" ] && [ ! -L "$_rp_file" ] || exit 0
+    printf 'RESUME=%s,%s\n' "$(sed -n 's/^REASON=\([a-z]*\)$/\1/p' "$_rp_file")" "$(sed -n 's/^TIME=\([0-9]*\)$/\1/p' "$_rp_file")"
+    sed -n -E '/^(PRESENTATION_ID|CONVERSATION_ID)=[0-9a-f-]{36}$/p' "$_rp_file"
+    ;;
   reap|release) [ -n "${2:-}" ] || exit 2; release_session "$2" "${3:-}" ;;
   config-used|release-config)
     [ -n "${2:-}" ] || exit 2
@@ -589,6 +606,6 @@ case "${1:-}" in
     fi
     ;;
   gc) gc ;;
-  *) echo "usage: session-reaper.sh watch|resume-take|reap|release <session-dir> [--session-only] | config-used|release-config <ssh-config> | gc" >&2; exit 2 ;;
+  *) echo "usage: session-reaper.sh watch|resume-take|reap|release <session-dir> [--session-only] | resume-peek <mountpoint> <agent> | config-used|release-config <ssh-config> | gc" >&2; exit 2 ;;
 esac
 fi

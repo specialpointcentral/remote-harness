@@ -62,6 +62,9 @@
 - 启动器把每次 Agent 启动的开始和结束原因追加到本机 `~/.remote-harness/launches.log`，同一项目
   下次启动时提示异常结束。原生桥接进程在聊天于应用中被关闭时退出 0，被信号停止时退出 128 加信号值，
   Orca 桥接进程与 Orca Server 失去联系后退出 3；启动器据此判断原因。
+- 终端 Claude 启动的续接菜单把在其挂载点因断线结束的对话列在第一项并默认选中（读取
+  `session-reaper.sh resume-peek` 和本机标记，均不消耗）；菜单里的选择就是最终决定，注入步骤消耗两份
+  记录，不再询问。
 - 原生 Codex 包装器启动私有 stdio app server，禁用内置 shell 和代码执行工具。私有 MCP 命令工具
   使用 Codex 原生审批，执行前检查 lease、gateway 策略及 Codex 规则，再调用项目主机 runner。
   文件编辑使用挂载。桥接 lease 失效后 app server 停止，旧聊天不能用其他挂载或账号继续。

@@ -101,8 +101,9 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    project host through the tunnel every `RH_HEARTBEAT_INTERVAL` (30) seconds and ends the agent
    once every check has failed for `RH_HEARTBEAT_TIMEOUT` (600) seconds.
 9. A session ended by a lost connection leaves `$RH_HOME/.sessions/.resume/<mountpoint>.<agent>`;
-   the next launch of that mountpoint and agent asks once whether to continue the conversation
-   (`--continue` / `resume --last`). `RH_RESUME=1|0` forces the choice. Local cleanup retries an
+   the next Claude launch of that mountpoint offers the conversation once, first in its continue
+   menu and preselected (`--resume <conversation ID>`), or with one question when there is no menu;
+   terminal Codex refuses to continue. `RH_RESUME=1|0` forces the choice. Local cleanup retries an
    unreachable remote after `RH_RELEASE_RETRY_DELAYS` (10 20 30) seconds, then stops only a tunnel
    this launch created, with its user-mode sshd and local authorization.
 

@@ -93,8 +93,9 @@ RH_VIA="$h" RH_LANG=<lang> bash "$s/simple-bootstrap.sh" --mode reverse --launch
    已挂断），自行完成远端清理；重启等原因遗留的状态由下次启动时的 GC 处理。watcher 还会每
    `RH_HEARTBEAT_INTERVAL`（30）秒经隧道检查一次项目主机，连续失败满 `RH_HEARTBEAT_TIMEOUT`（600）秒
    后结束 Agent。
-9. 因断线结束的会话会留下 `$RH_HOME/.sessions/.resume/<挂载点>.<agent>`；下次启动同一挂载点、同一
-   Agent 时询问一次是否继续该对话（`--continue` / `resume --last`），`RH_RESUME=1|0` 可强制指定。本机
+9. 因断线结束的会话会留下 `$RH_HOME/.sessions/.resume/<挂载点>.<agent>`；下次在同一挂载点启动 Claude
+   时，续接菜单把该对话列在第一项并默认选中，只提供一次（`--resume <对话 ID>`），没有菜单时询问一次；
+   终端 Codex 会拒绝续接。`RH_RESUME=1|0` 可强制指定。本机
    清理在远端不可达时按 `RH_RELEASE_RETRY_DELAYS`（10 20 30）秒重试，之后只停止本次启动创建的隧道及其
    用户态 sshd 和本机授权。
 

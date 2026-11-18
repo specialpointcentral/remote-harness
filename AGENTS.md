@@ -71,6 +71,9 @@ it provides files over SSHFS and executes project commands through a forced gate
   `~/.remote-harness/launches.log`, and the next launch of the project reports an abnormal end.
   Native bridges exit 0 when their chat was closed in the app, 128 + the signal that stopped them,
   and the Orca bridge 3 after losing Orca Server; the launcher maps these statuses to reasons.
+- A terminal Claude launch's continue menu lists the conversation a lost connection ended at its
+  mount first and starts on it (`session-reaper.sh resume-peek` plus the laptop marker, neither used
+  up); the menu choice is final, so the injection step uses both records up without asking again.
 - With Codex and either native UI, the configured wrapper starts a private stdio app server with
   built-in shell and code execution disabled. The app server enforces native approval on the
   private MCP command tool. The command tool checks the lease, gateway policy and Codex rules

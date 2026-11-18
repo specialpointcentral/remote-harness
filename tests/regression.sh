@@ -1576,7 +1576,10 @@ PY
       printf 'MOUNTPOINT=/tmp/rh-remote-orca\nRESUME=1b4e28ba-2fa1-41d2-883f-0016d3cca427\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
     *'orca-session.py'*' claim '*) printf 'MOUNTPOINT=/tmp/rh-remote-orca\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
     *'orca-session.py'*' adopt '*) printf 'MOUNTPOINT=/tmp/rh-remote-adopt\nPRESENTATION_ID=22222222-2222-4222-8222-222222222222\n'; exit 0;;
-    *'orca-session.py'*' chats '*) printf 'RH_ORCA_CHAT=rev.old\t1\t1\tfixture\n'; exit 0;;
+    *'orca-session.py'*' chats '*)
+      case "$arg" in *"session-reaper.sh\" resume-peek "*)
+        printf 'RH_DROPPED_MOUNTPOINT=/tmp/rh-remote\n';; esac
+      printf 'RH_ORCA_CHAT=rev.old\t1\t1\tfixture\n'; exit 0;;
     *'inject-rule.sh'*"'orca'"*)
       printf 'RH_STATUS=INJECTED\nRH_SESSION_DIR=/remote/.sessions/fixture session\nRH_PRESENTATION_PYTHON=/remote/login bin/python3\nRH_PRESENTATION_SCRIPT=/remote/.sessions/fixture session/impl/session_privacy.py\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_LAUNCH_PREFIX=rh-session\nRH_ORCA_LAUNCH=orca-bridge\n'; exit 0;;
     *'inject-rule.sh'*) printf 'RH_STATUS=INJECTED\nRH_SESSION_DIR=/remote/.sessions/fixture session\nRH_PRESENTATION_PYTHON=/remote/login bin/python3\nRH_PRESENTATION_SCRIPT=/remote/.sessions/fixture session/impl/session_privacy.py\nRH_LAUNCH_ENV=\nRH_LAUNCH_FLAGS=\nRH_RESUME_ARGS=\nRH_APPROVAL=auto\n'; exit 0;;
@@ -1615,7 +1618,7 @@ assert_grep "$launch_dir.out" "Prewarmed project metadata" "remote prelude prewa
 assert_grep "$launch_dir.out" "-lic codex" "remote prelude still execs the agent"
 # The agent learns which terminal it draws on; values outside a safe charset are not sent.
 SSH_LOG="$tmp/term-env.ssh.log" AUTH_KEYS_SNAPSHOT="$auth_keys_snapshot" RH_SSHFS_FOLLOW_SYMLINKS=0 MOUNT_FOLLOW_SYMLINKS=1 TERM_PROGRAM=iTerm.app \
-  TERM_PROGRAM_VERSION=3.5.10 LC_TERMINAL='iTerm2;touch x' COLORTERM=truecolor \
+  TERM_PROGRAM_VERSION=3.5.10 LC_TERMINAL='iTerm2;touch x' LC_TERMINAL_VERSION= COLORTERM=truecolor \
   project_launch "$tmp/term-env.out"
 assert_grep "$tmp/term-env.ssh.log" "export TERM_PROGRAM='iTerm.app' TERM_PROGRAM_VERSION='3.5.10' COLORTERM='truecolor';" \
   "launch passes the terminal identity to the agent"
@@ -1723,6 +1726,83 @@ printf '2026-01-01 00:00:00\tSTART\trev.slept0\tcodex/terminal\t%s\t999999:x\tst
 project_launch "$tmp/history-slept.out"
 assert_grep "$tmp/history-slept.out" "dropped (exit code 255); the tunnel reconnected 2 time(s); the laptop slept for about 25 min." \
   "the report includes tunnel restarts and laptop sleep"
+# A terminal Claude launch after a dropped connection lists that conversation first in the continue
+# menu and starts on it: Enter continues it by its exact ID, and no later question asks again. Picking
+# a new conversation there uses the records up as well.
+menu_launch() {  # output file, keys as a Python bytes tuple; the launcher runs in a pseudo-terminal
+  HOME="$proj_home" PATH="$tmp/bin:$PATH" RH_COMMON="$ROOT/scripts/_common.sh" TERM=xterm \
+    python3 - "$1" "$2" "$ROOT/scripts/laptop-setup.sh" --pubkey "$TEST_PUBKEY" --box-alias laptop \
+    --host example.com --port 32025 --via "ssh user@example.com" \
+    --box-ssh-config /home/box/.remote-harness/.sessions/test/ssh_config \
+    --project-dir "$valid_project" --launch claude <<'PY'
+import ast
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+out, keys, args = sys.argv[1], ast.literal_eval(sys.argv[2]), sys.argv[3:]
+pid, fd = pty.fork()
+if pid == 0:
+    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 200, 0, 0))  # menu items fit unshortened
+    os.execvp('bash', ['bash', *args])
+text = bytearray()
+sent = False
+deadline = time.monotonic() + 120
+while time.monotonic() < deadline:
+    if select.select([fd], [], [], 0.2)[0]:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        text.extend(chunk)
+    if not sent and re.search(rb'\(Up/Down, Enter\)|\xe4\xb8\x8a\xe4\xb8\x8b\xe9\x94\xae', text):
+        time.sleep(0.3)
+        for key in keys:
+            os.write(fd, key)
+            time.sleep(0.2)
+        sent = True
+    if re.search(rb'\[(Y/n|y/N)\] $', bytes(text)):
+        os.write(fd, b'\r')
+        text.extend(b'\n')
+if time.monotonic() >= deadline:
+    os.kill(pid, signal.SIGKILL)
+    text.extend(b'\nmenu_launch: timed out\n')
+os.waitpid(pid, 0)
+open(out, 'wb').write(bytes(text))
+PY
+}
+dropped_markers() { find "$proj_home/.remote-harness/.sessions/.resume" -type f 2>/dev/null; }
+presentation=22222222-2222-4222-8222-222222222222
+SSH_LOG="$tmp/dropped-first.ssh.log" TT_EXIT=255 terminal_claude_launch "$tmp/dropped-first.out"
+[ -n "$(dropped_markers)" ] || fail "a dropped terminal Claude launch left no local resume marker"
+SSH_LOG="$tmp/dropped-menu.ssh.log" TT_EXIT=255 menu_launch "$tmp/dropped-menu.out" "(b'\\r',)"
+assert_grep "$tmp/dropped-menu.out" "❯ Terminal conversation 22222222 · ended on a lost connection · " \
+  "the continue menu lists the dropped conversation first and starts on it"
+assert_grep "$tmp/dropped-menu.out" "Orca chat rev.old" "the same menu still lists ended Orca chats"
+assert_grep "$tmp/dropped-menu.out" "Continuing terminal conversation 22222222, which a lost connection ended" \
+  "the launcher reports the dropped conversation it continues"
+assert_grep "$tmp/dropped-menu.ssh.log" "claude --resume $presentation" "Enter continues the dropped conversation by its ID"
+assert_grep "$tmp/dropped-menu.ssh.log" "mp='/tmp/rh-remote'" "the dropped conversation continues at its mount"
+refute_grep "$tmp/dropped-menu.out" "Continue that conversation?" "the menu's choice is not asked again"
+refute_grep "$tmp/dropped-menu.out" "menu_launch: timed out" "the menu launch finished"
+SSH_LOG="$tmp/dropped-new.ssh.log" menu_launch "$tmp/dropped-new.out" "(b'\\x1b[A', b'\\r')"
+assert_grep "$tmp/dropped-new.out" "Terminal conversation 22222222 · ended on a lost connection" \
+  "a launch after another drop offers that conversation again"
+refute_grep "$tmp/dropped-new.ssh.log" "claude --resume" "a new conversation chosen in the menu resumes nothing"
+assert_grep "$tmp/dropped-new.ssh.log" "--session-id" "a new conversation chosen in the menu gets a new session ID"
+refute_grep "$tmp/dropped-new.out" "Continue that conversation?" "declining in the menu is not asked again"
+[ -z "$(dropped_markers)" ] || fail "declining the dropped conversation in the menu left its marker"
+SSH_LOG="$tmp/dropped-none.ssh.log" menu_launch "$tmp/dropped-none.out" "(b'\\r',)"
+refute_grep "$tmp/dropped-none.out" "ended on a lost connection ·" "a used-up record is not offered again"
+assert_grep "$tmp/dropped-none.out" "❯ Start a new conversation" "without a dropped conversation the menu starts on a new one"
 # A native bridge's exit status says how its chat ended.
 SSH_LOG="$tmp/orca-lost.ssh.log" RH_RESUME_CHAT=rev.old TT_EXIT=3 orca_launch "$tmp/orca-lost.out"
 assert_grep "$tmp/orca-lost.out" "claude session ended: the bridge lost contact with Orca Server (exit code 3)." \

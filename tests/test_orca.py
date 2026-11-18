@@ -64,13 +64,15 @@ class OrcaOptionTests(PaseoFixture):
                 self.assertFalse((self.home / "ssh-ran").exists())
 
     def menu(self, *keys, options=("New chat", "rev.one · 1 h ago · first", "rev.two · 2 d ago · second"),
-             columns=100):
+             columns=100, start=None):
         """Drive pick_menu in a pseudo-terminal, as the launcher does, and return the picked index."""
         script = '. "$1"; shift; pick=$(pick_menu "Continue?" "$@"); printf "\\nPICK=%s\\n" "$pick"'
+        env = {**self.env, "TERM": "xterm", "LC_ALL": "C.UTF-8"}
+        if start is not None:
+            env["PICK_MENU_START"] = start
         pid, fd = pty.fork()
         if pid == 0:
-            os.execvpe("bash", ["bash", "-c", script, "menu", str(SCRIPTS / "_common.sh"), *options],
-                       {**self.env, "TERM": "xterm", "LC_ALL": "C.UTF-8"})
+            os.execvpe("bash", ["bash", "-c", script, "menu", str(SCRIPTS / "_common.sh"), *options], env)
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
         output = bytearray()
 
@@ -107,6 +109,15 @@ class OrcaOptionTests(PaseoFixture):
         line = next(line for line in text.splitlines() if "rev.one" in line)
         self.assertIn("…", line)
         self.assertLessEqual(len(line.split("rev.one")[1]), 17)
+
+    def test_launcher_menu_can_start_on_another_option(self):
+        self.assertEqual(self.menu(b"\r", start="1")[0], 1)
+        self.assertEqual(self.menu(b"\x1b[B", b"\r", start="1")[0], 2)
+        self.assertEqual(self.menu(b"\x1b[A", b"\r", start="1")[0], 0)
+        self.assertEqual(self.menu(b"\x1b", start="1")[0], 0)  # Esc still picks the first option
+        self.assertEqual(self.menu(b"q", start="2")[0], 0)
+        self.assertEqual(self.menu(b"\r", start="3")[0], 0)  # out of range
+        self.assertEqual(self.menu(b"\r", start="x")[0], 0)
 
 
 def provider_id(session_id):

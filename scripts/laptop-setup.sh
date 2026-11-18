@@ -1432,13 +1432,17 @@ register_gateway_project || { err "could not register the project with the force
 
 # Ended Orca chats of this project and agent can continue in this launch instead of a new chat, and
 # with Claude a terminal launch continues an Orca chat's conversation, while an Orca launch continues a
-# terminal launch's conversation in a new chat. Only this local terminal chooses one, in an arrow-key
-# menu that starts on a new conversation: RH_RESUME_CHAT=<chat or conversation ID> continues it
-# without asking, and RH_RESUME=0, --yes or a terminal without cursor control never offers one. The
-# agent host's claim checks the choice again.
+# terminal launch's conversation in a new chat. A terminal Claude launch also lists the conversation
+# that a lost connection ended at its mount, first, and the menu then starts on it; otherwise it starts
+# on a new conversation. Only this local terminal chooses one, in that arrow-key menu:
+# RH_RESUME_CHAT=<chat or conversation ID> continues it without asking, and RH_RESUME=0, --yes or a
+# terminal without cursor control never offers one. The agent host's claim checks the choice again.
 ORCA_CONTINUE=""
 TERMINAL_CONTINUE=""
 CONTINUE_RESUME=""
+DROPPED_OFFERED=""
+DROPPED_CONTINUE=""
+DROPPED_MOUNT=""
 PRESENTATION_REQUEST=new
 continue_ago() {  # epoch -> "N min ago"
   local _ago
@@ -1452,8 +1456,17 @@ is_conversation_id() {  # a Claude session UUID, as the agent host lists it
   case "$1" in *[!0-9a-f-]*|'') return 1;; esac
   [ "${#1}" = 36 ]
 }
+# Local resume marker (the epoch of the drop) for this remote, remote mountpoint and agent. ssh exits
+# 255 when the interactive connection drops; the next launch then offers to continue even if the
+# remote left no marker.
+local_resume_marker() {  # canonical remote mountpoint
+  printf '%s/.remote-harness/.sessions/.resume/%s' "$HOME" \
+    "$(printf '%s\n%s\n%s' "$TARGET" "$1" "$LAUNCH_BASE" | cksum | awk '{print $1}')"
+}
 choose_continue() {
-  local listing line key label at recorded said pick question
+  local listing line key label at recorded said pick question start=0
+  local mount remote remote_at record local_at
+  local dropped_at="" dropped_presentation="" dropped_conversation=""
   local -a labels=() items=()
   if [ -n "${RH_RESUME_CHAT:-}" ]; then
     if ! is_conversation_id "$RH_RESUME_CHAT"; then
@@ -1469,14 +1482,53 @@ choose_continue() {
   fi
   case "${RH_RESUME:-}" in 0|no) return 0;; esac
   [ "$ASSUME_YES" != 1 ] && [ "${TERM:-dumb}" != dumb ] && { : </dev/tty; } 2>/dev/null || return 0
-  # A terminal launch on an agent host that never ran an Orca launch skips the listing.
+  # A terminal launch also learns its mount and the disconnect record the agent host keeps there (left
+  # in place for the injector), and skips the chat listing on an agent host that never ran an Orca
+  # launch.
   listing=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
+    if [ $(sq "$UI") = terminal ]; then
+      mp=$(sq "$REMOTE_MP")
+      [ -n \"\$mp\" ] || mp=\"\$rh/mounts/\"$(sq "$PROJ_NAME")
+      \"\$rh/scripts/session-reaper.sh\" resume-peek \"\$mp\" $(sq "$LAUNCH_BASE") | sed 's/^/RH_DROPPED_/'
+    fi
     [ -d \"\$rh/.orca-identities\" ] || [ $(sq "$UI") = orca ] || exit 0
     exec env RH_REQUIRE_PRESENTATION_V3=1 python3 -EsB \"\$rh/scripts/orca-session.py\" chats \"\$rh\" $(sq "$LAUNCH_BASE") $(sq "$PROJ_DIR") $(sq "$UI")
-  " 2>/dev/null | grep -E '^RH_(ORCA|TERMINAL)_CHAT=')
+  " 2>/dev/null | grep -E '^RH_(ORCA_CHAT|TERMINAL_CHAT|DROPPED_[A-Z_]+)=')
   [ -n "$listing" ] || return 0
   items[0]="$(tr2 "Start a new conversation" "新建会话")"
+  # The conversation a lost connection ended here: the newer of the agent host's record and this
+  # laptop's marker, as the injection step below decides, within a week and with its exact binding.
+  # RH_RESUME=1 continues it without this menu.
+  mount=$(printf '%s\n' "$listing" | kv_value RH_DROPPED_MOUNTPOINT)
+  case "${RH_RESUME:-}" in 1|yes) mount="";; esac
+  case "$mount" in *[[:cntrl:]]*) mount="";; esac
+  if [ "$UI" = terminal ] && [ -n "$mount" ]; then
+    remote=$(printf '%s\n' "$listing" | kv_value RH_DROPPED_RESUME)
+    remote_at=${remote#*,}
+    case "$remote_at" in ''|*[!0-9]*) remote_at=0; remote="";; esac
+    if [ -n "$remote" ]; then
+      dropped_at=$remote_at
+      dropped_presentation=$(printf '%s\n' "$listing" | kv_value RH_DROPPED_PRESENTATION_ID)
+      dropped_conversation=$(printf '%s\n' "$listing" | kv_value RH_DROPPED_CONVERSATION_ID)
+    fi
+    record=$(read_local_resume_marker "$(local_resume_marker "$mount")" 2>/dev/null) || record=""
+    local_at=$(printf '%s\n' "$record" | kv_value TIME)
+    case "$local_at" in ''|*[!0-9]*) ;; *)
+      if [ "$local_at" -ge "$remote_at" ]; then
+        dropped_at=$local_at
+        dropped_presentation=$(printf '%s\n' "$record" | kv_value PRESENTATION_ID)
+        dropped_conversation=$(printf '%s\n' "$record" | kv_value CONVERSATION_ID)
+      fi;;
+    esac
+    if [ -n "$dropped_at" ] && [ $(( $(date +%s) - dropped_at )) -le 604800 ] \
+       && is_conversation_id "$dropped_presentation" && is_conversation_id "$dropped_conversation"; then
+      labels[0]=":dropped"
+      items[1]="$(tr2 "Terminal conversation" "终端对话") ${dropped_conversation%%-*} · $(tr2 "ended on a lost connection" "因断线结束") · $(continue_ago "$dropped_at")"
+      start=1
+      DROPPED_OFFERED=1
+    fi
+  fi
   while IFS= read -r line; do
     key=${line%%=*}
     line=${line#*=}
@@ -1505,17 +1557,17 @@ EOF
 $listing
 EOF
   [ "${#labels[@]}" -gt 0 ] || return 0
-  if [ "$UI" = orca ]; then
-    question=$(tr2 "Continue an earlier conversation of this project? (Up/Down, Enter)" \
-                   "要继续该项目之前的会话吗？（上下键选择，回车确认）")
-  else
-    question=$(tr2 "Continue an earlier Orca chat of this project in the terminal? (Up/Down, Enter)" \
-                   "要在终端继续该项目之前的 Orca 会话吗？（上下键选择，回车确认）")
-  fi
-  pick=$(pick_menu "$question" "${items[@]}")
+  question=$(tr2 "Continue an earlier conversation of this project? (Up/Down, Enter)" \
+                 "要继续该项目之前的会话吗？（上下键选择，回车确认）")
+  pick=$(PICK_MENU_START=$start pick_menu "$question" "${items[@]}")
   case "$pick" in ''|*[!0-9]*|0) return 0;; esac
   label="${labels[$((pick - 1))]}"
-  if is_conversation_id "$label"; then TERMINAL_CONTINUE="$label"; else ORCA_CONTINUE="$label"; fi
+  if [ "$label" = ":dropped" ]; then
+    DROPPED_CONTINUE=1
+    DROPPED_MOUNT=$mount
+    CONTINUE_RESUME=$dropped_conversation
+    PRESENTATION_REQUEST=$dropped_presentation
+  elif is_conversation_id "$label"; then TERMINAL_CONTINUE="$label"; else ORCA_CONTINUE="$label"; fi
 }
 if [ "$UI" = orca ] || { [ "$UI" = terminal ] && [ "$LAUNCH_BASE" = claude ]; }; then
   choose_continue
@@ -1571,6 +1623,10 @@ elif [ -n "$TERMINAL_CONTINUE" ]; then
   fi
   ok "$(tr2 "Continuing terminal conversation ${TERMINAL_CONTINUE%%-*} in a new Orca chat" \
             "将在新的 Orca 会话中继续终端对话 ${TERMINAL_CONTINUE%%-*}")"
+elif [ -n "$DROPPED_CONTINUE" ]; then
+  REMOTE_MOUNTPOINT=$DROPPED_MOUNT
+  ok "$(tr2 "Continuing terminal conversation ${CONTINUE_RESUME%%-*}, which a lost connection ended" \
+            "将继续因断线结束的终端对话 ${CONTINUE_RESUME%%-*}")"
 elif [ "$UI" = orca ]; then
   if ! REMOTE_MOUNTPOINT=$(ssh -n -o ClearAllForwardings=yes -o BatchMode=yes -o ConnectTimeout=8 "$TARGET" "
     rh=\"\${RH_HOME:-\$HOME/.remote-harness}\"
@@ -1681,11 +1737,7 @@ fi
 # ===========================================================================
 # Phase 5: Launch the agent on the remote
 # ===========================================================================
-# Local resume marker (the epoch of the drop) for this remote, remote mountpoint and agent. ssh exits
-# 255 when the interactive connection drops; the next launch then offers to continue even if the
-# remote left no marker.
-LOCAL_RESUME_MARKER="$HOME/.remote-harness/.sessions/.resume/$(printf '%s\n%s\n%s' "$TARGET" \
-  "$REMOTE_MOUNTPOINT" "$LAUNCH_BASE" | cksum | awk '{print $1}')"
+LOCAL_RESUME_MARKER=$(local_resume_marker "$REMOTE_MOUNTPOINT")
 
 # Inject the run-on-laptop rule SCOPED TO THIS SESSION: inject-rule builds box-side, per-session
 # artifacts (nothing global, nothing in the mounted repo, so other projects on this box are
@@ -1754,7 +1806,8 @@ if [ "$rh_status" = INJECTED ]; then
     EFF_LAUNCH="export $rh_env; exec $rh_prefix $rh_native_launch"
   else
     # Continue the agent's last conversation in this mount when the remote watcher ended it after a lost
-    # connection (asked once, default yes). RH_RESUME=1 always continues, RH_RESUME=0 never does.
+    # connection (asked once, default yes), unless the menu above already offered it. RH_RESUME=1
+    # always continues, RH_RESUME=0 never does. Either way the records are used up here.
     rh_resume=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_AVAILABLE)
     rh_resume_args=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_ARGS)
     resume_presentation=$(printf '%s\n' "$rh_out" | kv_value RH_RESUME_PRESENTATION_ID)
@@ -1779,6 +1832,7 @@ if [ "$rh_status" = INJECTED ]; then
     fi
     RESUME=0
     [ -z "$CONTINUE_RESUME" ] || rh_resume="" rh_resume_args="--resume $CONTINUE_RESUME"
+    [ -z "$DROPPED_OFFERED" ] || rh_resume=""
     case "${CONTINUE_RESUME:+chosen}${RH_RESUME:-}" in
       chosen*) RESUME=1;;
       1|yes) RESUME=1;;

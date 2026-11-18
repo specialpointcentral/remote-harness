@@ -99,8 +99,9 @@ configure both providers' Harness wrappers; each wrapper protects launches of it
 
 A later launch of the same project and agent can continue a chat whose launcher has exited.
 Before it mounts the project, the launcher shows a menu of that project's ended chats, newest
-first, with their last activity and your last message. The menu starts on a new chat; move with
-the Up and Down keys and press Enter. The chosen conversation continues with its full history at
+first, with their last activity and your last message. The menu starts on a new chat, unless a
+terminal launch lists a dropped conversation first (below); move with the Up and Down keys and
+press Enter. The chosen conversation continues with its full history at
 its original mount path, under the new launch's routing, hooks, lease and approval mode. If Orca
 still has the chat, it reopens.
 
@@ -134,6 +135,10 @@ A Claude conversation can move between an Orca chat and a terminal launch of the
   so the paths in its history stay valid. Until that launch ends, no launch offers the chat and Orca
   cannot run it. A later Orca launch reopens the chat, and Claude continues with the terminal turns
   as well, although Orca's own chat view may not show the terminal turns.
+- When a lost connection ended the project's last terminal Claude launch, the terminal launch's
+  menu lists that conversation first, marked "ended on a lost connection", and starts on it. Enter
+  continues it at its mount (`claude --resume <id>`); either choice is final, and the launch does
+  not ask again.
 - An Orca launch's menu also lists up to five ended conversations of the project's terminal
   launches, marked "Terminal conversation". The chosen one continues in a new Orca chat, which
   shows its earlier history. Orca resumes only a conversation recorded in the chat's own folder,

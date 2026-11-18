@@ -249,12 +249,13 @@ Agent 主机上的 Orca Server 为聊天建立专用挂载和命令路由。保�
   但结果不明确时仍保留资源，并在提示里写明原因，下次启动再回收。
 - **会话恢复**：对话记录保存在远端（Claude `~/.claude/projects/`、Codex `~/.codex/sessions/`），按工作
   目录区分；默认挂载点按项目名固定，所以同一项目重连后能找到上次对话。若上次会话因断线结束，下次启动
-  同一项目、同一 Agent 时会询问"继续该会话？[Y/n]"（回车即继续，只问一次），分别以
-  `claude --continue`、`codex resume --last` 启动。`RH_RESUME=1` 总是继续上次
-  对话，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。Agent 收到 SIGHUP 后往往
-  立刻自行退出，远端 watcher 来不及看到它"终端已挂断但仍在运行"：此时若项目主机经隧道不可达，watcher
-  同样留下标记；本机的交互 `ssh -tt` 因断线返回 255 时，也会在本机
-  `~/.remote-harness/.sessions/.resume/` 记下一次，两者任一存在都会触发上面的询问。
+  同一项目的 Claude 时，续接菜单把这段对话列在第一项并默认选中：回车即以 `claude --resume <对话 ID>`
+  继续，选“新建会话”则开始新对话，两种选择都不会再问（只提供一次）。终端不支持光标控制、没有菜单时，
+  改为询问"继续该会话？[Y/n]"；`--yes` 直接继续。终端 Codex 无法确认是哪个线程，会拒绝续接。
+  `RH_RESUME=1` 不经询问直接继续，`RH_RESUME=0` 从不继续。断线时正在执行的那一步工具调用不会恢复。
+  Agent 收到 SIGHUP 后往往立刻自行退出，远端 watcher 来不及看到它"终端已挂断但仍在运行"：此时若项目
+  主机经隧道不可达，watcher 同样留下标记；本机的交互 `ssh -tt` 因断线返回 255 时，也会在本机
+  `~/.remote-harness/.sessions/.resume/` 记下一次，两者任一存在都会提供上面的续接。
 - **结束原因记录**：每次启动到 Agent 开始运行后，启动器会在本机 `~/.remote-harness/launches.log`
   （仅本人可读，保留最近 500 行）记一行开始、一行结束及原因：Agent 正常退出、聊天在 Orca/Paseo 中
   被关闭、按 Ctrl-C、交互式 SSH 连接断开（退出码 255）、桥接进程与 Orca Server 失去联系、本地终端
@@ -670,14 +671,17 @@ project's Claude auto memory with terminal launches.
 - **Resuming**: conversations live on the remote (Claude `~/.claude/projects/`, Codex
   `~/.codex/sessions/`) keyed by working directory, and the default mountpoint is fixed by project name,
   so reconnecting the same project finds the last conversation. When the last session ended on a lost
-  connection, the next launch of the same project and agent asks "Continue that conversation? [Y/n]"
-  (Enter continues; asked once) and starts `claude --continue` or `codex resume --last`.
-  `RH_RESUME=1` always continues the last conversation, `RH_RESUME=0` never does.
+  connection, the next Claude launch of the project lists that conversation first in its continue
+  menu and starts on it: Enter continues it with `claude --resume <conversation ID>`, and "Start a new
+  conversation" starts a new one; neither asks again (it is offered once). A terminal without cursor
+  control gets no menu and the question "Continue that conversation? [Y/n]" instead; `--yes`
+  continues. Terminal Codex cannot confirm the exact thread, so it refuses to continue.
+  `RH_RESUME=1` continues without asking, `RH_RESUME=0` never does.
   The tool call running at the moment of the drop is not resumed. Agents usually exit on their own
   when SIGHUP arrives, before the remote watcher can see a hung-up agent linger; the watcher still
   leaves the marker when the project host is unreachable through the tunnel at that moment, and an
   interactive `ssh -tt` that returns 255 on a lost connection records a local marker under
-  `~/.remote-harness/.sessions/.resume/`. Either one triggers the question above.
+  `~/.remote-harness/.sessions/.resume/`. Either one offers the conversation as above.
 - **Why a session ended**: once a launch starts its agent, the launcher writes a start line and an
   end line with the reason to `~/.remote-harness/launches.log` on the laptop (owner-only, the last
   500 lines): the agent exited, the chat was closed in Orca or Paseo, Ctrl-C, the interactive SSH
